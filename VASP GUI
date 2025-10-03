@@ -474,6 +474,15 @@ class VaspGUI(tk.Tk):
         self.overview_label_map = {k: label for k, label in self.overview_items}
         self.overview_key_map = {k.lower(): k for k, _ in self.overview_items}
 
+        # 先初始化页面属性为 None
+        self.page_inputs = None
+        self.page_potcar = None
+        self.page_kpoints = None
+        self.page_workflow = None
+        self.page_run = None
+        self.page_monitor = None
+        self.page_post = None
+
         self._build_ui()
         self.set_project(self.project_dir)
 
@@ -501,13 +510,16 @@ class VaspGUI(tk.Tk):
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill=tk.BOTH, expand=True)
 
+        # 先创建所有页面，再构建工作流页面（因为它需要引用其他页面）
         self.page_inputs = self._build_inputs_page(self.nb)
         self.page_potcar = self._build_potcar_page(self.nb)
         self.page_kpoints = self._build_kpoints_page(self.nb)
-        self.page_workflow = self._build_workflow_page(self.nb)
         self.page_run = self._build_run_page(self.nb)
         self.page_monitor = self._build_monitor_page(self.nb)
         self.page_post = self._build_post_page(self.nb)
+        
+        # 最后创建工作流页面，因为它需要引用其他页面
+        self.page_workflow = self._build_workflow_page(self.nb)
 
         self.nb.add(self.page_inputs, text="输入文件")
         self.nb.add(self.page_potcar, text="POTCAR 赝势")
@@ -562,7 +574,7 @@ class VaspGUI(tk.Tk):
 
         ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
-        ttk.Label(right, text="KPOINTS 编辑（可在"K 点生成"页自动生成）").pack(anchor=tk.W)
+        ttk.Label(right, text="KPOINTS 编辑（可在\"K 点生成\"页自动生成）").pack(anchor=tk.W)
         self.kpoints_text = tk.Text(right, height=10)
         self.kpoints_text.pack(fill=tk.BOTH, expand=True)
         row2 = ttk.Frame(right)
@@ -1006,7 +1018,7 @@ class VaspGUI(tk.Tk):
 
         return frame
 
-    def is_windows() -> bool:
+    def is_windows(self) -> bool:
         return os.name == "nt"
 
     def win_to_wsl_path(self, p: Path) -> str:
@@ -1104,7 +1116,7 @@ srun {vcmd}
                 messagebox.showerror(APP_NAME, f"启动失败：{e}")
         elif mode == "wsl":
             # Windows GUI -> 在 WSL 内调用 mpirun 运行 VASP
-            if not is_windows() or not which("wsl"):
+            if not self.is_windows() or not which("wsl"):
                 messagebox.showerror(APP_NAME, "未检测到 Windows/WSL 环境或 wsl.exe 不可用。")
                 return
             # 建议把项目放在 Windows 盘，如 C:\... ，WSL 中对应 /mnt/c/...
@@ -1194,7 +1206,7 @@ srun {vcmd}
         sys_frame.pack(fill=tk.BOTH, expand=False, padx=8, pady=6)
         self.sys_info = tk.Text(sys_frame, height=10)
         self.sys_info.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-        self.sys_info.insert(tk.END, "点击"开始监视"以获取实时系统信息。\n")
+        self.sys_info.insert(tk.END, "点击\"开始监视\"以获取实时系统信息。\n")
 
         return frame
 
