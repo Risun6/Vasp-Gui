@@ -496,6 +496,7 @@ class VaspGUI(tk.Tk):
 
         self.project_dir = Path.cwd()
         self.proc = None  # subprocess.Popen or None
+        self._local_run_pid: int | None = None
         self.monitor = None  # EnergyMonitor
         self.sys_monitor = None  # SystemStatsMonitor
         self.run_status_var = tk.StringVar(value="⚪ 未检测")
@@ -1012,6 +1013,60 @@ class VaspGUI(tk.Tk):
             self.run_log.insert(tk.END, line.rstrip("\n") + "\n")
         self.run_log.see(tk.END)
 
+
+    # ====== 非阻塞跟随 vasp.out 到 GUI ======
+    def _start_following_log(self, log_path: Path, interval_ms: int = 500):
+        """非阻塞跟随 log_path，将新增内容追加到 self.run_log。"""
+        self._log_path = Path(log_path)
+        self._tail_pos = 0
+        self._tail_interval = int(interval_ms)
+        # 若之前有定时任务，先取消
+        if hasattr(self, "_tail_job") and self._tail_job:
+            try:
+                self.after_cancel(self._tail_job)
+            except Exception:
+                pass
+        # 立即触发一次
+        self._follow_log_tick()
+
+    def _follow_log_tick(self):
+        chunk = ""
+        try:
+            with open(self._log_path, "r", encoding="utf-8", errors="ignore") as f:
+                f.seek(getattr(self, "_tail_pos", 0))
+                chunk = f.read()
+                self._tail_pos = f.tell()
+        except FileNotFoundError:
+            # 文件还没生成，忽略
+            pass
+        except Exception as e:
+            chunk = f"[log-follow] 读取失败：{e}\n"
+        if chunk:
+            self.append_run_log(chunk)
+        # 继续下一次
+        self._tail_job = self.after(getattr(self, "_tail_interval", 500), self._follow_log_tick)
+
+    def _stop_following_log(self):
+        if hasattr(self, "_tail_job") and self._tail_job:
+            try:
+                self.after_cancel(self._tail_job)
+            except Exception:
+                pass
+            self._tail_job = None
+
+    def _is_pid_running(self, pid: int | None) -> bool:
+        if not pid:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
     def _int_from_var(self, var, default=0) -> int:
         try:
             value = var.get()
@@ -1165,7 +1220,7 @@ srun {vcmd}
             ):
                 return
         if mode == "local":
-            if self.proc and self.proc.poll() is None:
+            if self._is_pid_running(self._local_run_pid):
                 messagebox.showwarning(APP_NAME, "已有本地 VASP 进程在运行。先停止或等待结束。")
                 return
             if not which("mpirun"):
@@ -1179,8 +1234,11 @@ srun {vcmd}
                 out = subprocess.check_output(cmd, text=True)
                 pid = int(out.strip())
                 self.append_run_log(f"已启动本地 VASP，PID={pid}")
-                self.proc = subprocess.Popen(["bash", "-lc", f"tail -f -n +1 '{proj / 'vasp.out'}'"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                self.append_run_log("日志跟随 vasp.out（tail -f）已启动。")
+
+                self._local_run_pid = pid
+                # 用非阻塞文件跟随替代 tail -f 子进程
+                self._start_following_log(proj / "vasp.out")
+                self.append_run_log("日志跟随 vasp.out（非阻塞）已启动。\n")
                 self.start_monitor()
             except Exception as e:
                 messagebox.showerror(APP_NAME, f"启动失败：{e}")
@@ -1196,13 +1254,10 @@ srun {vcmd}
                 out = subprocess.check_output(cmd, text=True)
                 pid = out.strip()
                 self.append_run_log(f"已在 WSL 启动 VASP，PID={pid}")
-                # 在 Windows 侧跟随同一路径（使用 Windows 路径监视 vasp.out）
-                if which("powershell"):
-                    self.proc = subprocess.Popen(["powershell", "-NoProfile", "-Command", f"Get-Content -Path '{(proj / 'vasp.out')}' -Wait"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                else:
-                    # 退化为 Python 轮询
-                    self.proc = None
-                self.append_run_log("日志跟随 vasp.out（Windows 侧）已启动。")
+
+                # 用非阻塞文件跟随替代 tail -f 子进程
+                self._start_following_log(proj / "vasp.out")
+                self.append_run_log("日志跟随 vasp.out（非阻塞）已启动。\n")
                 self.start_monitor()
             except Exception as e:
                 messagebox.showerror(APP_NAME, f"WSL 启动失败：{e}")
@@ -1233,6 +1288,8 @@ srun {vcmd}
             self.refresh_run_status()
         except Exception as e:
             messagebox.showerror(APP_NAME, f"停止失败：{e}")
+        finally:
+            self._local_run_pid = None
 
     # ------------------------- 页面：监视 ----------------------------------
     def _build_monitor_page(self, parent):
@@ -1299,10 +1356,10 @@ srun {vcmd}
             self.monitor.stop()
             self.monitor = None
         if self.sys_monitor:
-
             monitor = self.sys_monitor
             self.sys_monitor = None
             monitor.stop()
+        self._stop_following_log()
         self.mon_info.insert(tk.END, "已停止监视。\n")
         self.mon_info.see(tk.END)
         self.sys_info.insert(tk.END, "系统监视已停止。\n")
@@ -1683,8 +1740,9 @@ srun {vcmd}
         try:
             # 保存配置
             self.save_config()
-            # 停止监视与 tail 进程
+            # 停止监视与日志跟随
             self.stop_monitor()
+            self._stop_following_log()
             if self.proc and self.proc.poll() is None:
                 self.proc.terminate()
         except Exception:
