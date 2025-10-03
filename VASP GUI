@@ -77,6 +77,25 @@ def read_text(p: Path) -> str:
 def write_text(p: Path, s: str) -> None:
     p.write_text(s, encoding="utf-8")
 
+def format_bytes(num: int | float | None) -> str:
+    """将字节数转为易读字符串。"""
+    if num is None:
+        return "-"
+    try:
+        n = float(num)
+    except Exception:
+        return str(num)
+    if n < 0:
+        n = 0.0
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    for unit in units:
+        if n < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(n)} {unit}"
+            return f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} PB"
+
 POSCAR_ELEM_LINE_RX = re.compile(r"^\s*([A-Za-z][a-z]?(?:\s+[A-Za-z][a-z]?)*?)\s*$")
 COUNTS_RX = re.compile(r"^\s*(\d+(?:\s+\d+)*)\s*$")
 ENERGY_RX = re.compile(r"F=\s*([-+]?\d+\.\d+)|E0=\s*([-+]?\d+\.\d+)")
@@ -184,6 +203,137 @@ def gen_kpoints_monkhorst(nx: int, ny: int, nz: int, gamma_center: bool) -> str:
 
 # ----------------------------- GUI 组件 ------------------------------------
 
+class SystemStatsMonitor(threading.Thread):
+    """后台线程：监视 CPU/进程以及关键文件增长情况。"""
+
+    def __init__(self, workdir: Path, watch_files: list[str], on_update):
+        super().__init__(daemon=True)
+        self.workdir = workdir
+        self.watch_files = watch_files
+        self.on_update = on_update  # callback(dict)
+        self._stop = threading.Event()
+        self._prev_cpu = None  # tuple(total, idle)
+        self._prev_sizes: dict[Path, int] = {}
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        while not self._stop.is_set():
+            stats = self._collect_stats()
+            try:
+                self.on_update(stats)
+            except Exception:
+                pass
+            for _ in range(6):
+                if self._stop.is_set():
+                    break
+                time.sleep(0.5)
+
+    def _collect_stats(self) -> dict:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        cpu_usage = self._cpu_usage_percent()
+        loadavg = self._loadavg()
+        files = self._file_stats()
+        procs = self._process_stats()
+        return {
+            "timestamp": timestamp,
+            "cpu_usage": cpu_usage,
+            "loadavg": loadavg,
+            "files": files,
+            "processes": procs,
+        }
+
+    def _cpu_usage_percent(self) -> float | None:
+        proc_stat = Path("/proc/stat")
+        if not proc_stat.exists():
+            return None
+        try:
+            line = proc_stat.read_text().splitlines()[0]
+        except Exception:
+            return None
+        parts = line.split()
+        if len(parts) < 5 or parts[0] != "cpu":
+            return None
+        try:
+            values = [float(x) for x in parts[1:]]
+        except Exception:
+            return None
+        idle = values[3]
+        total = sum(values)
+        if self._prev_cpu is None:
+            self._prev_cpu = (total, idle)
+            return None
+        prev_total, prev_idle = self._prev_cpu
+        total_delta = total - prev_total
+        idle_delta = idle - prev_idle
+        self._prev_cpu = (total, idle)
+        if total_delta <= 0:
+            return None
+        usage = max(0.0, min(100.0, (1.0 - idle_delta / total_delta) * 100.0))
+        return usage
+
+    def _loadavg(self) -> tuple[float, float, float] | None:
+        if hasattr(os, "getloadavg"):
+            try:
+                return os.getloadavg()
+            except OSError:
+                return None
+        return None
+
+    def _file_stats(self) -> list[dict]:
+        stats = []
+        for name in self.watch_files:
+            if not name:
+                continue
+            p = Path(name)
+            if not p.is_absolute():
+                p = self.workdir / name
+            p = p.resolve()
+            info = {
+                "name": str(p),
+                "exists": False,
+                "size": 0,
+                "delta": 0,
+            }
+            try:
+                if p.exists():
+                    size = p.stat().st_size
+                    prev = self._prev_sizes.get(p, size)
+                    info.update({
+                        "exists": True,
+                        "size": size,
+                        "delta": size - prev,
+                    })
+                    self._prev_sizes[p] = size
+            except Exception:
+                pass
+            stats.append(info)
+        return stats
+
+    def _process_stats(self) -> list[dict]:
+        cmd = ["ps", "-eo", "pid,comm,%cpu,%mem", "--sort=-%cpu"]
+        try:
+            out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+        except Exception:
+            return []
+        lines = out.strip().splitlines()
+        procs = []
+        for line in lines[1:6]:  # 跳过表头，仅取前5项
+            parts = line.split(None, 3)
+            if len(parts) < 4:
+                continue
+            cmd_name = parts[1]
+            procs.append({
+                "pid": parts[0],
+                "cmd": cmd_name,
+                "cpu": parts[2],
+                "mem": parts[3],
+                "is_vasp": "vasp" in cmd_name.lower() or "mpi" in cmd_name.lower(),
+            })
+        return procs
+
+
 class EnergyMonitor(threading.Thread):
     """后台线程：周期性解析 OSZICAR，提取 F/E0 能量，供主线程绘图。"""
     def __init__(self, workdir: Path, on_update):
@@ -250,6 +400,7 @@ class VaspGUI(tk.Tk):
         self.project_dir = Path.cwd()
         self.proc = None  # subprocess.Popen or None
         self.monitor = None  # EnergyMonitor
+        self.sys_monitor = None  # SystemStatsMonitor
 
         self._build_ui()
 
@@ -280,6 +431,7 @@ class VaspGUI(tk.Tk):
         self.page_inputs = self._build_inputs_page(self.nb)
         self.page_potcar = self._build_potcar_page(self.nb)
         self.page_kpoints = self._build_kpoints_page(self.nb)
+        self.page_workflow = self._build_workflow_page(self.nb)
         self.page_run = self._build_run_page(self.nb)
         self.page_monitor = self._build_monitor_page(self.nb)
         self.page_post = self._build_post_page(self.nb)
@@ -287,6 +439,7 @@ class VaspGUI(tk.Tk):
         self.nb.add(self.page_inputs, text="输入文件")
         self.nb.add(self.page_potcar, text="POTCAR 赝势")
         self.nb.add(self.page_kpoints, text="K 点生成")
+        self.nb.add(self.page_workflow, text="流程助手")
         self.nb.add(self.page_run, text="运行 / 提交")
         self.nb.add(self.page_monitor, text="监视")
         self.nb.add(self.page_post, text="后处理 (简)")
@@ -567,6 +720,97 @@ class VaspGUI(tk.Tk):
 
         return frame
 
+    # ------------------------- 页面：流程助手 ------------------------------
+    def _build_workflow_page(self, parent):
+        frame = ttk.Frame(parent)
+
+        intro = ttk.Label(
+            frame,
+            text="按照从上到下的步骤完成一次 VASP 计算，可点击按钮快速跳转到对应面板。",
+            wraplength=900,
+            justify=tk.LEFT,
+        )
+        intro.pack(fill=tk.X, padx=12, pady=8)
+
+        steps = [
+            (
+                "① 准备项目目录",
+                "选择/新建项目文件夹，所有输入输出文件都保存在此处。",
+                [
+                    ("选择项目", self.choose_project),
+                    ("新建项目", self.create_project),
+                    ("快速体检", self.quick_check),
+                ],
+                self.page_inputs,
+            ),
+            (
+                "② 编辑输入文件",
+                "填写 INCAR、POSCAR、KPOINTS 等输入，确保必要信息完整。",
+                [
+                    ("跳转到输入页", lambda: self.goto_tab(self.page_inputs)),
+                    ("跳转到 K 点生成", lambda: self.goto_tab(self.page_kpoints)),
+                ],
+                self.page_inputs,
+            ),
+            (
+                "③ 准备 POTCAR",
+                "解析 POSCAR 元素并在 POTCAR 面板一键拼接所需赝势。",
+                [
+                    ("跳转到 POTCAR", lambda: self.goto_tab(self.page_potcar)),
+                    ("解析元素", self.show_poscar_elements),
+                ],
+                self.page_potcar,
+            ),
+            (
+                "④ 配置运行方式",
+                "根据实际环境选择本地/WSL/SLURM 运行，并生成脚本。",
+                [
+                    ("跳转到运行页", lambda: self.goto_tab(self.page_run)),
+                    ("生成运行脚本", self.write_job_script),
+                ],
+                self.page_run,
+            ),
+            (
+                "⑤ 启动并监视",
+                "启动计算后，利用监视页关注能量收敛、CPU 使用率及文件增长。",
+                [
+                    ("启动/提交", self.start_run),
+                    ("跳转到监视", lambda: self.goto_tab(self.page_monitor)),
+                    ("开始监视", self.start_monitor),
+                ],
+                self.page_monitor,
+            ),
+            (
+                "⑥ 后处理与结果",
+                "提取最终能量或绘制一次性曲线，整理输出文件。",
+                [
+                    ("跳转到后处理", lambda: self.goto_tab(self.page_post)),
+                    ("提取最终能量", self.extract_final_energy),
+                ],
+                self.page_post,
+            ),
+        ]
+
+        for title, desc, buttons, page in steps:
+            box = ttk.LabelFrame(frame, text=title)
+            box.pack(fill=tk.X, padx=12, pady=6)
+            ttk.Label(box, text=desc, justify=tk.LEFT).pack(anchor=tk.W, padx=8, pady=4)
+            row = ttk.Frame(box)
+            row.pack(anchor=tk.W, padx=8, pady=4)
+            for txt, cmd in buttons:
+                ttk.Button(row, text=txt, command=cmd).pack(side=tk.LEFT, padx=4)
+            ttk.Button(row, text="打开此面板", command=lambda p=page: self.goto_tab(p)).pack(side=tk.LEFT, padx=8)
+
+        notes = ttk.LabelFrame(frame, text="流程备注 / 待办")
+        notes.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+        self.workflow_notes = tk.Text(notes, height=10)
+        self.workflow_notes.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.workflow_notes.insert(
+            tk.END,
+            "可在此记录当前任务的特殊参数、检查列表或备注。内容不会自动保存。",
+        )
+        return frame
+
     def kpoints_to_editor(self):
         s = gen_kpoints_monkhorst(self.k_nx.get(), self.k_ny.get(), self.k_nz.get(), self.k_gamma.get())
         self.kpoints_text.delete("1.0", tk.END)
@@ -578,6 +822,12 @@ class VaspGUI(tk.Tk):
         s = self.kpoints_text.get("1.0", tk.END)
         write_text(proj / "KPOINTS", s)
         messagebox.showinfo(APP_NAME, f"KPOINTS 已保存到 {proj/'KPOINTS'}")
+
+    def goto_tab(self, page):
+        try:
+            self.nb.select(page)
+        except Exception:
+            pass
 
     # ------------------------- 页面：运行 / 提交 ----------------------------
     def _build_run_page(self, parent):
@@ -696,6 +946,18 @@ srun {vcmd}
         proj = Path(self.project_var.get())
         mode = self.run_mode.get()
         vcmd = self.vasp_cmd.get().strip()
+        if not proj.exists():
+            messagebox.showerror(APP_NAME, f"项目目录不存在：{proj}")
+            return
+        missing = [f for f in ["INCAR", "POSCAR", "POTCAR"] if not (proj / f).exists()]
+        if missing:
+            if not messagebox.askyesno(
+                APP_NAME,
+                "检测到以下关键输入文件缺失：\n"
+                + "\n".join(missing)
+                + "\n仍要继续启动吗？",
+            ):
+                return
         if mode == "local":
             if self.proc and self.proc.poll() is None:
                 messagebox.showwarning(APP_NAME, "已有本地 VASP 进程在运行。先停止或等待结束。")
@@ -775,6 +1037,9 @@ srun {vcmd}
         top.pack(fill=tk.X, padx=8, pady=6)
         ttk.Button(top, text="开始监视", command=self.start_monitor).pack(side=tk.LEFT)
         ttk.Button(top, text="停止监视", command=self.stop_monitor).pack(side=tk.LEFT, padx=6)
+        ttk.Label(top, text="文件列表(逗号分隔)").pack(side=tk.LEFT, padx=6)
+        self.file_watch_var = tk.StringVar(value="vasp.out,OSZICAR,OUTCAR")
+        ttk.Entry(top, textvariable=self.file_watch_var, width=36).pack(side=tk.LEFT)
 
         fig = Figure(figsize=(6, 4), dpi=100)
         self.ax = fig.add_subplot(111)
@@ -787,8 +1052,14 @@ srun {vcmd}
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        self.mon_info = tk.Text(frame, height=8)
-        self.mon_info.pack(fill=tk.BOTH, expand=False, padx=8, pady=8)
+        self.mon_info = tk.Text(frame, height=6)
+        self.mon_info.pack(fill=tk.BOTH, expand=False, padx=8, pady=4)
+
+        sys_frame = ttk.LabelFrame(frame, text="系统状态：CPU / 进程 / 文件增长")
+        sys_frame.pack(fill=tk.BOTH, expand=False, padx=8, pady=6)
+        self.sys_info = tk.Text(sys_frame, height=10)
+        self.sys_info.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.sys_info.insert(tk.END, "点击“开始监视”以获取实时系统信息。\n")
 
         return frame
 
@@ -799,11 +1070,26 @@ srun {vcmd}
         self.monitor.start()
         self.mon_info.insert(tk.END, f"开始监视 {proj/'OSZICAR'}\n")
         self.mon_info.see(tk.END)
+        watch_files = [s.strip() for s in self.file_watch_var.get().split(",") if s.strip()]
+        self.sys_monitor = SystemStatsMonitor(proj, watch_files, self.on_system_update)
+        self.sys_monitor.start()
+        self.sys_info.delete("1.0", tk.END)
+        self.sys_info.insert(tk.END, "系统监视线程已启动……\n")
 
     def stop_monitor(self):
         if self.monitor:
             self.monitor.stop()
             self.monitor = None
+        if self.sys_monitor:
+            self.sys_monitor.stop()
+            try:
+                self.sys_monitor.join(timeout=1.0)
+            except Exception:
+                pass
+            self.sys_monitor = None
+        self.mon_info.insert(tk.END, "已停止监视。\n")
+        self.mon_info.see(tk.END)
+        self.sys_info.insert(tk.END, "系统监视已停止。\n")
 
     def on_energy_update(self, steps, energies):
         # Tk 线程安全：使用 after 回到主线程更新
@@ -818,6 +1104,39 @@ srun {vcmd}
             if energies:
                 self.mon_info.insert(tk.END, f"最新步：{steps[-1]}, 能量：{energies[-1]:.6f} eV\n")
                 self.mon_info.see(tk.END)
+        self.after(0, _upd)
+
+    def on_system_update(self, stats):
+        def _upd():
+            lines = []
+            lines.append(f"时间：{stats.get('timestamp', '-')}")
+            cpu = stats.get("cpu_usage")
+            if cpu is not None:
+                lines.append(f"CPU 使用率：{cpu:.1f}%")
+            load = stats.get("loadavg")
+            if load:
+                lines.append(f"平均负载：{load[0]:.2f}, {load[1]:.2f}, {load[2]:.2f}")
+            lines.append("监视文件：")
+            for item in stats.get("files", []):
+                name = item.get("name", "-")
+                if item.get("exists"):
+                    size = format_bytes(item.get("size"))
+                    delta = format_bytes(item.get("delta"))
+                    lines.append(f"  {name}: {size} (Δ {delta})")
+                else:
+                    lines.append(f"  {name}: 未找到")
+            procs = stats.get("processes", [])
+            if procs:
+                lines.append("相关进程 (前5按CPU)：")
+                for p in procs:
+                    mark = "★" if p.get("is_vasp") else " "
+                    lines.append(
+                        f" {mark} PID {p.get('pid')} {p.get('cmd')} | CPU {p.get('cpu')} | MEM {p.get('mem')}"
+                    )
+            else:
+                lines.append("未获取到进程信息 (可能无 ps 命令或权限不足)。")
+            self.sys_info.delete("1.0", tk.END)
+            self.sys_info.insert(tk.END, "\n".join(lines) + "\n")
         self.after(0, _upd)
 
     # ------------------------- 页面：后处理（简） ---------------------------
@@ -910,6 +1229,7 @@ srun {vcmd}
             self.mpi_np.set(int(data.get("mpi_np", self.mpi_np.get())))
         except Exception:
             pass
+        self.file_watch_var.set(data.get("file_watch", self.file_watch_var.get()))
         # SLURM
         self.slurm_part.set(data.get("slurm_part", self.slurm_part.get()))
         self.slurm_time.set(data.get("slurm_time", self.slurm_time.get()))
@@ -952,6 +1272,7 @@ srun {vcmd}
             "slurm_account": self.slurm_account.get(),
             "kgrid": {"nx": self.k_nx.get(), "ny": self.k_ny.get(), "nz": self.k_nz.get(), "gamma": bool(self.k_gamma.get())},
             "tab_index": self.nb.index("current"),
+            "file_watch": self.file_watch_var.get(),
         }
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
