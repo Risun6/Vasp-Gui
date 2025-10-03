@@ -21,7 +21,7 @@ POTCAR 拼接（本地已有赝势）、K 点生成、作业脚本生成与提�
 
 说明：
 - 本工具不包含、也不会分发任何 VASP 程序或赝势文件。请确保你拥有 VASP 许可，
-  并在“POTCAR 面板”正确设置本地赝势库路径。
+  并在"POTCAR 面板"正确设置本地赝势库路径。
 - 监视功能主要解析 OSZICAR（F= 或 E0= 行），用于快速查看收敛趋势。
 - SLURM 模板可在 GUI 中一键生成，你可以直接提交或先手动修改。
 
@@ -562,7 +562,7 @@ class VaspGUI(tk.Tk):
 
         ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
-        ttk.Label(right, text="KPOINTS 编辑（可在“K 点生成”页自动生成）").pack(anchor=tk.W)
+        ttk.Label(right, text="KPOINTS 编辑（可在"K 点生成"页自动生成）").pack(anchor=tk.W)
         self.kpoints_text = tk.Text(right, height=10)
         self.kpoints_text.pack(fill=tk.BOTH, expand=True)
         row2 = ttk.Frame(right)
@@ -1194,7 +1194,7 @@ srun {vcmd}
         sys_frame.pack(fill=tk.BOTH, expand=False, padx=8, pady=6)
         self.sys_info = tk.Text(sys_frame, height=10)
         self.sys_info.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-        self.sys_info.insert(tk.END, "点击“开始监视”以获取实时系统信息。\n")
+        self.sys_info.insert(tk.END, "点击"开始监视"以获取实时系统信息。\n")
 
         return frame
 
