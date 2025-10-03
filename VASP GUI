@@ -59,6 +59,88 @@ APP_VER = "0.1.0-MVP"
 CONFIG_DIR = Path.home() / ".config" / "vasp_gui"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
+# === ETA helpers ===
+ETA_LOOP_RX = re.compile(r"LOOP:\s+cpu time\s+([0-9.eE+\-]+)\s*:\s*real time\s+([0-9.eE+\-]+)", re.IGNORECASE)
+ETA_LOOP_CPU_ONLY_RX = re.compile(r"LOOP:\s+cpu time\s+([0-9.eE+\-]+)", re.IGNORECASE)
+ETA_ITER_LINE_RX = re.compile(r"^\s*\d+\s+[-+]?[\d.eE]+\s")  # OSZICAR: "  N   E   dE ..."
+ETA_F_LINE_RX = re.compile(r"\bF=\s*([-+]?\d+\.\d+)")
+
+def _fmt_eta_seconds(sec: float | None) -> str:
+    if not sec or sec <= 0:
+        return "—"
+    sec = int(sec)
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    return (f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}")
+
+def _parse_incar_int(path: Path, key: str, default: int | None = None) -> int | None:
+    try:
+        txt = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return default
+    rx = re.compile(rf"^\s*{re.escape(key)}\s*=\s*([-+]?\d+)", re.IGNORECASE | re.MULTILINE)
+    m = rx.search(txt)
+    return int(m.group(1)) if m else default
+
+def _oszicar_stats(osz: Path) -> tuple[int, float | None]:
+    """返回 (已完成离子步数, 每离子步平均SCF迭代数)。"""
+    if not osz.exists():
+        return 0, None
+    steps_done = 0
+    iter_counts: list[int] = []
+    cur = 0
+    try:
+        for line in osz.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if ETA_ITER_LINE_RX.match(line):
+                cur += 1
+            elif ETA_F_LINE_RX.search(line):
+                steps_done += 1
+                if cur > 0:
+                    iter_counts.append(cur)
+                cur = 0
+    except Exception:
+        pass
+    avg_iter = (sum(iter_counts) / len(iter_counts)) if iter_counts else None
+    return steps_done, avg_iter
+
+def _vaspout_loop_times(vout: Path, take_last: int = 40) -> tuple[float | None, int]:
+    """解析 vasp.out 最近的 LOOP 行，返回(平均单次SCF耗时(秒), 已解析迭代数)。"""
+    if not vout.exists():
+        return None, 0
+    try:
+        lines = vout.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return None, 0
+    times: list[float] = []
+    for ln in reversed(lines):
+        m = ETA_LOOP_RX.search(ln)
+        if m:
+            # 优先 real time
+            try:
+                times.append(float(m.group(2)))
+            except Exception:
+                try:
+                    times.append(float(m.group(1)))
+                except Exception:
+                    pass
+        else:
+            m2 = ETA_LOOP_CPU_ONLY_RX.search(ln)
+            if m2:
+                try:
+                    times.append(float(m2.group(1)))
+                except Exception:
+                    pass
+        if len(times) >= take_last:
+            break
+    if not times:
+        return None, 0
+    # 使用中位数更稳，也可用均值
+    times_sorted = sorted(times)
+    mid = times_sorted[len(times_sorted)//2]
+    return (mid, len(times))
+
+
 # ----------------------------- 工具函数区 ----------------------------------
 
 def which(cmd: str) -> str | None:
@@ -73,21 +155,6 @@ def read_text(p: Path) -> str:
             return p.read_text(encoding="latin-1")
         except Exception:
             return ""
-
-def read_tail(p: Path, max_bytes: int = 4096) -> str:
-    """读取文件末尾指定字节，失败时返回空串。"""
-    try:
-        with p.open("rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            fh.seek(max(0, size - max_bytes))
-            data = fh.read()
-    except Exception:
-        return ""
-    try:
-        return data.decode("utf-8", errors="ignore")
-    except Exception:
-        return ""
 
 def write_text(p: Path, s: str) -> None:
     p.write_text(s, encoding="utf-8")
@@ -113,7 +180,17 @@ def format_bytes(num: int | float | None) -> str:
 
 POSCAR_ELEM_LINE_RX = re.compile(r"^\s*([A-Za-z][a-z]?(?:\s+[A-Za-z][a-z]?)*?)\s*$")
 COUNTS_RX = re.compile(r"^\s*(\d+(?:\s+\d+)*)\s*$")
-ENERGY_RX = re.compile(r"F=\s*([-+]?\d+\.\d+)|E0=\s*([-+]?\d+\.\d+)")
+# 兼容:  -12.34   12.   .1234   -1.23E+02   3.4D-01
+ENERGY_RX = re.compile(
+    r"F=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][+-]?\d+)?)"
+    r"|E0=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][+-]?\d+)?)"
+)
+# 备用：从 OUTCAR 也能抓（有时 OSZICAR 很慢才写）
+TOTEN_RX = re.compile(
+    r"free\s+energy\s+TOTEN\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][+-]?\d+)?)",
+    re.IGNORECASE
+)
+
 
 
 def parse_poscar(poscar_text: str):
@@ -237,12 +314,12 @@ class SystemStatsMonitor(threading.Thread):
             self.workdir_resolved = self.workdir
         self.watch_files = watch_files or []
         self.on_update = on_update  # callback(dict)
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._prev_cpu = None  # tuple(total, idle)
         self._prev_sizes: dict[Path, int] = {}
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
         if self.is_alive():
             try:
@@ -251,7 +328,7 @@ class SystemStatsMonitor(threading.Thread):
                 pass
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             stats = self._collect_stats()
             if self.on_update:
                 try:
@@ -259,7 +336,7 @@ class SystemStatsMonitor(threading.Thread):
                 except Exception:
                     pass
             for _ in range(6):
-                if self._stop.is_set():
+                if self._stop_event.is_set():
                     break
                 time.sleep(0.5)
 
@@ -349,30 +426,37 @@ class SystemStatsMonitor(threading.Thread):
         return stats
 
     def _process_stats(self) -> list[dict]:
-
-        cmd = ["ps", "-eo", "pid,%cpu,%mem,cmd", "--sort=-%cpu"]
+        # 限制输出 + 超时，避免在某些系统里 ps 卡住
         try:
-            out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+            out = subprocess.check_output(
+                ["bash", "-lc", "ps -eo pid,%cpu,%mem,cmd --sort=-%cpu | head -n 6"],
+                text=True, stderr=subprocess.DEVNULL, timeout=2.0
+            )
         except Exception:
-            return []
+            try:
+                out = subprocess.check_output(
+                    ["ps", "-eo", "pid,%cpu,%mem,cmd"],
+                    text=True, stderr=subprocess.DEVNULL, timeout=2.0
+                )
+                out = "\n".join(out.splitlines()[:6])
+            except Exception:
+                return []
+
         lines = out.strip().splitlines()
         procs = []
-        for line in lines[1:6]:  # 跳过表头，仅取前5项
+        for line in lines[1:6]:
             parts = line.split(None, 3)
-
             if len(parts) < 3:
                 continue
-            pid = parts[0]
-            cpu = parts[1]
-            mem = parts[2]
+            pid, cpu, mem = parts[0], parts[1], parts[2]
             cmd_full = parts[3] if len(parts) >= 4 else ""
             cwd = self._proc_cwd(pid)
+
             in_project = False
             try:
                 if cwd:
-
                     resolved = Path(cwd).resolve()
-                    in_project = resolved == self.workdir_resolved
+                    in_project = (resolved == self.workdir_resolved)
                     if not in_project:
                         try:
                             resolved.relative_to(self.workdir_resolved)
@@ -381,16 +465,13 @@ class SystemStatsMonitor(threading.Thread):
                             in_project = False
             except Exception:
                 in_project = False
+
             cmd_lower = cmd_full.lower()
-            is_vasp = "vasp" in cmd_lower or ("mpi" in cmd_lower and "vasp" in cmd_lower)
+            is_vasp = ("vasp" in cmd_lower) or ("mpi" in cmd_lower and "vasp" in cmd_lower)
             procs.append({
-                "pid": pid,
-                "cmd": cmd_full.strip(),
-                "cpu": cpu,
-                "mem": mem,
-                "is_vasp": is_vasp,
-                "cwd": cwd,
-                "in_project": in_project,
+                "pid": pid, "cmd": cmd_full.strip(),
+                "cpu": cpu, "mem": mem,
+                "is_vasp": is_vasp, "cwd": cwd, "in_project": in_project,
             })
         return procs
 
@@ -439,14 +520,14 @@ class EnergyMonitor(threading.Thread):
         super().__init__(daemon=True)
         self.workdir = workdir
         self.on_update = on_update  # callback(steps:list[int], energies:list[float])
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self.steps = []
         self.energies = []
         self._last_size = 0
         self._last_pos = 0
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
         if self.is_alive():
             try:
                 self.join(timeout=2.0)
@@ -455,19 +536,25 @@ class EnergyMonitor(threading.Thread):
 
     def run(self):
         osz = self.workdir / "OSZICAR"
-        while not self._stop.is_set():
+        outcar = self.workdir / "OUTCAR"
+        while not self._stop_event.is_set():
             try:
-                if osz.exists():
-                    size = osz.stat().st_size
+                target = None
+                if osz.exists() and osz.stat().st_size > 0:
+                    target = osz
+                elif outcar.exists() and outcar.stat().st_size > 0:
+                    target = outcar
+                if target:
+                    size = target.stat().st_size
                     reset = False
                     if size < self._last_size:
                         reset = True
                         self._last_pos = 0
                         self._last_size = 0
-                        self.steps = []
+                        self.steps = [];
                         self.energies = []
                     if reset or size > self._last_size:
-                        self._parse(osz, reset)
+                        self._parse(target, reset)
                         self._last_size = size
                         if self.on_update:
                             self.on_update(self.steps, self.energies)
@@ -483,14 +570,24 @@ class EnergyMonitor(threading.Thread):
                 else:
                     self.steps = []
                     self.energies = []
+                new_pts = 0
                 for line in f:
+                    val = None
                     m = ENERGY_RX.search(line)
                     if m:
                         val = m.group(1) or m.group(2)
+                    else:
+                        # 若传入的是 OUTCAR，尝试 TOTEN 兜底
+                        m2 = TOTEN_RX.search(line)
+                        if m2:
+                            val = m2.group(1)
+                    if val is not None:
                         try:
-                            e = float(val)
+                            # Fortran 指数 D 替换为 E
+                            e = float(val.replace("D", "E").replace("d", "E"))
                             self.steps.append(len(self.steps) + 1)
                             self.energies.append(e)
+                            new_pts += 1
                         except Exception:
                             pass
                 self._last_pos = f.tell()
@@ -502,7 +599,6 @@ class VaspGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_NAME} v{APP_VER}")
-        self.minsize(960, 640)
         self.geometry("1200x800")
         try:
             import ttkbootstrap as tb  # 可选美化
@@ -512,7 +608,6 @@ class VaspGUI(tk.Tk):
 
         self.project_dir = Path.cwd()
         self.proc = None  # subprocess.Popen or None
-        self._local_run_pid: int | None = None
         self.monitor = None  # EnergyMonitor
         self.sys_monitor = None  # SystemStatsMonitor
         self.run_status_var = tk.StringVar(value="⚪ 未检测")
@@ -543,20 +638,16 @@ class VaspGUI(tk.Tk):
     # ------------------------- UI 构建 ----------------------------------
     def _build_ui(self):
         # 顶部工具栏
-        toolbar = ttk.Frame(self, padding=(8, 6))
+        toolbar = ttk.Frame(self)
         toolbar.pack(side=tk.TOP, fill=tk.X)
-        toolbar.grid_columnconfigure(1, weight=1)
 
-        ttk.Label(toolbar, text="项目目录:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(toolbar, text="项目目录:").pack(side=tk.LEFT, padx=6)
         self.project_var = tk.StringVar(value=str(self.project_dir))
-        self.project_entry = ttk.Entry(toolbar, textvariable=self.project_var)
-        self.project_entry.grid(row=0, column=1, sticky="ew", padx=(6, 6))
-        self.project_entry.bind("<Return>", self._on_project_entry_return)
-        self.project_entry.bind("<FocusOut>", self._on_project_entry_focus_out)
-        ttk.Button(toolbar, text="选择…", command=self.choose_project).grid(row=0, column=2, padx=(0, 4))
-        ttk.Button(toolbar, text="打开目录", command=self.open_project_folder).grid(row=0, column=3, padx=(0, 4))
-        ttk.Button(toolbar, text="新建项目", command=self.create_project).grid(row=0, column=4, padx=(0, 4))
-        ttk.Button(toolbar, text="快速体检", command=self.quick_check).grid(row=0, column=5, padx=(0, 0))
+        self.project_entry = ttk.Entry(toolbar, textvariable=self.project_var, width=80)
+        self.project_entry.pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="选择…", command=self.choose_project).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="新建项目", command=self.create_project).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="一键读取项目", command=self.import_project_files).pack(side=tk.LEFT, padx=4)
 
         # Notebook
         self.nb = ttk.Notebook(self)
@@ -565,10 +656,14 @@ class VaspGUI(tk.Tk):
         self.page_inputs = self._build_inputs_page(self.nb)
         self.page_potcar = self._build_potcar_page(self.nb)
         self.page_kpoints = self._build_kpoints_page(self.nb)
-        self.page_workflow = self._build_workflow_page(self.nb)
+
+        # 先把 workflow 会引用到的页面都建好
         self.page_run = self._build_run_page(self.nb)
         self.page_monitor = self._build_monitor_page(self.nb)
         self.page_post = self._build_post_page(self.nb)
+
+        # 最后再建 workflow（里面会引用上面三个）
+        self.page_workflow = self._build_workflow_page(self.nb)
 
         self.nb.add(self.page_inputs, text="输入文件")
         self.nb.add(self.page_potcar, text="POTCAR 赝势")
@@ -576,99 +671,17 @@ class VaspGUI(tk.Tk):
         self.nb.add(self.page_workflow, text="流程助手")
         self.nb.add(self.page_run, text="运行 / 提交")
         self.nb.add(self.page_monitor, text="监视")
-        self.nb.add(self.page_post, text="后处理 (简)")
-
-        # 状态栏
-        self.status_var = tk.StringVar(value="准备就绪")
-        self._status_job = None
-        self.status_bar = ttk.Label(self, textvariable=self.status_var, anchor=tk.W)
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=(0, 2))
+        self.nb.add(self.page_post, text="后处理")
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
-
-    def _create_text_area(
-        self,
-        parent,
-        *,
-        height: int = 10,
-        wrap: str = "none",
-        pack_kwargs: dict | None = None,
-        add_xscroll: bool = True,
-        text_kwargs: dict | None = None,
-    ) -> tk.Text:
-        """创建带滚动条的 Text 组件，统一风格，避免布局错乱。"""
-        if pack_kwargs is None:
-            pack_kwargs = {"fill": tk.BOTH, "expand": True}
-        if text_kwargs is None:
-            text_kwargs = {}
-        container = ttk.Frame(parent)
-        container.pack(**pack_kwargs)
-        container.grid_rowconfigure(0, weight=1)
-        container.grid_columnconfigure(0, weight=1)
-
-        text = tk.Text(container, height=height, wrap=wrap, **text_kwargs)
-        text.grid(row=0, column=0, sticky="nsew")
-
-        yscroll = ttk.Scrollbar(container, orient=tk.VERTICAL, command=text.yview)
-        yscroll.grid(row=0, column=1, sticky="ns")
-        text.configure(yscrollcommand=yscroll.set)
-
-        if add_xscroll:
-            xscroll = ttk.Scrollbar(container, orient=tk.HORIZONTAL, command=text.xview)
-            xscroll.grid(row=1, column=0, sticky="ew")
-            text.configure(xscrollcommand=xscroll.set)
-        return text
-
-    def set_status(self, message: str, *, timeout_ms: int = 8000):
-        """更新状态栏文本，并在一段时间后恢复默认。"""
-        self.status_var.set(message)
-        if self._status_job:
-            try:
-                self.after_cancel(self._status_job)
-            except Exception:
-                pass
-            self._status_job = None
-        if timeout_ms > 0:
-            def reset():
-                self.status_var.set("准备就绪")
-                self._status_job = None
-
-            self._status_job = self.after(timeout_ms, reset)
-
-    def _apply_project_from_entry(self) -> bool:
-        raw = self.project_var.get().strip()
-        if not raw:
-            return False
-        try:
-            target = Path(raw).expanduser()
-        except Exception:
-            target = Path(raw)
-        try:
-            normalized = target.resolve()
-        except Exception:
-            normalized = target
-        if normalized == self.project_dir:
-            return False
-        self.set_project(target)
-        return True
-
-    def _on_project_entry_return(self, _event):
-        self._apply_project_from_entry()
-        return "break"
-
-    def _on_project_entry_focus_out(self, _event):
-        self._apply_project_from_entry()
 
     # ------------------------- 页面：输入文件 -----------------------------
     def _build_inputs_page(self, parent):
         frame = ttk.Frame(parent)
 
-        paned = ttk.Panedwindow(frame, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-
         # 左边：INCAR 模板
-        left = ttk.Frame(paned, padding=8)
-        paned.add(left, weight=1)
+        left = ttk.Frame(frame)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         ttk.Label(left, text="INCAR 模板与编辑").pack(anchor=tk.W)
         temp_bar = ttk.Frame(left)
@@ -680,39 +693,23 @@ class VaspGUI(tk.Tk):
             ("dos", "态密度"),
             ("bands", "能带预设"),
         ]:
-            ttk.Radiobutton(
-                temp_bar,
-                text=txt,
-                value=key,
-                variable=self.incar_template,
-                command=self.load_incar_template,
-            ).pack(side=tk.LEFT)
+            ttk.Radiobutton(temp_bar, text=txt, value=key, variable=self.incar_template, command=self.load_incar_template).pack(side=tk.LEFT)
         ttk.Button(temp_bar, text="加载模板到编辑器", command=self.load_incar_template).pack(side=tk.RIGHT)
 
-        self.incar_text = self._create_text_area(
-            left,
-            height=20,
-            add_xscroll=True,
-            pack_kwargs={"fill": tk.BOTH, "expand": True, "pady": 4},
-            text_kwargs={"undo": True},
-        )
+        self.incar_text = tk.Text(left, height=20)
+        self.incar_text.pack(fill=tk.BOTH, expand=True)
         btns = ttk.Frame(left)
         btns.pack(fill=tk.X, pady=4)
         ttk.Button(btns, text="打开现有 INCAR", command=lambda: self.open_into_editor("INCAR", self.incar_text)).pack(side=tk.LEFT)
         ttk.Button(btns, text="保存到项目", command=lambda: self.save_from_editor("INCAR", self.incar_text)).pack(side=tk.LEFT, padx=6)
 
         # 右边：POSCAR & KPOINTS 编辑
-        right = ttk.Frame(paned, padding=8)
-        paned.add(right, weight=1)
+        right = ttk.Frame(frame)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         ttk.Label(right, text="POSCAR 编辑").pack(anchor=tk.W)
-        self.poscar_text = self._create_text_area(
-            right,
-            height=10,
-            add_xscroll=True,
-            pack_kwargs={"fill": tk.BOTH, "expand": True, "pady": 4},
-            text_kwargs={"undo": True},
-        )
+        self.poscar_text = tk.Text(right, height=10)
+        self.poscar_text.pack(fill=tk.BOTH, expand=True)
         row = ttk.Frame(right)
         row.pack(fill=tk.X, pady=4)
         ttk.Button(row, text="打开 POSCAR", command=lambda: self.open_into_editor("POSCAR", self.poscar_text)).pack(side=tk.LEFT)
@@ -721,14 +718,9 @@ class VaspGUI(tk.Tk):
 
         ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
-        ttk.Label(right, text="KPOINTS 编辑（可在“K 点生成”页自动生成）").pack(anchor=tk.W)
-        self.kpoints_text = self._create_text_area(
-            right,
-            height=10,
-            add_xscroll=True,
-            pack_kwargs={"fill": tk.BOTH, "expand": True, "pady": 4},
-            text_kwargs={"undo": True},
-        )
+        ttk.Label(right, text="KPOINTS 编辑（可在K 点生成页自动生成）").pack(anchor=tk.W)
+        self.kpoints_text = tk.Text(right, height=10)
+        self.kpoints_text.pack(fill=tk.BOTH, expand=True)
         row2 = ttk.Frame(right)
         row2.pack(fill=tk.X, pady=4)
         ttk.Button(row2, text="打开 KPOINTS", command=lambda: self.open_into_editor("KPOINTS", self.kpoints_text)).pack(side=tk.LEFT)
@@ -776,20 +768,16 @@ class VaspGUI(tk.Tk):
             write_text(p, editor.get("1.0", tk.END))
             messagebox.showinfo(APP_NAME, f"已保存 {name} -> {p}")
             self.refresh_project_overview()
-            self.set_status(f"{name} 已保存到 {p}")
         except Exception as e:
             messagebox.showerror(APP_NAME, f"保存失败：{e}")
-            self.set_status(f"保存 {name} 失败：{e}", timeout_ms=10000)
 
     def show_poscar_elements(self):
         s = self.poscar_text.get("1.0", tk.END)
         elems = unique_elements_from_poscar(s)
         if elems:
             messagebox.showinfo(APP_NAME, f"POSCAR 元素：{', '.join(elems)}")
-            self.set_status(f"POSCAR 元素：{', '.join(elems)}")
         else:
             messagebox.showwarning(APP_NAME, "未解析到元素，请检查第6/7行。")
-            self.set_status("未能解析 POSCAR 元素", timeout_ms=8000)
 
     # ------------------------- 页面：POTCAR --------------------------------
     def _build_potcar_page(self, parent):
@@ -808,13 +796,8 @@ class VaspGUI(tk.Tk):
         ttk.Label(row2, text="从 POSCAR 自动解析元素并生成 POTCAR：").pack(side=tk.LEFT)
         ttk.Button(row2, text="生成 POTCAR", command=self.do_build_potcar).pack(side=tk.LEFT, padx=8)
 
-        self.pot_msg = self._create_text_area(
-            frame,
-            height=18,
-            wrap="word",
-            add_xscroll=False,
-            pack_kwargs={"fill": tk.BOTH, "expand": True, "padx": 8, "pady": 8},
-        )
+        self.pot_msg = tk.Text(frame, height=18)
+        self.pot_msg.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         return frame
 
@@ -822,7 +805,6 @@ class VaspGUI(tk.Tk):
         d = filedialog.askdirectory(initialdir=self.pot_dir_var.get(), title="选择赝势库根目录")
         if d:
             self.pot_dir_var.set(d)
-            self.set_status(f"已设置赝势库目录：{d}")
 
     def do_build_potcar(self):
         proj = self.current_project_path()
@@ -834,12 +816,10 @@ class VaspGUI(tk.Tk):
                 write_text(pos, s)
             else:
                 messagebox.showwarning(APP_NAME, "项目目录中不存在 POSCAR，且编辑器为空。")
-                self.set_status("生成 POTCAR 失败：POSCAR 不存在或为空", timeout_ms=10000)
                 return
         elems, _ = parse_poscar(read_text(pos))
         if not elems:
             messagebox.showwarning(APP_NAME, "未从 POSCAR 解析到元素。")
-            self.set_status("未能解析 POSCAR 元素，无法生成 POTCAR", timeout_ms=10000)
             return
         pot_base = Path(self.pot_dir_var.get())
         selections: list[Path] = []
@@ -849,7 +829,6 @@ class VaspGUI(tk.Tk):
                 msg = f"未找到元素 {e} 的 POTCAR（在 {pot_base} 下）。"
                 self.pot_msg.insert(tk.END, msg + "\n")
                 messagebox.showerror(APP_NAME, msg)
-                self.set_status(msg, timeout_ms=12000)
                 return
             if len(cands) == 1:
                 selected = cands[0]
@@ -860,7 +839,6 @@ class VaspGUI(tk.Tk):
                     cancel_msg = f"已取消 {e} 的 POTCAR 选择，终止生成。"
                     self.pot_msg.insert(tk.END, cancel_msg + "\n")
                     messagebox.showinfo(APP_NAME, cancel_msg)
-                    self.set_status(cancel_msg, timeout_ms=8000)
                     return
                 selected = Path(sel)
             selections.append(selected)
@@ -871,28 +849,23 @@ class VaspGUI(tk.Tk):
         self.pot_msg.see(tk.END)
         if not ok:
             messagebox.showerror(APP_NAME, msg)
-            self.set_status(f"生成 POTCAR 失败：{msg}", timeout_ms=12000)
         else:
             messagebox.showinfo(APP_NAME, msg)
             self.refresh_project_overview()
-            self.set_status("POTCAR 已成功生成")
 
     # --------- 赝势库探测与选择 ---------
     def detect_pot_roots(self):
         cands = self.scan_pot_roots(limit=30)
         if not cands:
             messagebox.showwarning(APP_NAME, "未在常见位置发现赝势库候选。你也可以手动选择根目录。")
-            self.set_status("未找到赝势库候选，请手动指定目录。", timeout_ms=10000)
             return
         if len(cands) == 1:
             self.pot_dir_var.set(cands[0])
             messagebox.showinfo(APP_NAME, f"已设置赝势库根目录：\n{cands[0]}")
-            self.set_status(f"自动选择赝势库：{cands[0]}")
             return
         sel = self.select_from_list("选择赝势库根目录", cands)
         if sel:
             self.pot_dir_var.set(sel)
-            self.set_status(f"已选择赝势库：{sel}")
 
     def select_from_list(self, title, items):
         top = tk.Toplevel(self)
@@ -910,7 +883,6 @@ class VaspGUI(tk.Tk):
             except Exception:
                 sel["val"] = None
             top.destroy()
-        lb.bind("<Double-Button-1>", lambda _event: ok())
         ttk.Button(top, text="使用选中", command=ok).pack(pady=6)
         top.transient(self); top.grab_set(); self.wait_window(top)
         return sel["val"]
@@ -1041,14 +1013,8 @@ class VaspGUI(tk.Tk):
         sugg = ttk.Frame(status_box)
         sugg.pack(fill=tk.BOTH, expand=False, padx=8, pady=(0, 6))
         ttk.Label(sugg, text="运行建议：").pack(anchor=tk.W)
-        wf_suggest = self._create_text_area(
-            sugg,
-            height=4,
-            wrap="word",
-            add_xscroll=False,
-            pack_kwargs={"fill": tk.X, "expand": True},
-            text_kwargs={"state": "disabled"},
-        )
+        wf_suggest = tk.Text(sugg, height=4, wrap="word", state="disabled")
+        wf_suggest.pack(fill=tk.X, expand=True)
         self._register_suggestion_widget(wf_suggest)
 
         steps = [
@@ -1127,13 +1093,8 @@ class VaspGUI(tk.Tk):
 
         notes = ttk.LabelFrame(frame, text="流程备注 / 待办")
         notes.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
-        self.workflow_notes = self._create_text_area(
-            notes,
-            height=8,
-            wrap="word",
-            add_xscroll=False,
-            pack_kwargs={"fill": tk.BOTH, "expand": True, "padx": 6, "pady": 6},
-        )
+        self.workflow_notes = tk.Text(notes, height=8)
+        self.workflow_notes.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         self.workflow_notes.insert(
             tk.END,
             "可在此记录当前任务的特殊参数、检查列表或备注。内容不会自动保存。",
@@ -1144,7 +1105,6 @@ class VaspGUI(tk.Tk):
         s = gen_kpoints_monkhorst(self.k_nx.get(), self.k_ny.get(), self.k_nz.get(), self.k_gamma.get())
         self.kpoints_text.delete("1.0", tk.END)
         self.kpoints_text.insert("1.0", s)
-        self.set_status("已生成 KPOINTS 网格到编辑器")
 
     def kpoints_save(self):
         proj = self.current_project_path()
@@ -1153,7 +1113,6 @@ class VaspGUI(tk.Tk):
         write_text(proj / "KPOINTS", s)
         messagebox.showinfo(APP_NAME, f"KPOINTS 已保存到 {proj/'KPOINTS'}")
         self.refresh_project_overview()
-        self.set_status("KPOINTS 已写入项目目录")
 
     def goto_tab(self, page):
         try:
@@ -1168,7 +1127,6 @@ class VaspGUI(tk.Tk):
         for line in lines:
             self.run_log.insert(tk.END, line.rstrip("\n") + "\n")
         self.run_log.see(tk.END)
-
 
     # ====== 非阻塞跟随 vasp.out 到 GUI ======
     def _start_following_log(self, log_path: Path, interval_ms: int = 500):
@@ -1190,16 +1148,14 @@ class VaspGUI(tk.Tk):
         try:
             with open(self._log_path, "r", encoding="utf-8", errors="ignore") as f:
                 f.seek(getattr(self, "_tail_pos", 0))
-                chunk = f.read()
+                chunk = f.read(64 * 1024)  # 每 tick 最多 64KB
                 self._tail_pos = f.tell()
         except FileNotFoundError:
-            # 文件还没生成，忽略
             pass
         except Exception as e:
             chunk = f"[log-follow] 读取失败：{e}\n"
         if chunk:
             self.append_run_log(chunk)
-        # 继续下一次
         self._tail_job = self.after(getattr(self, "_tail_interval", 500), self._follow_log_tick)
 
     def _stop_following_log(self):
@@ -1209,19 +1165,6 @@ class VaspGUI(tk.Tk):
             except Exception:
                 pass
             self._tail_job = None
-
-    def _is_pid_running(self, pid: int | None) -> bool:
-        if not pid:
-            return False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return False
-        return True
 
     def _int_from_var(self, var, default=0) -> int:
         try:
@@ -1247,14 +1190,8 @@ class VaspGUI(tk.Tk):
         ttk.Label(row, text="当前状态：").pack(side=tk.LEFT)
         ttk.Label(row, textvariable=self.run_status_var).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text="刷新状态", command=self.refresh_run_status).pack(side=tk.RIGHT)
-        run_suggest = self._create_text_area(
-            status,
-            height=3,
-            wrap="word",
-            add_xscroll=False,
-            pack_kwargs={"fill": tk.X, "padx": 6, "pady": (0, 6)},
-            text_kwargs={"state": "disabled"},
-        )
+        run_suggest = tk.Text(status, height=3, wrap="word", state="disabled")
+        run_suggest.pack(fill=tk.X, padx=6, pady=(0, 6))
         self._register_suggestion_widget(run_suggest)
 
         # 运行方式
@@ -1275,6 +1212,10 @@ class VaspGUI(tk.Tk):
 
         ttk.Label(row1, text="MPI 进程数 -np").grid(row=1, column=0, sticky=tk.W, padx=6, pady=4)
         self.mpi_np = tk.IntVar(value=8)
+        # 新增：自动并行
+        self.auto_parallel = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row1, text="自动并行（智能设置 KPAR/NCORE）",
+                        variable=self.auto_parallel).grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=6)
         ttk.Spinbox(row1, from_=1, to=2048, textvariable=self.mpi_np, width=8).grid(row=1, column=1, sticky=tk.W)
 
         # SLURM 区域
@@ -1302,18 +1243,14 @@ class VaspGUI(tk.Tk):
         ttk.Button(btns, text="启动/提交", command=self.start_run).pack(side=tk.LEFT, padx=8)
         ttk.Button(btns, text="停止本地进程", command=self.stop_local).pack(side=tk.LEFT)
 
-        self.run_log = self._create_text_area(
-            frame,
-            height=14,
-            wrap="none",
-            add_xscroll=True,
-            pack_kwargs={"fill": tk.BOTH, "expand": True, "padx": 8, "pady": 8},
-        )
+        self.run_log = tk.Text(frame, height=14)
+        self.run_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         return frame
 
+    @staticmethod
     def is_windows() -> bool:
-        return os.name == "nt"
+        return os.name == "nt" or sys.platform.startswith("win")
 
     def win_to_wsl_path(self, p: Path) -> str:
         # 将 Windows 路径 C:\foo\bar 转为 /mnt/c/foo/bar
@@ -1333,109 +1270,213 @@ class VaspGUI(tk.Tk):
             messagebox.showwarning(APP_NAME, f"未在 PATH 中找到 {cmd}")
 
     def write_job_script(self):
+        """生成 run_local.sh / run_slurm.sh（含自动并行设置与稳健环境）。"""
         proj = self.current_project_path()
         proj.mkdir(parents=True, exist_ok=True)
-        mode = self.run_mode.get()
-        vcmd = self.vasp_cmd.get().strip()
-        if mode == "local":
-            script = f"""#!/bin/bash
-# 本地运行 VASP（mpirun）
-set -e
-cd "{proj}"
-echo "[INFO] Workdir: $(pwd)"
-mpirun -np {self.mpi_np.get()} {vcmd} > vasp.out 2>&1
-"""
-            write_text(proj / "run_local.sh", script)
+
+        # —— 可选额外库（只拼接存在的路径，不会写坏环境）——
+        extra_libs = []
+        for pth in ["/home/yu/apps/aocl/4.1.0/aocc/lib",
+                    "/home/yu/apps/aocc-compiler-4.1.0/lib"]:
+            try:
+                if Path(pth).exists():
+                    extra_libs.append(pth)
+            except Exception:
+                pass
+        extra_ld = ":".join(extra_libs)
+
+        ld_line = (f'export LD_LIBRARY_PATH="{extra_ld}:${{LD_LIBRARY_PATH}}"\n'
+                   if extra_ld else 'export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"\n')
+
+        env_lines = (
+            "# --- Runtime environment (auto generated) ---\n"
+            ': "${LD_LIBRARY_PATH:=}"\n'
+            f"{ld_line}"
+            'export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"\n'
+            'export OMP_PROC_BIND="${OMP_PROC_BIND:-true}"\n'
+            'export OMP_PLACES="${OMP_PLACES:-cores}"\n'
+        )
+
+        vcmd = (self.vasp_cmd.get().strip() if hasattr(self, "vasp_cmd") else "") or "vasp_std"
+        mpirun_path = which("mpirun") or "mpirun"
+        try:
+            np = int(self.mpi_np.get()) if hasattr(self, "mpi_np") else 8
+        except Exception:
+            np = 8
+
+        # —— 自动并行：写回 KPAR/NCORE（若提供了开关或未提供也尝试）——
+        try:
+            if hasattr(self, "auto_parallel"):
+                if self.auto_parallel.get():
+                    self._autotune_parallel_and_write(np)
+            else:
+                # 没有勾选框也尽量自动一次，不报错即可
+                if hasattr(self, "_autotune_parallel_and_write"):
+                    self._autotune_parallel_and_write(np)
+        except Exception as e:
+            self.append_run_log(f"[auto-parallel] 失败：{e}")
+
+        # ===== 本地 run_local.sh =====
+        local_script = f"""#!/bin/bash
+    set -euo pipefail
+
+    {env_lines}
+    cd "{proj}"
+
+    echo "[INFO] Workdir: $(pwd)"
+    echo "[INFO] Using mpirun: {mpirun_path}"
+    echo "[INFO] VASP cmd    : {vcmd}"
+    echo "[INFO] NP          : {np}"
+    echo "[INFO] LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+    echo "[INFO] OMP_NUM_THREADS=$OMP_NUM_THREADS"
+
+    # 降低调度与 I/O 优先级；并把 MPI 绑定到 core，降低任务迁移开销
+    # 动态选择绑定策略：超过物理核数就用硬件线程
+PHYS_CORES=$(lscpu -p=CORE 2>/dev/null | egrep -v '^#' | cut -d, -f2 | sort -u | wc -l | tr -d ' ')
+if [ -n "$PHYS_CORES" ] && [ "$PHYS_CORES" -gt 0 ] && [ "{np}" -gt "$PHYS_CORES" ]; then
+  BIND="--use-hwthread-cpus --bind-to hwthread --map-by ppr:1:hwthread"
+else
+  BIND="--bind-to core --map-by ppr:1:core"
+fi
+
+nice -n 5 ionice -c2 -n4 \
+{mpirun_path} $BIND -np {np} {vcmd} > vasp.out 2>&1
+
+    """
+
+        # ===== SLURM run_slurm.sh =====
+        slurm_part = self.slurm_part.get().strip() if hasattr(self, "slurm_part") else "normal"
+        slurm_time = self.slurm_time.get().strip() if hasattr(self, "slurm_time") else "02:00:00"
+        try:
+            slurm_nodes = int(self.slurm_nodes.get()) if hasattr(self, "slurm_nodes") else 1
+        except Exception:
+            slurm_nodes = 1
+        try:
+            slurm_ntasks = int(self.slurm_ntasks.get()) if hasattr(self, "slurm_ntasks") else max(np, 1)
+        except Exception:
+            slurm_ntasks = max(np, 1)
+        slurm_account = (self.slurm_account.get().strip() if hasattr(self, "slurm_account") else "")
+        acc_line = f"#SBATCH --account={slurm_account}\n" if slurm_account else ""
+
+        slurm_script = f"""#!/bin/bash
+    #SBATCH --job-name=vasp
+    #SBATCH --partition={slurm_part}
+    #SBATCH --time={slurm_time}
+    #SBATCH --nodes={slurm_nodes}
+    #SBATCH --ntasks={slurm_ntasks}
+    {acc_line}set -euo pipefail
+
+    {env_lines}
+    cd "{proj}"
+
+    echo "SLURM_JOB_ID=$SLURM_JOB_ID"
+    echo "[INFO] Workdir: $(pwd)"
+    echo "[INFO] VASP cmd: {vcmd}"
+    echo "[INFO] ntasks  : $SLURM_NTASKS"
+    echo "[INFO] LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+    echo "[INFO] OMP_NUM_THREADS=$OMP_NUM_THREADS"
+
+    # 绑定到物理核，避免过度超线程导致的抖动
+    srun --cpu-bind=cores {vcmd} > vasp.out 2>&1
+    """
+
+        # —— 写文件并授权 ——
+        try:
+            write_text(proj / "run_local.sh", local_script)
             os.chmod(proj / "run_local.sh", 0o755)
-            self.append_run_log(f"已生成 {proj/'run_local.sh'}")
-        else:
-            acc = f"#SBATCH --account={self.slurm_account.get()}\n" if self.slurm_account.get().strip() else ""
-            script = f"""#!/bin/bash
-#SBATCH --job-name=vasp
-#SBATCH --partition={self.slurm_part.get()}
-#SBATCH --time={self.slurm_time.get()}
-#SBATCH --nodes={self.slurm_nodes.get()}
-#SBATCH --ntasks={self.slurm_ntasks.get()}
-{acc}
+            self.append_run_log(f"已生成 {proj / 'run_local.sh'}")
+        except Exception as e:
+            self.append_run_log(f"[EXC] 写 run_local.sh 失败：{e}")
 
-cd "{proj}"
-echo "SLURM_JOB_ID=$SLURM_JOB_ID"
-
-# 视集群环境加载模块或设置变量
-# module load vasp
-
-srun {vcmd}
-"""
-            write_text(proj / "run_slurm.sh", script)
+        try:
+            write_text(proj / "run_slurm.sh", slurm_script)
             os.chmod(proj / "run_slurm.sh", 0o755)
-            self.append_run_log(f"已生成 {proj/'run_slurm.sh'}")
+            self.append_run_log(f"已生成 {proj / 'run_slurm.sh'}")
+        except Exception as e:
+            self.append_run_log(f"[EXC] 写 run_slurm.sh 失败：{e}")
+
+        # 刷新界面状态
+        self.refresh_project_overview()
 
     def start_run(self):
         proj = self.current_project_path()
         mode = self.run_mode.get()
         vcmd = self.vasp_cmd.get().strip()
+
         if not proj.exists():
             messagebox.showerror(APP_NAME, f"项目目录不存在：{proj}")
             return
+
+        # 关键输入文件缺失时提示，但允许继续
         missing = [f for f in ["INCAR", "POSCAR", "POTCAR"] if not (proj / f).exists()]
         if missing:
             if not messagebox.askyesno(
-                APP_NAME,
-                "检测到以下关键输入文件缺失：\n"
-                + "\n".join(missing)
-                + "\n仍要继续启动吗？",
+                    APP_NAME,
+                    "检测到以下关键输入文件缺失：\n"
+                    + "\n".join(missing)
+                    + "\n仍要继续启动吗？",
             ):
                 return
+
         if mode == "local":
-            if self._is_pid_running(self._local_run_pid):
+            # 防止重复起
+            if self.proc and self.proc.poll() is None:
                 messagebox.showwarning(APP_NAME, "已有本地 VASP 进程在运行。先停止或等待结束。")
                 return
+
+            # 基础可用性检查
             if not which("mpirun"):
-                messagebox.showerror(APP_NAME, "未找到 mpirun。请安装 OpenMPI 或 Intel MPI。")
+                messagebox.showerror(APP_NAME, "未找到 mpirun。请安装 OpenMPI/IntelMPI 并加入 PATH。")
                 return
             if not which(vcmd):
-                messagebox.showerror(APP_NAME, f"未找到 VASP 命令：{vcmd}")
+                messagebox.showerror(APP_NAME, f"未找到 VASP 命令：{vcmd}\n可改填绝对路径，例如 /opt/vasp/vasp_std")
                 return
-            cmd = ["bash", "-lc", f"cd '{proj}' && mpirun -np {self.mpi_np.get()} {vcmd} > vasp.out 2>&1 & echo $!"]
-            try:
-                out = subprocess.check_output(cmd, text=True)
-                pid = int(out.strip())
-                self.append_run_log(f"已启动本地 VASP，PID={pid}")
 
-                self._local_run_pid = pid
-                # 用非阻塞文件跟随替代 tail -f 子进程
+            # 总是重写一次脚本，确保环境最新
+            self.write_job_script()
+            # 替换 start_run() 内 local 分支里 “后台运行脚本” 那一段
+            runsh = proj / "run_local.sh"
+            try:
+                # 使用 Popen 非阻塞启动脚本本身，而不是在主线程里 check_output
+                self.proc = subprocess.Popen(
+                    ["bash", "-lc", f"cd '{proj}' && exec './{runsh.name}'"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True  # 关键：新会话，便于后续整组终止
+                )
+                self.append_run_log(f"[run_local.sh pid] {self.proc.pid}")
+
+                # 启动非阻塞日志跟随
                 self._start_following_log(proj / "vasp.out")
                 self.append_run_log("日志跟随 vasp.out（非阻塞）已启动。\n")
-                self.start_monitor()
+
+                # 改为 after 定时健康检查（避免 time.sleep 阻塞 Tk）
+                def _health_check():
+                    vout = proj / "vasp.out"
+                    if not vout.exists() or vout.stat().st_size == 0:
+                        # 再等 2 秒复查一次
+                        self.after(2000, _health_check)
+                        return
+                    # 有输出就启动监视器
+                    self.start_monitor()
+
+                self.after(1500, _health_check)
+
             except Exception as e:
+                self.append_run_log(f"[EXC] 启动失败：{e}")
                 messagebox.showerror(APP_NAME, f"启动失败：{e}")
-        elif mode == "wsl":
-            # Windows GUI -> 在 WSL 内调用 mpirun 运行 VASP
-            if not is_windows() or not which("wsl"):
-                messagebox.showerror(APP_NAME, "未检测到 Windows/WSL 环境或 wsl.exe 不可用。")
                 return
-            # 建议把项目放在 Windows 盘，如 C:\... ，WSL 中对应 /mnt/c/...
-            proj_wsl = self.win_to_wsl_path(proj)
-            cmd = ["wsl", "-e", "bash", "-lc", f"cd '{proj_wsl}' && mpirun -np {self.mpi_np.get()} {vcmd} > vasp.out 2>&1 & echo $!"]
-            try:
-                out = subprocess.check_output(cmd, text=True)
-                pid = out.strip()
-                self.append_run_log(f"已在 WSL 启动 VASP，PID={pid}")
 
-                # 用非阻塞文件跟随替代 tail -f 子进程
-                self._start_following_log(proj / "vasp.out")
-                self.append_run_log("日志跟随 vasp.out（非阻塞）已启动。\n")
-                self.start_monitor()
-            except Exception as e:
-                messagebox.showerror(APP_NAME, f"WSL 启动失败：{e}")
+        elif mode == "wsl":
+            messagebox.showerror(APP_NAME, "WSL 分支未内置 AOCL/AOCC 环境设置，请使用本地或 SLURM。")
+            return
+
         else:
-            # 提交 SLURM
+            # SLURM：写脚本并 sbatch
             if not which("sbatch"):
                 messagebox.showerror(APP_NAME, "未找到 sbatch。请在 SLURM 节点上运行或配置环境。")
                 return
+            self.write_job_script()
             script = proj / "run_slurm.sh"
-            if not script.exists():
-                self.write_job_script()
             try:
                 out = subprocess.check_output(["bash", "-lc", f"cd '{proj}' && sbatch '{script.name}'"], text=True)
                 if out:
@@ -1445,18 +1486,21 @@ srun {vcmd}
                 messagebox.showerror(APP_NAME, f"sbatch 失败：{e}{e.output}")
 
     def stop_local(self):
-        # 尝试优雅停止本地 vasp：找出进程名包含 vasp 的并杀掉当前目录下的
-        proj = self.current_project_path()
         try:
-            # 粗暴但简单：pkill -f "vasp.*{proj}"
-            subprocess.call(["bash", "-lc", f"pkill -f 'vasp' || true"])  # 保守处理
-
-            self.append_run_log("已尝试停止本地 VASP 进程（pkill -f 'vasp'）。")
+            if self.proc and self.proc.poll() is None:
+                # 发送到整组（需要 start_new_session=True）
+                os.killpg(os.getpgid(self.proc.pid), 15)  # SIGTERM
+                time.sleep(0.5)
+                if self.proc.poll() is None:
+                    os.killpg(os.getpgid(self.proc.pid), 9)  # SIGKILL
+                self.append_run_log("已停止本地 VASP 进程组。\n")
+            else:
+                # 兜底：旧行为
+                subprocess.call(["bash", "-lc", f"pkill -f 'vasp' || true"])
+                self.append_run_log("已尝试 pkill -f 'vasp'。\n")
             self.refresh_run_status()
         except Exception as e:
             messagebox.showerror(APP_NAME, f"停止失败：{e}")
-        finally:
-            self._local_run_pid = None
 
     # ------------------------- 页面：监视 ----------------------------------
     def _build_monitor_page(self, parent):
@@ -1469,14 +1513,8 @@ srun {vcmd}
         ttk.Label(row, text="当前状态：").pack(side=tk.LEFT)
         ttk.Label(row, textvariable=self.run_status_var).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text="刷新状态", command=self.refresh_run_status).pack(side=tk.RIGHT)
-        monitor_suggest = self._create_text_area(
-            status_box,
-            height=3,
-            wrap="word",
-            add_xscroll=False,
-            pack_kwargs={"fill": tk.X, "padx": 6, "pady": (0, 6)},
-            text_kwargs={"state": "disabled"},
-        )
+        monitor_suggest = tk.Text(status_box, height=3, wrap="word", state="disabled")
+        monitor_suggest.pack(fill=tk.X, padx=6, pady=(0, 6))
         self._register_suggestion_widget(monitor_suggest)
 
         top = ttk.Frame(frame)
@@ -1498,23 +1536,22 @@ srun {vcmd}
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        self.mon_info = self._create_text_area(
-            frame,
-            height=6,
-            wrap="word",
-            add_xscroll=False,
-            pack_kwargs={"fill": tk.BOTH, "expand": False, "padx": 8, "pady": 4},
-        )
+        # ETA 显示
+        eta_row = ttk.Frame(frame)
+        eta_row.pack(fill=tk.X, padx=8, pady=(0, 4))
+        ttk.Label(eta_row, text="预计剩余时间：").pack(side=tk.LEFT)
+        self.eta_var = tk.StringVar(value="—")
+        self.eta_label = ttk.Label(eta_row, textvariable=self.eta_var, foreground="#2b8a3e")
+        self.eta_label.pack(side=tk.LEFT, padx=6)
+        ttk.Label(eta_row, text="(基于最近 SCF 平均耗时与 OSZICAR 迭代统计)").pack(side=tk.LEFT, padx=6)
+
+        self.mon_info = tk.Text(frame, height=6)
+        self.mon_info.pack(fill=tk.BOTH, expand=False, padx=8, pady=4)
 
         sys_frame = ttk.LabelFrame(frame, text="系统状态：CPU / 进程 / 文件增长")
         sys_frame.pack(fill=tk.BOTH, expand=False, padx=8, pady=6)
-        self.sys_info = self._create_text_area(
-            sys_frame,
-            height=10,
-            wrap="word",
-            add_xscroll=False,
-            pack_kwargs={"fill": tk.BOTH, "expand": True, "padx": 6, "pady": 6},
-        )
+        self.sys_info = tk.Text(sys_frame, height=10)
+        self.sys_info.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
         self.sys_info.insert(tk.END, "点击“开始监视”以获取实时系统信息。\n")
 
@@ -1525,7 +1562,7 @@ srun {vcmd}
         proj = self.current_project_path()
         self.monitor = EnergyMonitor(proj, self.on_energy_update)
         self.monitor.start()
-        self.mon_info.insert(tk.END, f"开始监视 {proj/'OSZICAR'}\n")
+        self.mon_info.insert(tk.END, f"开始监视 {proj / 'OSZICAR'}\n")
         self.mon_info.see(tk.END)
         watch_files = [s.strip() for s in self.file_watch_var.get().split(",") if s.strip()]
         self.sys_monitor = SystemStatsMonitor(proj, watch_files, self.on_system_update)
@@ -1533,36 +1570,50 @@ srun {vcmd}
         self.sys_info.delete("1.0", tk.END)
         self.sys_info.insert(tk.END, "系统监视线程已启动……\n")
         self.apply_run_status("🟡 正在监视…", ["系统监视线程已启动，等待数据更新。"])
-        self.set_status("监视线程已启动")
+
+        # <<< 新增：初始化刷新一次 ETA >>>
+        self._update_eta()
 
     def stop_monitor(self):
         if self.monitor:
             self.monitor.stop()
             self.monitor = None
         if self.sys_monitor:
+
             monitor = self.sys_monitor
             self.sys_monitor = None
             monitor.stop()
-        self._stop_following_log()
         self.mon_info.insert(tk.END, "已停止监视。\n")
         self.mon_info.see(tk.END)
         self.sys_info.insert(tk.END, "系统监视已停止。\n")
         self.refresh_run_status()
-        self.set_status("监视已停止")
+        self._stop_following_log()
 
     def on_energy_update(self, steps, energies):
-        # Tk 线程安全：使用 after 回到主线程更新
         def _upd():
-            self.ax.cla()
-            self.ax.set_xlabel("Step")
-            self.ax.set_ylabel("Total energy (F or E0) [eV]")
-            self.ax.grid(True, linestyle=":", linewidth=0.8)
-            if steps and energies:
-                self.ax.plot(steps, energies, marker="o", linestyle="-")
+            # 初始化坐标轴标签只做一次
+            if not hasattr(self, "_plot_inited"):
+                self.ax.set_xlabel("Step")
+                self.ax.set_ylabel("Total energy (F or E0) [eV]")
+                self.ax.grid(True, linestyle=":", linewidth=0.8)
+                self._plot_inited = True
+
+            # ★ 不再 cla：直接更新 Line2D 数据
+            self.line.set_data(steps or [], energies or [])
+            self.ax.relim()
+            self.ax.autoscale_view()
+
             self.canvas.draw_idle()
+            # 保证布局立即刷新
+            self.canvas.get_tk_widget().update_idletasks()
+
             if energies:
                 self.mon_info.insert(tk.END, f"最新步：{steps[-1]}, 能量：{energies[-1]:.6f} eV\n")
                 self.mon_info.see(tk.END)
+
+            # 顺手刷新 ETA
+            self._update_eta()
+
         self.after(0, _upd)
 
     def on_system_update(self, stats):
@@ -1605,23 +1656,67 @@ srun {vcmd}
                 lines.append("未获取到进程信息 (可能无 ps 命令或权限不足)。")
             self.sys_info.delete("1.0", tk.END)
             self.sys_info.insert(tk.END, "\n".join(lines) + "\n")
+
+            # <<< 新增：系统状态更新后也刷新 ETA（即便 OSZICAR 暂未增长，仍可用 vasp.out 的 LOOP） >>>
+            self._update_eta()
+
         self.after(0, _upd)
 
-    # ------------------------- 页面：后处理（简） ---------------------------
+    def _estimate_eta_text(self) -> str:
+        """综合 OSZICAR/vasp.out/INCAR 估算 ETA。优先针对几何优化 (NSW>0)。"""
+        proj = self.current_project_path()
+        osz = proj / "OSZICAR"
+        vout = proj / "vasp.out"
+        incar = proj / "INCAR"
+
+        # 解析步数配置
+        NSW = _parse_incar_int(incar, "NSW", None)
+        NELM = _parse_incar_int(incar, "NELM", 60)  # 若未给出，VASP 默认 60
+
+        # 统计 OSZICAR：已完成离子步、平均每步迭代数
+        steps_done, avg_iter = _oszicar_stats(osz)
+
+        # 统计 vasp.out：最近单次 SCF 的平均耗时（中位数更稳）
+        t_per_scf, seen_loops = _vaspout_loop_times(vout, take_last=40)
+
+        # 默认兜底
+        if avg_iter is None:
+            avg_iter = 8.0  # 常见数量级 6~15 之间
+        if t_per_scf is None:
+            return "—"
+
+        # 情况A：几何优化 (NSW>0)
+        if NSW and NSW > 0:
+            remain_steps = max(NSW - steps_done, 0)
+            eta_sec = remain_steps * avg_iter * t_per_scf
+            # 若刚开始，给个宽松区间
+            if steps_done <= 1:
+                eta_sec *= 1.3
+            return _fmt_eta_seconds(eta_sec)
+
+        # 情况B：静态或单步 (NSW<=0) → 用 NELM 估一个上界
+        # 估计已完成迭代数 = vasp.out LOOP 行数（近似）
+        done_iters = seen_loops
+        remain_iters = max((NELM or 60) - done_iters, 0)
+        eta_sec = remain_iters * t_per_scf
+        return _fmt_eta_seconds(eta_sec)
+
+    def _update_eta(self):
+        try:
+            self.eta_var.set(self._estimate_eta_text())
+        except Exception:
+            self.eta_var.set("—")
+
+    # ------------------------- 页面：后处理 ---------------------------
     def _build_post_page(self, parent):
         frame = ttk.Frame(parent)
         row = ttk.Frame(frame)
         row.pack(fill=tk.X, padx=8, pady=8)
-        ttk.Button(row, text="读取 OSZICAR 绘制（一次性）", command=self.plot_once_from_oszicar).pack(side=tk.LEFT)
-        ttk.Button(row, text="提取最终能量", command=self.extract_final_energy).pack(side=tk.LEFT, padx=8)
-
-        self.post_log = self._create_text_area(
-            frame,
-            height=18,
-            wrap="word",
-            add_xscroll=False,
-            pack_kwargs={"fill": tk.BOTH, "expand": True, "padx": 8, "pady": 8},
-        )
+        ttk.Button(row, text="收敛曲线（OSZICAR）→ 图/CSV", command=self.export_convergence).pack(side=tk.LEFT)
+        ttk.Button(row, text="总 DOS（DOSCAR）→ 图/CSV", command=self.export_dos_total).pack(side=tk.LEFT, padx=8)
+        ttk.Button(row, text="能带（EIGENVAL）→ 图/CSV", command=self.export_bands).pack(side=tk.LEFT)
+        self.post_log = tk.Text(frame, height=18)
+        self.post_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         return frame
 
     def plot_once_from_oszicar(self):
@@ -1786,94 +1881,63 @@ srun {vcmd}
                 pass
 
     def refresh_run_status(self):
+        """后台采样 + 主线程更新；带防抖，确保同一时刻最多一个采样线程。"""
         proj = self.current_project_path()
         if not proj.exists():
             self.apply_run_status("⚠️ 项目目录不存在", ["请选择有效的项目路径。"])
             return
+
+        # --- 防抖：已有一次刷新在路上，就直接跳过 ---
+        if getattr(self, "_refresh_busy", False):
+            return
+        self._refresh_busy = True
+
         watch_files = [s.strip() for s in self.file_watch_var.get().split(",") if s.strip()]
-        stats = SystemStatsMonitor.snapshot(proj, watch_files)
-        self._handle_stats(stats)
+
+        def _worker():
+            try:
+                stats = SystemStatsMonitor.snapshot(proj, watch_files)
+            except Exception:
+                stats = {"run_state": "unknown", "suggestions": ["状态刷新失败。"]}
+            finally:
+                # 回到主线程：更新 UI，并清除 busy 标记
+                def _apply():
+                    try:
+                        self._handle_stats(stats)
+                    finally:
+                        self._refresh_busy = False
+
+                self.after(0, _apply)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _handle_stats(self, stats: dict):
         run_state = stats.get("run_state")
         run_pids = stats.get("run_pids", [])
         if run_state == "running" and run_pids:
-            status = f"🟢 运行中 (PID {', '.join(run_pids)})"
+            status = f"   运行中 (PID {', '.join(run_pids)})"
         elif run_state == "idle":
             status = "⚪ 未检测到 VASP 进程"
         else:
             status = "⚠️ 状态未知"
         suggestions = stats.get("suggestions") or []
-        suggestions.extend(self._smart_missing_inputs())
-        suggestions.extend(self._smart_run_diagnostics())
-        unique = []
-        seen = set()
-        for item in suggestions:
-            if not item:
-                continue
-            if item in seen:
-                continue
-            seen.add(item)
-            unique.append(item)
-        self.apply_run_status(status, unique)
+        self.apply_run_status(status, suggestions)
         self.update_overview_with_file_stats(stats.get("files", []))
-
-    def _smart_missing_inputs(self) -> list[str]:
-        """根据项目文件缺失情况给出提示。"""
-        proj = self.current_project_path()
-        hints: list[str] = []
-        essentials = [
-            ("INCAR", "在“输入文件”页加载模板或手动填写。"),
-            ("POSCAR", "可从结构文件导入或手动编辑。"),
-            ("POTCAR", "在“POTCAR 赝势”页自动拼接。"),
-        ]
-        for name, action in essentials:
-            if not (proj / name).exists():
-                hints.append(f"{name} 尚未准备，{action}")
-        if not (proj / "KPOINTS").exists():
-            hints.append("KPOINTS 缺失，可在“K 点生成”页一键生成。")
-        return hints
-
-    def _smart_run_diagnostics(self) -> list[str]:
-        """解析日志末尾的常见错误，给出更智能的提示。"""
-        proj = self.current_project_path()
-        hints: list[str] = []
-        log_path = proj / "vasp.out"
-        if log_path.exists():
-            tail = read_tail(log_path, max_bytes=8192)
-            tail_low = tail.lower()
-            patterns = [
-                ("very bad news", "检测到 VASP 输出中的“VERY BAD NEWS”错误，通常与 INCAR 设置或结构质量有关。"),
-                ("zbrent: fatal error", "检测到 ZBRENT 收敛错误，建议调节 IBRION/EDIFFG 或初始结构。"),
-                ("brmix: very serious problems", "BRMIX 收敛失败，考虑增大 ENCUT、调整混合参数或启用 IALGO=48。"),
-                ("segmentation fault", "输出包含“segmentation fault”，请检查并重启计算。"),
-                ("mpi_abort", "MPI_ABORT 提示计算异常终止，建议查看节点日志或减小并行规模。"),
-            ]
-            for key, msg in patterns:
-                if key in tail_low:
-                    hints.append(msg)
-            if "convergence has not been achieved" in tail_low:
-                hints.append("VASP 提示尚未收敛，可增加步数或放宽收敛准则。")
-            if "error" in tail_low and not hints:
-                hints.append("vasp.out 末尾包含 error 关键字，建议打开日志查看详细信息。")
-        osz = proj / "OSZICAR"
-        if osz.exists():
-            tail = read_tail(osz, max_bytes=4096)
-            if tail and "f=" not in tail.lower() and "e0=" not in tail.lower():
-                hints.append("OSZICAR 尚未产生能量信息，可能是计算尚未真正开始。")
-        return hints
 
     def update_overview_with_file_stats(self, file_stats: list[dict]):
         tree = getattr(self, "workflow_tree", None)
         if not tree or not file_stats:
             return
+        # 使用现有 iid 判断是否存在
+        existing = set(tree.get_children()) | {"__project__", "INCAR", "POSCAR", "KPOINTS", "POTCAR", "CONTCAR",
+                                               "vasp.out", "OSZICAR", "OUTCAR"}
         for item in file_stats:
             name = item.get("name")
             if not name:
                 continue
             short = Path(name).name
             key = self.overview_key_map.get(short.lower())
-            if not key or not tree.exists(key):
+            if not key or key not in existing:
                 continue
             label = self.overview_label_map.get(key, short)
             if item.get("exists"):
@@ -1881,7 +1945,7 @@ srun {vcmd}
                 delta = item.get("delta")
                 if isinstance(delta, (int, float)):
                     detail += f" | Δ {format_bytes(delta)}"
-                status = "🟡 输出中" if isinstance(delta, (int, float)) and delta > 0 else "✅ 已存在"
+                status = "📈 输出增长" if isinstance(delta, (int, float)) and delta > 0 else "✅ 已存在"
             else:
                 status = "⚠️ 未找到"
                 detail = "尚未生成或路径不匹配"
@@ -1941,42 +2005,17 @@ srun {vcmd}
             path = Path(path).expanduser()
         except Exception:
             path = Path(path)
-        try:
-            resolved = path.resolve()
-        except Exception:
-            resolved = path
-        self.project_dir = resolved
-        self.project_var.set(str(resolved))
+        self.project_dir = path
+        self.project_var.set(str(path))
         self.load_project_inputs()
         self.refresh_project_overview()
         self.refresh_run_status()
-        if resolved.exists():
-            self.set_status(f"当前项目目录：{resolved}")
-        else:
-            self.set_status(f"项目目录不存在：{resolved}", timeout_ms=10000)
 
     # ------------------------- 项目与体检 ----------------------------------
-    def open_project_folder(self):
-        proj = self.current_project_path()
-        if not proj.exists():
-            messagebox.showwarning(APP_NAME, f"目录 {proj} 尚不存在，无法打开。")
-            return
-        try:
-            if sys.platform.startswith("darwin"):
-                subprocess.Popen(["open", str(proj)])
-            elif os.name == "nt":
-                os.startfile(str(proj))  # type: ignore[attr-defined]
-            else:
-                subprocess.Popen(["xdg-open", str(proj)])
-            self.set_status(f"已在文件管理器中打开：{proj}")
-        except Exception as exc:
-            messagebox.showerror(APP_NAME, f"无法打开目录：{exc}")
-
     def choose_project(self):
         d = filedialog.askdirectory(initialdir=self.project_var.get(), title="选择项目目录")
         if d:
             self.set_project(Path(d))
-            self.set_status(f"已切换到项目：{d}")
 
     def create_project(self):
         d = filedialog.askdirectory(initialdir=str(Path.home()), title="选择或创建项目父目录")
@@ -1989,7 +2028,6 @@ srun {vcmd}
         p.mkdir(parents=True, exist_ok=True)
         self.set_project(p)
         messagebox.showinfo(APP_NAME, f"已创建项目目录：{p}")
-        self.set_status(f"已创建新项目：{p}")
 
     def quick_check(self):
         proj = self.current_project_path()
@@ -2002,30 +2040,319 @@ srun {vcmd}
                 msgs.append(f"which {cmd:8s} -> {which(cmd) or '未找到'}")
         potroot = Path(self.pot_dir_var.get())
         msgs.append(f"POT 库: {potroot} {'(存在)' if potroot.exists() else '(不存在)'}")
-        smart_hints = self._smart_missing_inputs() + self._smart_run_diagnostics()
-        if smart_hints:
-            msgs.append("")
-            msgs.append("智能提示：")
-            msgs.extend(f"  - {hint}" for hint in smart_hints)
         for msg in msgs:
             self.append_run_log(msg)
         self.refresh_project_overview()
         self.refresh_run_status()
-        self.set_status("快速体检结果已输出至运行日志")
+
+    # === 并行推断辅助 ===
+    def _read_file_text(self, p: Path) -> str:
+        try:
+            return p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    def _incar_get(self, key: str) -> int | None:
+        txt = self._read_file_text(self.current_project_path() / "INCAR")
+        m = re.search(rf"(?mi)^\s*{re.escape(key)}\s*=\s*([-+]?\d+)", txt)
+        return int(m.group(1)) if m else None
+
+    def _incar_upsert(self, key: str, val: int):
+        """在 INCAR 中插入/更新形如 'KEY = val' 的行：
+        - 匹配不区分大小写，仅替换第一处，以保留后续注释或模板段落
+        - 保留原有行前缩进
+        - 追加时确保文件末尾带换行
+        """
+        proj = self.current_project_path()
+        incar = proj / "INCAR"
+        txt = self._read_file_text(incar)
+
+        # 目标行（不带末尾换行，写入时再统一补 '\n'）
+        new_line = f"{key:6s} = {val}"
+
+        # 匹配：行首可有空白，然后是 key，再等号到行尾；忽略大小写、多行模式
+        # 使用命名分组 'lead' 保留原有缩进
+        pattern = re.compile(rf"(?mi)^(?P<lead>\s*){re.escape(key)}\s*=.*$")
+
+        m = pattern.search(txt)
+        if m:
+            # 仅替换第一处匹配，保持该行原有缩进
+            def _repl(mm: re.Match) -> str:
+                lead = mm.group('lead') or ''
+                return f"{lead}{new_line}"
+
+            txt = pattern.sub(_repl, txt, count=1)
+            # 确保文件以换行结尾
+            if not txt.endswith("\n"):
+                txt += "\n"
+        else:
+            # 末尾补换行后再追加新行
+            if txt and not txt.endswith("\n"):
+                txt += "\n"
+            txt += new_line + "\n"
+
+        write_text(incar, txt)
+
+    def _infer_nbands(self) -> int | None:
+        outcar = self.current_project_path() / "OUTCAR"
+        m = re.search(r"(?mi)\bNBANDS\s*=\s*(\d+)", self._read_file_text(outcar))
+        return int(m.group(1)) if m else None
+
+    def _infer_kpoints_total(self) -> int | None:
+        """粗略从 KPOINTS 取 Monkhorst-Pack 网格乘积；line-mode 留空。"""
+        kp = self.current_project_path() / "KPOINTS"
+        s = self._read_file_text(kp).splitlines()
+        if len(s) >= 4 and re.search(r"(?i)gamma|monkhorst", s[2]):
+            try:
+                nx, ny, nz = map(int, s[3].split()[:3])
+                return max(1, nx * ny * nz)
+            except Exception:
+                return None
+        return None
+
+    def _best_divisor(self, n: int, choices=(8, 6, 4, 3, 2, 1)) -> int:
+        for c in choices:
+            if n % c == 0: return c
+        return 1
+
+    def _autotune_parallel_and_write(self, np_total: int):
+        """核心：根据 -np / NBANDS / KPOINTS 推断 KPAR 与 NCORE，并写回 INCAR。"""
+        # 1) 读现有设置（用户若已手动设定，尊重并只做校验）
+        ncore_user = self._incar_get("NCORE")
+        kpar_user = self._incar_get("KPAR")
+
+        # 2) 粗略信息
+        nbands = self._infer_nbands() or 12  # 缺省 12（小体系常见）
+        ktot = self._infer_kpoints_total() or np_total  # 没法判断就放宽
+
+        # 3) 选一个合理的 NCORE（要能整除 -np）
+        ncore = ncore_user if ncore_user and np_total % ncore_user == 0 else self._best_divisor(np_total)
+
+        # 4) 估 groups（band 并行组数），不能超过 NBANDS
+        groups_max = max(1, nbands)
+        # KPAR 先给个上限（不能超过总 k 点的粗略值）
+        kpar_max = max(1, min(ktot, np_total // ncore))
+
+        # 若用户指定了 KPAR 就尽量用，否则我们分配尽量多的 k 点并行
+        if kpar_user:
+            kpar = max(1, min(kpar_user, kpar_max))
+        else:
+            # 让剩余核数 /ncore 尽量落到“<= NBANDS”的组数
+            # np_total = KPAR * NCORE * groups  →  groups = np_total/(KPAR*NCORE)
+            kpar = kpar_max
+            while kpar > 1 and np_total // (kpar * ncore) > groups_max:
+                kpar -= 1
+            # 还要让整除成立
+            while kpar > 1 and (np_total % (kpar * ncore) != 0):
+                kpar -= 1
+            kpar = max(1, kpar)
+
+        groups = max(1, np_total // (kpar * ncore))
+
+        # 5) 写回（只有当自动模式勾选或用户未设置时才写）
+        if self.auto_parallel.get() or (ncore_user is None):
+            self._incar_upsert("NCORE", ncore)
+        if self.auto_parallel.get() or (kpar_user is None):
+            self._incar_upsert("KPAR", kpar)
+
+        self.append_run_log(
+            f"[auto-parallel] np={np_total}, 推断: NCORE={ncore}, KPAR={kpar}, groups≈{groups}, NBANDS≈{nbands}, K总≈{ktot}")
+
+    def _plots_dir(self) -> Path:
+        d = self.current_project_path() / "plots"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def export_convergence(self):
+        proj = self.current_project_path()
+        osz = proj / "OSZICAR"
+        if not osz.exists():
+            messagebox.showwarning(APP_NAME, f"{osz} 不存在。");
+            return
+        steps, energies = [], []
+        with osz.open("r", encoding="utf-8", errors="ignore") as f:
+            i = 0
+            for line in f:
+                m = ENERGY_RX.search(line)
+                if m:
+                    val = m.group(1) or m.group(2)
+                    try:
+                        e = float(val.replace("D", "E").replace("d", "E"))
+                        i += 1;
+                        steps.append(i);
+                        energies.append(e)
+                    except:
+                        pass
+        if not energies:
+            messagebox.showwarning(APP_NAME, "OSZICAR 未解析到能量。");
+            return
+
+        # 图
+        fig = Figure(figsize=(6, 4), dpi=140);
+        ax = fig.add_subplot(111)
+        ax.plot(steps, energies, marker="o", linestyle="-")
+        ax.set_xlabel("Ionic step");
+        ax.set_ylabel("Total energy [eV]")
+        ax.grid(True, linestyle=":", linewidth=0.8)
+        canvas = FigureCanvasTkAgg(fig, master=self.page_post); canvas.draw()
+        canvas.draw()
+
+        out = self._plots_dir()
+        png = out / "convergence.png";
+        svg = out / "convergence.svg";
+        csv = out / "convergence.csv"
+        fig.savefig(png, bbox_inches="tight");
+        fig.savefig(svg, bbox_inches="tight")
+        with (csv).open("w", encoding="utf-8") as g:
+            g.write("step,energy_eV\n");
+            g.writelines(f"{s},{e}\n" for s, e in zip(steps, energies))
+        self.post_log.insert(tk.END, f"已导出收敛图：{png}\nSVG：{svg}\nCSV：{csv}\n")
+
+    def _fermi_from_outcar(self) -> float | None:
+        m = re.search(r"(?mi)E-fermi\s*:\s*([-\d.Ee+]+)", self._read_file_text(self.current_project_path() / "OUTCAR"))
+        return float(m.group(1)) if m else None
+
+    def export_dos_total(self):
+        proj = self.current_project_path()
+        doscar = proj / "DOSCAR"
+        if not doscar.exists():
+            messagebox.showwarning(APP_NAME, "未找到 DOSCAR。请先做 DOS 计算。");
+            return
+        ef = self._fermi_from_outcar() or 0.0
+
+        with doscar.open("r", encoding="utf-8", errors="ignore") as f:
+            lines = f.read().splitlines()
+        if len(lines) < 6:
+            messagebox.showwarning(APP_NAME, "DOSCAR 文件太短。");
+            return
+        # 第6行起为 DOS 数据，直到 NEDOS 行数结束；简单做法：跳过前5行，直到遇到空行/非数字
+        data = []
+        for ln in lines[5:]:
+            parts = ln.split()
+            if len(parts) < 3: break
+            try:
+                nums = list(map(float, parts))
+                data.append(nums)
+            except:
+                break
+        if not data:
+            messagebox.showwarning(APP_NAME, "未解析到 DOS 数据。");
+            return
+
+        arr = list(zip(*data))  # 转置
+        E = [x - ef for x in arr[0]]
+        if len(arr) >= 5:  # 自旋极化：E, DOS_up, DOS_dn, Int_up, Int_dn
+            DOS = [u + d for u, d in zip(arr[1], arr[2])]
+        else:  # 非极化：E, DOS, Int
+            DOS = list(arr[1])
+
+        # 图
+        fig = Figure(figsize=(6, 4), dpi=140);
+        ax = fig.add_subplot(111)
+        ax.plot(E, DOS, linewidth=1.2)
+        ax.axvline(0.0, linestyle="--", linewidth=0.8)  # EF
+        ax.set_xlabel("Energy - $E_F$ (eV)");
+        ax.set_ylabel("DOS (states/eV)")
+        ax.grid(True, linestyle=":", linewidth=0.8)
+        out = self._plots_dir()
+        png = out / "dos_total.png";
+        svg = out / "dos_total.svg";
+        csv = out / "dos_total.csv"
+        fig.savefig(png, bbox_inches="tight");
+        fig.savefig(svg, bbox_inches="tight")
+        with (csv).open("w", encoding="utf-8") as g:
+            g.write("E-EF,DOS\n");
+            g.writelines(f"{x},{y}\n" for x, y in zip(E, DOS))
+        self.post_log.insert(tk.END, f"已导出 DOS：{png}\nSVG：{svg}\nCSV：{csv}\n")
+
+    def export_bands(self):
+        proj = self.current_project_path()
+        eig = proj / "EIGENVAL"
+        if not eig.exists():
+            messagebox.showwarning(APP_NAME, "未找到 EIGENVAL。请使用 KPOINTS 路径做 band 计算。");
+            return
+        ef = self._fermi_from_outcar() or 0.0
+        txt = self._read_file_text(eig).splitlines()
+
+        # 头部：第6行通常包含 NKPTS, NBANDS, NIONS
+        try:
+            parts = txt[5].split()
+            nk, nb = int(parts[0]), int(parts[1])
+        except Exception:
+            messagebox.showwarning(APP_NAME, "EIGENVAL 头部解析失败。");
+            return
+
+        i = 6
+        kpts = []
+        bands = [[] for _ in range(nb)]
+
+        for _ in range(nk):
+            # 跳过空行（有些版本每个 k-block 前有空行）
+            while i < len(txt) and not txt[i].strip():
+                i += 1
+            if i >= len(txt):
+                break
+
+            # kx ky kz w
+            try:
+                kx, ky, kz, w = map(float, txt[i].split()[:4])
+            except Exception:
+                messagebox.showwarning(APP_NAME, "EIGENVAL k 点块格式异常。")
+                return
+            i += 1
+            kpts.append((kx, ky, kz))
+
+            # nb 行： bandIndex, energy, occ
+            for b in range(nb):
+                parts = txt[i].split()
+                e = float(parts[1]) - ef
+                bands[b].append(e)
+                i += 1
+
+        import math
+        xs = [0.0]
+        for a, b in zip(kpts[:-1], kpts[1:]):
+            xs.append(xs[-1] + math.dist(a, b))
+
+        fig = Figure(figsize=(6, 4), dpi=140)
+        ax = fig.add_subplot(111)
+        for b in range(nb):
+            ax.plot(xs, bands[b], linewidth=0.8)
+        ax.axhline(0, linestyle="--", linewidth=0.8)  # EF
+        ax.set_xlabel("k-path (arb.)")
+        ax.set_ylabel("Energy - $E_F$ (eV)")
+        ax.grid(True, linestyle=":", linewidth=0.8)
+        out = self._plots_dir()
+        png, svg, csv = out / "bands.png", out / "bands.svg", out / "bands.csv"
+        fig.savefig(png, bbox_inches="tight")
+        fig.savefig(svg, bbox_inches="tight")
+        with csv.open("w", encoding="utf-8") as g:
+            g.write("k," + ",".join(f"band{b + 1}" for b in range(nb)) + "\n")
+            for j in range(nk):
+                row = [f"{xs[j]}"] + [f"{bands[b][j]}" for b in range(nb)]
+                g.write(",".join(row) + "\n")
+        self.post_log.insert(tk.END, f"已导出能带：{png}\nSVG：{svg}\nCSV：{csv}\n")
+
+    def import_project_files(self):
+        """把项目目录下的 INCAR/POSCAR/KPOINTS 一键读入三个编辑器，并刷新概览与状态。"""
+        self.load_project_inputs()
+        self.refresh_project_overview()
+        self.refresh_run_status()
+        messagebox.showinfo(APP_NAME, "已读取项目文件并刷新状态。")
 
     # ------------------------- 退出清理 ------------------------------------
     def on_close(self):
         try:
             # 保存配置
             self.save_config()
-            # 停止监视与日志跟随
+            # 停止监视与 tail 进程
             self.stop_monitor()
-            self._stop_following_log()
             if self.proc and self.proc.poll() is None:
                 self.proc.terminate()
         except Exception:
             pass
         self.destroy()
+        self._stop_following_log()
 
 
 if __name__ == "__main__":
