@@ -21,7 +21,7 @@ POTCAR 拼接（本地已有赝势）、K 点生成、作业脚本生成与提�
 
 说明：
 - 本工具不包含、也不会分发任何 VASP 程序或赝势文件。请确保你拥有 VASP 许可，
-  并在“POTCAR 面板”正确设置本地赝势库路径。
+  并在"POTCAR 面板"正确设置本地赝势库路径。
 - 监视功能主要解析 OSZICAR（F= 或 E0= 行），用于快速查看收敛趋势。
 - SLURM 模板可在 GUI 中一键生成，你可以直接提交或先手动修改。
 
@@ -206,10 +206,14 @@ def gen_kpoints_monkhorst(nx: int, ny: int, nz: int, gamma_center: bool) -> str:
 class SystemStatsMonitor(threading.Thread):
     """后台线程：监视 CPU/进程以及关键文件增长情况。"""
 
-    def __init__(self, workdir: Path, watch_files: list[str], on_update):
+    def __init__(self, workdir: Path, watch_files: list[str] | None, on_update=None):
         super().__init__(daemon=True)
-        self.workdir = workdir
-        self.watch_files = watch_files
+        self.workdir = Path(workdir).expanduser()
+        try:
+            self.workdir_resolved = self.workdir.resolve()
+        except Exception:
+            self.workdir_resolved = self.workdir
+        self.watch_files = watch_files or []
         self.on_update = on_update  # callback(dict)
         self._stop = threading.Event()
         self._prev_cpu = None  # tuple(total, idle)
@@ -221,10 +225,11 @@ class SystemStatsMonitor(threading.Thread):
     def run(self):
         while not self._stop.is_set():
             stats = self._collect_stats()
-            try:
-                self.on_update(stats)
-            except Exception:
-                pass
+            if self.on_update:
+                try:
+                    self.on_update(stats)
+                except Exception:
+                    pass
             for _ in range(6):
                 if self._stop.is_set():
                     break
@@ -236,12 +241,16 @@ class SystemStatsMonitor(threading.Thread):
         loadavg = self._loadavg()
         files = self._file_stats()
         procs = self._process_stats()
+        run_state, run_pids, suggestions = self._run_status(procs, files)
         return {
             "timestamp": timestamp,
             "cpu_usage": cpu_usage,
             "loadavg": loadavg,
             "files": files,
             "processes": procs,
+            "run_state": run_state,
+            "run_pids": run_pids,
+            "suggestions": suggestions,
         }
 
     def _cpu_usage_percent(self) -> float | None:
@@ -324,14 +333,62 @@ class SystemStatsMonitor(threading.Thread):
             if len(parts) < 4:
                 continue
             cmd_name = parts[1]
+            pid = parts[0]
+            cwd = self._proc_cwd(pid)
+            in_project = False
+            try:
+                if cwd:
+                    in_project = Path(cwd).resolve() == self.workdir_resolved
+            except Exception:
+                in_project = False
             procs.append({
-                "pid": parts[0],
+                "pid": pid,
                 "cmd": cmd_name,
                 "cpu": parts[2],
                 "mem": parts[3],
                 "is_vasp": "vasp" in cmd_name.lower() or "mpi" in cmd_name.lower(),
+                "cwd": cwd,
+                "in_project": in_project,
             })
         return procs
+
+    def _proc_cwd(self, pid: str) -> str | None:
+        proc_path = Path("/proc") / str(pid) / "cwd"
+        try:
+            return os.readlink(proc_path)
+        except Exception:
+            return None
+
+    def _run_status(self, procs: list[dict], files: list[dict]) -> tuple[str, list[str], list[str]]:
+        run_pids: list[str] = []
+        suggestions: list[str] = []
+        for proc in procs:
+            if proc.get("is_vasp") and proc.get("in_project"):
+                run_pids.append(proc.get("pid", ""))
+        run_state = "running" if run_pids else "idle"
+        if run_pids:
+            suggestions.append(
+                f"检测到 {len(run_pids)} 个 VASP 相关进程在 {self.workdir} 运行。"
+            )
+        else:
+            suggestions.append("未检测到项目内的 VASP 进程，可检查作业或尝试重新启动。")
+
+        for item in files:
+            short = Path(item.get("name", "")).name
+            if not item.get("exists"):
+                suggestions.append(f"未发现 {short}，请确认计算是否已开始输出。")
+            else:
+                delta = item.get("delta")
+                if isinstance(delta, (int, float)) and delta <= 0 and run_pids:
+                    suggestions.append(f"{short} 暂未增长，可稍后再次检查。")
+        if len(suggestions) > 5:
+            suggestions = suggestions[:5]
+        return run_state, run_pids, suggestions
+
+    @classmethod
+    def snapshot(cls, workdir: Path, watch_files: list[str] | None) -> dict:
+        monitor = cls(workdir, watch_files, on_update=None)
+        return monitor._collect_stats()
 
 
 class EnergyMonitor(threading.Thread):
@@ -401,8 +458,24 @@ class VaspGUI(tk.Tk):
         self.proc = None  # subprocess.Popen or None
         self.monitor = None  # EnergyMonitor
         self.sys_monitor = None  # SystemStatsMonitor
+        self.run_status_var = tk.StringVar(value="⚪ 未检测")
+        self.run_suggestion_widgets: list[tk.Text] = []
+        self.overview_items = [
+            ("__project__", "项目目录"),
+            ("INCAR", "INCAR"),
+            ("POSCAR", "POSCAR"),
+            ("KPOINTS", "KPOINTS"),
+            ("POTCAR", "POTCAR"),
+            ("CONTCAR", "CONTCAR"),
+            ("vasp.out", "vasp.out"),
+            ("OSZICAR", "OSZICAR"),
+            ("OUTCAR", "OUTCAR"),
+        ]
+        self.overview_label_map = {k: label for k, label in self.overview_items}
+        self.overview_key_map = {k.lower(): k for k, _ in self.overview_items}
 
         self._build_ui()
+        self.set_project(self.project_dir)
 
         # 加载历史配置（若存在）
         try:
@@ -489,7 +562,7 @@ class VaspGUI(tk.Tk):
 
         ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
-        ttk.Label(right, text="KPOINTS 编辑（可在“K 点生成”页自动生成）").pack(anchor=tk.W)
+        ttk.Label(right, text="KPOINTS 编辑（可在"K 点生成"页自动生成）").pack(anchor=tk.W)
         self.kpoints_text = tk.Text(right, height=10)
         self.kpoints_text.pack(fill=tk.BOTH, expand=True)
         row2 = ttk.Frame(right)
@@ -532,12 +605,13 @@ class VaspGUI(tk.Tk):
             messagebox.showerror(APP_NAME, f"读取失败：{e}")
 
     def save_from_editor(self, name: str, editor: tk.Text):
-        proj = Path(self.project_var.get()).expanduser()
+        proj = self.current_project_path()
         proj.mkdir(parents=True, exist_ok=True)
         p = proj / name
         try:
             write_text(p, editor.get("1.0", tk.END))
             messagebox.showinfo(APP_NAME, f"已保存 {name} -> {p}")
+            self.refresh_project_overview()
         except Exception as e:
             messagebox.showerror(APP_NAME, f"保存失败：{e}")
 
@@ -577,7 +651,7 @@ class VaspGUI(tk.Tk):
             self.pot_dir_var.set(d)
 
     def do_build_potcar(self):
-        proj = Path(self.project_var.get()).expanduser()
+        proj = self.current_project_path()
         pos = proj / "POSCAR"
         if not pos.exists():
             # 尝试从编辑器
@@ -598,6 +672,7 @@ class VaspGUI(tk.Tk):
             messagebox.showerror(APP_NAME, msg)
         else:
             messagebox.showinfo(APP_NAME, msg)
+            self.refresh_project_overview()
 
     # --------- 赝势库探测与选择 ---------
     def detect_pot_roots(self):
@@ -732,6 +807,37 @@ class VaspGUI(tk.Tk):
         )
         intro.pack(fill=tk.X, padx=12, pady=8)
 
+        status_box = ttk.LabelFrame(frame, text="当前项目状态")
+        status_box.pack(fill=tk.BOTH, expand=False, padx=12, pady=6)
+
+        status_row = ttk.Frame(status_box)
+        status_row.pack(fill=tk.X, padx=8, pady=6)
+        ttk.Label(status_row, text="运行状态：").pack(side=tk.LEFT)
+        ttk.Label(status_row, textvariable=self.run_status_var).pack(side=tk.LEFT, padx=4)
+        ttk.Button(status_row, text="刷新状态", command=self.refresh_run_status).pack(side=tk.RIGHT)
+
+        tree_frame = ttk.Frame(status_box)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+        columns = ("name", "status", "detail")
+        self.workflow_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=6)
+        self.workflow_tree.heading("name", text="项目项")
+        self.workflow_tree.heading("status", text="状态")
+        self.workflow_tree.heading("detail", text="详情")
+        self.workflow_tree.column("name", width=120, anchor=tk.W)
+        self.workflow_tree.column("status", width=120, anchor=tk.W)
+        self.workflow_tree.column("detail", anchor=tk.W, stretch=True)
+        tree_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.workflow_tree.yview)
+        self.workflow_tree.configure(yscrollcommand=tree_scroll.set)
+        self.workflow_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        sugg = ttk.Frame(status_box)
+        sugg.pack(fill=tk.BOTH, expand=False, padx=8, pady=(0, 6))
+        ttk.Label(sugg, text="运行建议：").pack(anchor=tk.W)
+        wf_suggest = tk.Text(sugg, height=4, wrap="word", state="disabled")
+        wf_suggest.pack(fill=tk.X, expand=True)
+        self._register_suggestion_widget(wf_suggest)
+
         steps = [
             (
                 "① 准备项目目录",
@@ -791,19 +897,24 @@ class VaspGUI(tk.Tk):
             ),
         ]
 
-        for title, desc, buttons, page in steps:
-            box = ttk.LabelFrame(frame, text=title)
-            box.pack(fill=tk.X, padx=12, pady=6)
-            ttk.Label(box, text=desc, justify=tk.LEFT).pack(anchor=tk.W, padx=8, pady=4)
-            row = ttk.Frame(box)
-            row.pack(anchor=tk.W, padx=8, pady=4)
+        steps_frame = ttk.Frame(frame)
+        steps_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
+        steps_frame.grid_columnconfigure(0, weight=1)
+        steps_frame.grid_columnconfigure(1, weight=1)
+        for idx, (title, desc, buttons, page) in enumerate(steps):
+            row, col = divmod(idx, 2)
+            box = ttk.LabelFrame(steps_frame, text=title)
+            box.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
+            ttk.Label(box, text=desc, justify=tk.LEFT, wraplength=360).pack(anchor=tk.W, padx=8, pady=4)
+            row_frame = ttk.Frame(box)
+            row_frame.pack(anchor=tk.W, padx=8, pady=4)
             for txt, cmd in buttons:
-                ttk.Button(row, text=txt, command=cmd).pack(side=tk.LEFT, padx=4)
-            ttk.Button(row, text="打开此面板", command=lambda p=page: self.goto_tab(p)).pack(side=tk.LEFT, padx=8)
+                ttk.Button(row_frame, text=txt, command=cmd).pack(side=tk.LEFT, padx=4)
+            ttk.Button(row_frame, text="打开此面板", command=lambda p=page: self.goto_tab(p)).pack(side=tk.LEFT, padx=8)
 
         notes = ttk.LabelFrame(frame, text="流程备注 / 待办")
         notes.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
-        self.workflow_notes = tk.Text(notes, height=10)
+        self.workflow_notes = tk.Text(notes, height=8)
         self.workflow_notes.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         self.workflow_notes.insert(
             tk.END,
@@ -817,11 +928,12 @@ class VaspGUI(tk.Tk):
         self.kpoints_text.insert("1.0", s)
 
     def kpoints_save(self):
-        proj = Path(self.project_var.get())
+        proj = self.current_project_path()
         proj.mkdir(parents=True, exist_ok=True)
         s = self.kpoints_text.get("1.0", tk.END)
         write_text(proj / "KPOINTS", s)
         messagebox.showinfo(APP_NAME, f"KPOINTS 已保存到 {proj/'KPOINTS'}")
+        self.refresh_project_overview()
 
     def goto_tab(self, page):
         try:
@@ -832,6 +944,17 @@ class VaspGUI(tk.Tk):
     # ------------------------- 页面：运行 / 提交 ----------------------------
     def _build_run_page(self, parent):
         frame = ttk.Frame(parent)
+
+        status = ttk.LabelFrame(frame, text="运行状态")
+        status.pack(fill=tk.X, padx=8, pady=6)
+        row = ttk.Frame(status)
+        row.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Label(row, text="当前状态：").pack(side=tk.LEFT)
+        ttk.Label(row, textvariable=self.run_status_var).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text="刷新状态", command=self.refresh_run_status).pack(side=tk.RIGHT)
+        run_suggest = tk.Text(status, height=3, wrap="word", state="disabled")
+        run_suggest.pack(fill=tk.X, padx=6, pady=(0, 6))
+        self._register_suggestion_widget(run_suggest)
 
         # 运行方式
         row0 = ttk.LabelFrame(frame, text="运行方式")
@@ -904,7 +1027,7 @@ class VaspGUI(tk.Tk):
             messagebox.showwarning(APP_NAME, f"未在 PATH 中找到 {cmd}")
 
     def write_job_script(self):
-        proj = Path(self.project_var.get())
+        proj = self.current_project_path()
         proj.mkdir(parents=True, exist_ok=True)
         mode = self.run_mode.get()
         vcmd = self.vasp_cmd.get().strip()
@@ -943,7 +1066,7 @@ srun {vcmd}
         self.run_log.see(tk.END)
 
     def start_run(self):
-        proj = Path(self.project_var.get())
+        proj = self.current_project_path()
         mode = self.run_mode.get()
         vcmd = self.vasp_cmd.get().strip()
         if not proj.exists():
@@ -1020,18 +1143,30 @@ srun {vcmd}
 
     def stop_local(self):
         # 尝试优雅停止本地 vasp：找出进程名包含 vasp 的并杀掉当前目录下的
-        proj = Path(self.project_var.get())
+        proj = self.current_project_path()
         try:
             # 粗暴但简单：pkill -f "vasp.*{proj}"
             subprocess.call(["bash", "-lc", f"pkill -f 'vasp' || true"])  # 保守处理
             self.run_log.insert(tk.END, "已尝试停止本地 VASP 进程（pkill -f 'vasp'）。\n")
             self.run_log.see(tk.END)
+            self.refresh_run_status()
         except Exception as e:
             messagebox.showerror(APP_NAME, f"停止失败：{e}")
 
     # ------------------------- 页面：监视 ----------------------------------
     def _build_monitor_page(self, parent):
         frame = ttk.Frame(parent)
+
+        status_box = ttk.LabelFrame(frame, text="运行状态概览")
+        status_box.pack(fill=tk.X, padx=8, pady=6)
+        row = ttk.Frame(status_box)
+        row.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Label(row, text="当前状态：").pack(side=tk.LEFT)
+        ttk.Label(row, textvariable=self.run_status_var).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text="刷新状态", command=self.refresh_run_status).pack(side=tk.RIGHT)
+        monitor_suggest = tk.Text(status_box, height=3, wrap="word", state="disabled")
+        monitor_suggest.pack(fill=tk.X, padx=6, pady=(0, 6))
+        self._register_suggestion_widget(monitor_suggest)
 
         top = ttk.Frame(frame)
         top.pack(fill=tk.X, padx=8, pady=6)
@@ -1059,13 +1194,13 @@ srun {vcmd}
         sys_frame.pack(fill=tk.BOTH, expand=False, padx=8, pady=6)
         self.sys_info = tk.Text(sys_frame, height=10)
         self.sys_info.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-        self.sys_info.insert(tk.END, "点击“开始监视”以获取实时系统信息。\n")
+        self.sys_info.insert(tk.END, "点击"开始监视"以获取实时系统信息。\n")
 
         return frame
 
     def start_monitor(self):
         self.stop_monitor()
-        proj = Path(self.project_var.get())
+        proj = self.current_project_path()
         self.monitor = EnergyMonitor(proj, self.on_energy_update)
         self.monitor.start()
         self.mon_info.insert(tk.END, f"开始监视 {proj/'OSZICAR'}\n")
@@ -1075,6 +1210,7 @@ srun {vcmd}
         self.sys_monitor.start()
         self.sys_info.delete("1.0", tk.END)
         self.sys_info.insert(tk.END, "系统监视线程已启动……\n")
+        self.apply_run_status("🟡 正在监视…", ["系统监视线程已启动，等待数据更新。"])
 
     def stop_monitor(self):
         if self.monitor:
@@ -1090,6 +1226,7 @@ srun {vcmd}
         self.mon_info.insert(tk.END, "已停止监视。\n")
         self.mon_info.see(tk.END)
         self.sys_info.insert(tk.END, "系统监视已停止。\n")
+        self.refresh_run_status()
 
     def on_energy_update(self, steps, energies):
         # Tk 线程安全：使用 after 回到主线程更新
@@ -1108,7 +1245,16 @@ srun {vcmd}
 
     def on_system_update(self, stats):
         def _upd():
+            self._handle_stats(stats)
             lines = []
+            run_state = stats.get("run_state")
+            run_pids = stats.get("run_pids", [])
+            if run_state == "running" and run_pids:
+                lines.append(f"运行状态：运行中 (PID {', '.join(run_pids)})")
+            elif run_state == "idle":
+                lines.append("运行状态：未检测到 VASP 进程")
+            else:
+                lines.append("运行状态：未知")
             lines.append(f"时间：{stats.get('timestamp', '-')}")
             cpu = stats.get("cpu_usage")
             if cpu is not None:
@@ -1152,7 +1298,7 @@ srun {vcmd}
         return frame
 
     def plot_once_from_oszicar(self):
-        proj = Path(self.project_var.get())
+        proj = self.current_project_path()
         osz = proj / "OSZICAR"
         if not osz.exists():
             messagebox.showwarning(APP_NAME, f"{osz} 不存在。")
@@ -1181,7 +1327,7 @@ srun {vcmd}
         self.post_log.see(tk.END)
 
     def extract_final_energy(self):
-        proj = Path(self.project_var.get())
+        proj = self.current_project_path()
         osz = proj / "OSZICAR"
         if not osz.exists():
             messagebox.showwarning(APP_NAME, f"{osz} 不存在。")
@@ -1221,7 +1367,7 @@ srun {vcmd}
             except Exception:
                 pass
         # 基本变量
-        self.project_var.set(data.get("project", self.project_var.get()))
+        project_path = data.get("project", self.project_var.get())
         self.pot_dir_var.set(data.get("pot_dir", self.pot_dir_var.get()))
         self.run_mode.set(data.get("run_mode", self.run_mode.get()))
         self.vasp_cmd.set(data.get("vasp_cmd", self.vasp_cmd.get()))
@@ -1256,6 +1402,7 @@ srun {vcmd}
             self.nb.select(idx)
         except Exception:
             pass
+        self.set_project(project_path)
 
     def save_config(self):
         data = {
@@ -1280,11 +1427,143 @@ srun {vcmd}
         except Exception:
             pass
 
+    def _register_suggestion_widget(self, widget: tk.Text):
+        self.run_suggestion_widgets.append(widget)
+
+    def current_project_path(self) -> Path:
+        val = self.project_var.get()
+        try:
+            proj = Path(val).expanduser()
+        except Exception:
+            proj = Path(val)
+        self.project_dir = proj
+        return proj
+
+    def apply_run_status(self, status_text: str, suggestions: list[str] | None = None):
+        self.run_status_var.set(status_text)
+        text = "暂无建议。"
+        if suggestions:
+            text = "\n".join(f"• {s}" for s in suggestions)
+        for widget in self.run_suggestion_widgets:
+            try:
+                widget.configure(state="normal")
+                widget.delete("1.0", tk.END)
+                widget.insert("1.0", text)
+                widget.configure(state="disabled")
+            except Exception:
+                pass
+
+    def refresh_run_status(self):
+        proj = self.current_project_path()
+        if not proj.exists():
+            self.apply_run_status("⚠️ 项目目录不存在", ["请选择有效的项目路径。"])
+            return
+        watch_files = [s.strip() for s in self.file_watch_var.get().split(",") if s.strip()]
+        stats = SystemStatsMonitor.snapshot(proj, watch_files)
+        self._handle_stats(stats)
+
+    def _handle_stats(self, stats: dict):
+        run_state = stats.get("run_state")
+        run_pids = stats.get("run_pids", [])
+        if run_state == "running" and run_pids:
+            status = f"🟢 运行中 (PID {', '.join(run_pids)})"
+        elif run_state == "idle":
+            status = "⚪ 未检测到 VASP 进程"
+        else:
+            status = "⚠️ 状态未知"
+        suggestions = stats.get("suggestions") or []
+        self.apply_run_status(status, suggestions)
+        self.update_overview_with_file_stats(stats.get("files", []))
+
+    def update_overview_with_file_stats(self, file_stats: list[dict]):
+        tree = getattr(self, "workflow_tree", None)
+        if not tree or not file_stats:
+            return
+        for item in file_stats:
+            name = item.get("name")
+            if not name:
+                continue
+            short = Path(name).name
+            key = self.overview_key_map.get(short.lower())
+            if not key or not tree.exists(key):
+                continue
+            label = self.overview_label_map.get(key, short)
+            if item.get("exists"):
+                detail = f"大小 {format_bytes(item.get('size'))}"
+                delta = item.get("delta")
+                if isinstance(delta, (int, float)):
+                    detail += f" | Δ {format_bytes(delta)}"
+                status = "🟡 输出中" if isinstance(delta, (int, float)) and delta > 0 else "✅ 已存在"
+            else:
+                status = "⚠️ 未找到"
+                detail = "尚未生成或路径不匹配"
+            tree.item(key, values=(label, status, detail))
+
+    def refresh_project_overview(self):
+        tree = getattr(self, "workflow_tree", None)
+        if not tree:
+            return
+        for row in tree.get_children():
+            tree.delete(row)
+        proj = self.current_project_path()
+        exists = proj.exists()
+        proj_status = "✅ 已存在" if exists else "⚠️ 未找到"
+        tree.insert(
+            "",
+            tk.END,
+            iid="__project__",
+            values=(self.overview_label_map.get("__project__", "项目目录"), proj_status, str(proj)),
+        )
+        for key, label in self.overview_items:
+            if key == "__project__":
+                continue
+            path = proj / key
+            if path.exists():
+                try:
+                    stat = path.stat()
+                    mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime))
+                    status = "✅ 已存在"
+                    detail = f"更新于 {mtime} | {format_bytes(stat.st_size)}"
+                except Exception:
+                    status = "✅ 已存在"
+                    detail = "已检测到文件"
+            else:
+                status = "⚠️ 未找到"
+                detail = "项目目录中未检测到该文件"
+            tree.insert("", tk.END, iid=key, values=(label, status, detail))
+
+    def load_project_inputs(self):
+        proj = self.current_project_path()
+        mapping = [
+            (proj / "INCAR", getattr(self, "incar_text", None)),
+            (proj / "POSCAR", getattr(self, "poscar_text", None)),
+            (proj / "KPOINTS", getattr(self, "kpoints_text", None)),
+        ]
+        for path, widget in mapping:
+            if not widget or not path.exists():
+                continue
+            try:
+                widget.delete("1.0", tk.END)
+                widget.insert("1.0", read_text(path))
+            except Exception:
+                pass
+
+    def set_project(self, path: Path):
+        try:
+            path = Path(path).expanduser()
+        except Exception:
+            path = Path(path)
+        self.project_dir = path
+        self.project_var.set(str(path))
+        self.load_project_inputs()
+        self.refresh_project_overview()
+        self.refresh_run_status()
+
     # ------------------------- 项目与体检 ----------------------------------
     def choose_project(self):
         d = filedialog.askdirectory(initialdir=self.project_var.get(), title="选择项目目录")
         if d:
-            self.project_var.set(d)
+            self.set_project(Path(d))
 
     def create_project(self):
         d = filedialog.askdirectory(initialdir=str(Path.home()), title="选择或创建项目父目录")
@@ -1295,11 +1574,11 @@ srun {vcmd}
         name = time.strftime("vasp_proj_%Y%m%d_%H%M%S")
         p = base / name
         p.mkdir(parents=True, exist_ok=True)
-        self.project_var.set(str(p))
+        self.set_project(p)
         messagebox.showinfo(APP_NAME, f"已创建项目目录：{p}")
 
     def quick_check(self):
-        proj = Path(self.project_var.get())
+        proj = self.current_project_path()
         msgs = []
         for f in ["INCAR", "POSCAR", "POTCAR", "KPOINTS"]:
             exists = (proj / f).exists()
@@ -1311,6 +1590,8 @@ srun {vcmd}
         msgs.append(f"POT 库: {potroot} {'(存在)' if potroot.exists() else '(不存在)'}")
         self.run_log.insert(tk.END, "\n".join(msgs) + "\n")
         self.run_log.see(tk.END)
+        self.refresh_project_overview()
+        self.refresh_run_status()
 
     # ------------------------- 退出清理 ------------------------------------
     def on_close(self):
