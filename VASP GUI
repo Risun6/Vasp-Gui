@@ -146,8 +146,8 @@ def unique_elements_from_poscar(poscar_text: str):
     return elems
 
 
-def find_potcar_for_element(elem: str, pot_dir: Path) -> Path | None:
-    """在 pot_dir 下递归查找包含给定元素名称的 POTCAR 文件。
+def find_potcar_candidates(elem: str, pot_dir: Path) -> list[Path]:
+    """在 pot_dir 下递归查找包含给定元素名称的 POTCAR 文件，返回候选列表。
     常见目录层级（示例）：
       PAW_PBE/Si/POTCAR  或  potcars/PBE/Si/POTCAR  或  potpaw_PBE.54/Si/POTCAR
     策略：深度<=3 的广度优先查找，目录名包含元素精确匹配。"""
@@ -172,20 +172,27 @@ def find_potcar_for_element(elem: str, pot_dir: Path) -> Path | None:
             pass
         except FileNotFoundError:
             pass
-    return candidates[0] if candidates else None
+    seen = []
+    unique: list[Path] = []
+    for cand in candidates:
+        key = str(cand)
+        if key not in seen:
+            seen.append(key)
+            unique.append(cand)
+    return unique
 
 
-def build_potcar(elements, pot_base: Path, out_path: Path) -> tuple[bool, str]:
-    """将 elements 对应的 POTCAR 依序拼接到 out_path。返回 (ok, msg)。"""
-    if not elements:
-        return False, "未在 POSCAR 中解析到元素符号。请确认第6/7行写法。"
+def build_potcar(pot_files: list[Path], out_path: Path) -> tuple[bool, str]:
+    """将 pot_files 中的 POTCAR 依序拼接到 out_path。返回 (ok, msg)。"""
+    if not pot_files:
+        return False, "未提供任何 POTCAR 文件。"
     try:
         with open(out_path, "wb") as fout:
-            for e in elements:
-                p = find_potcar_for_element(e, pot_base)
-                if not p:
-                    return False, f"未找到元素 {e} 的 POTCAR（在 {pot_base} 下）。"
-                fout.write(Path(p).read_bytes())
+            for p in pot_files:
+                pp = Path(p)
+                if not pp.exists():
+                    return False, f"未找到 POTCAR：{pp}"
+                fout.write(pp.read_bytes())
         return True, f"POTCAR 已生成：{out_path}"
     except Exception as ex:
         return False, f"生成 POTCAR 失败：{ex}"
@@ -221,6 +228,12 @@ class SystemStatsMonitor(threading.Thread):
 
     def stop(self):
         self._stop.set()
+
+        if self.is_alive():
+            try:
+                self.join(timeout=2.0)
+            except RuntimeError:
+                pass
 
     def run(self):
         while not self._stop.is_set():
@@ -321,7 +334,8 @@ class SystemStatsMonitor(threading.Thread):
         return stats
 
     def _process_stats(self) -> list[dict]:
-        cmd = ["ps", "-eo", "pid,comm,%cpu,%mem", "--sort=-%cpu"]
+
+        cmd = ["ps", "-eo", "pid,%cpu,%mem,cmd", "--sort=-%cpu"]
         try:
             out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
         except Exception:
@@ -330,23 +344,36 @@ class SystemStatsMonitor(threading.Thread):
         procs = []
         for line in lines[1:6]:  # 跳过表头，仅取前5项
             parts = line.split(None, 3)
-            if len(parts) < 4:
+
+            if len(parts) < 3:
                 continue
-            cmd_name = parts[1]
             pid = parts[0]
+            cpu = parts[1]
+            mem = parts[2]
+            cmd_full = parts[3] if len(parts) >= 4 else ""
             cwd = self._proc_cwd(pid)
             in_project = False
             try:
                 if cwd:
-                    in_project = Path(cwd).resolve() == self.workdir_resolved
+
+                    resolved = Path(cwd).resolve()
+                    in_project = resolved == self.workdir_resolved
+                    if not in_project:
+                        try:
+                            resolved.relative_to(self.workdir_resolved)
+                            in_project = True
+                        except Exception:
+                            in_project = False
             except Exception:
                 in_project = False
+            cmd_lower = cmd_full.lower()
+            is_vasp = "vasp" in cmd_lower or ("mpi" in cmd_lower and "vasp" in cmd_lower)
             procs.append({
                 "pid": pid,
-                "cmd": cmd_name,
-                "cpu": parts[2],
-                "mem": parts[3],
-                "is_vasp": "vasp" in cmd_name.lower() or "mpi" in cmd_name.lower(),
+                "cmd": cmd_full.strip(),
+                "cpu": cpu,
+                "mem": mem,
+                "is_vasp": is_vasp,
                 "cwd": cwd,
                 "in_project": in_project,
             })
@@ -400,47 +427,60 @@ class EnergyMonitor(threading.Thread):
         self._stop = threading.Event()
         self.steps = []
         self.energies = []
+        self._last_size = 0
+        self._last_pos = 0
 
     def stop(self):
         self._stop.set()
+        if self.is_alive():
+            try:
+                self.join(timeout=2.0)
+            except RuntimeError:
+                pass
 
     def run(self):
-        last_size = 0
         osz = self.workdir / "OSZICAR"
-        step = 0
         while not self._stop.is_set():
             try:
                 if osz.exists():
                     size = osz.stat().st_size
-                    if size != last_size:
-                        last_size = size
-                        self._parse(osz)
-                        self.on_update(self.steps, self.energies)
+                    reset = False
+                    if size < self._last_size:
+                        reset = True
+                        self._last_pos = 0
+                        self._last_size = 0
+                        self.steps = []
+                        self.energies = []
+                    if reset or size > self._last_size:
+                        self._parse(osz, reset)
+                        self._last_size = size
+                        if self.on_update:
+                            self.on_update(self.steps, self.energies)
             except Exception:
                 pass
             time.sleep(1.0)
 
-    def _parse(self, path: Path):
-        steps = []
-        energies = []
+    def _parse(self, path: Path, reset: bool):
         try:
             with path.open("r", encoding="utf-8", errors="ignore") as f:
-                i = 0
+                if not reset and self._last_pos:
+                    f.seek(self._last_pos)
+                else:
+                    self.steps = []
+                    self.energies = []
                 for line in f:
                     m = ENERGY_RX.search(line)
                     if m:
                         val = m.group(1) or m.group(2)
                         try:
                             e = float(val)
-                            i += 1
-                            steps.append(i)
-                            energies.append(e)
+                            self.steps.append(len(self.steps) + 1)
+                            self.energies.append(e)
                         except Exception:
                             pass
+                self._last_pos = f.tell()
         except Exception:
             return
-        self.steps = steps
-        self.energies = energies
 
 
 class VaspGUI(tk.Tk):
@@ -665,7 +705,30 @@ class VaspGUI(tk.Tk):
         if not elems:
             messagebox.showwarning(APP_NAME, "未从 POSCAR 解析到元素。")
             return
-        ok, msg = build_potcar(elems, Path(self.pot_dir_var.get()), proj / "POTCAR")
+        pot_base = Path(self.pot_dir_var.get())
+        selections: list[Path] = []
+        for e in elems:
+            cands = find_potcar_candidates(e, pot_base)
+            if not cands:
+                msg = f"未找到元素 {e} 的 POTCAR（在 {pot_base} 下）。"
+                self.pot_msg.insert(tk.END, msg + "\n")
+                messagebox.showerror(APP_NAME, msg)
+                return
+            if len(cands) == 1:
+                selected = cands[0]
+            else:
+                options = [str(p) for p in cands]
+                sel = self.select_from_list(f"选择 {e} 的 POTCAR", options)
+                if not sel:
+                    cancel_msg = f"已取消 {e} 的 POTCAR 选择，终止生成。"
+                    self.pot_msg.insert(tk.END, cancel_msg + "\n")
+                    messagebox.showinfo(APP_NAME, cancel_msg)
+                    return
+                selected = Path(sel)
+            selections.append(selected)
+            self.pot_msg.insert(tk.END, f"{e}: 使用 {selected}\n")
+            self.pot_msg.see(tk.END)
+        ok, msg = build_potcar(selections, proj / "POTCAR")
         self.pot_msg.insert(tk.END, (msg + "\n"))
         self.pot_msg.see(tk.END)
         if not ok:
@@ -941,6 +1004,27 @@ class VaspGUI(tk.Tk):
         except Exception:
             pass
 
+
+    def append_run_log(self, msg: str):
+        text = (msg or "")
+        lines = text.splitlines() or [""]
+        for line in lines:
+            self.run_log.insert(tk.END, line.rstrip("\n") + "\n")
+        self.run_log.see(tk.END)
+
+    def _int_from_var(self, var, default=0) -> int:
+        try:
+            value = var.get()
+        except Exception:
+            value = default
+        try:
+            return int(value)
+        except Exception:
+            try:
+                return int(default)
+            except Exception:
+                return 0
+
     # ------------------------- 页面：运行 / 提交 ----------------------------
     def _build_run_page(self, parent):
         frame = ttk.Frame(parent)
@@ -1041,7 +1125,7 @@ mpirun -np {self.mpi_np.get()} {vcmd} > vasp.out 2>&1
 """
             write_text(proj / "run_local.sh", script)
             os.chmod(proj / "run_local.sh", 0o755)
-            self.run_log.insert(tk.END, f"已生成 {proj/'run_local.sh'}\n")
+            self.append_run_log(f"已生成 {proj/'run_local.sh'}")
         else:
             acc = f"#SBATCH --account={self.slurm_account.get()}\n" if self.slurm_account.get().strip() else ""
             script = f"""#!/bin/bash
@@ -1062,8 +1146,7 @@ srun {vcmd}
 """
             write_text(proj / "run_slurm.sh", script)
             os.chmod(proj / "run_slurm.sh", 0o755)
-            self.run_log.insert(tk.END, f"已生成 {proj/'run_slurm.sh'}\n")
-        self.run_log.see(tk.END)
+            self.append_run_log(f"已生成 {proj/'run_slurm.sh'}")
 
     def start_run(self):
         proj = self.current_project_path()
@@ -1095,10 +1178,9 @@ srun {vcmd}
             try:
                 out = subprocess.check_output(cmd, text=True)
                 pid = int(out.strip())
-                self.run_log.insert(tk.END, f"已启动本地 VASP，PID={pid}")
+                self.append_run_log(f"已启动本地 VASP，PID={pid}")
                 self.proc = subprocess.Popen(["bash", "-lc", f"tail -f -n +1 '{proj / 'vasp.out'}'"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                self.run_log.insert(tk.END, "日志跟随 vasp.out（tail -f）已启动。")
-                self.run_log.see(tk.END)
+                self.append_run_log("日志跟随 vasp.out（tail -f）已启动。")
                 self.start_monitor()
             except Exception as e:
                 messagebox.showerror(APP_NAME, f"启动失败：{e}")
@@ -1113,15 +1195,14 @@ srun {vcmd}
             try:
                 out = subprocess.check_output(cmd, text=True)
                 pid = out.strip()
-                self.run_log.insert(tk.END, f"已在 WSL 启动 VASP，PID={pid}")
+                self.append_run_log(f"已在 WSL 启动 VASP，PID={pid}")
                 # 在 Windows 侧跟随同一路径（使用 Windows 路径监视 vasp.out）
                 if which("powershell"):
                     self.proc = subprocess.Popen(["powershell", "-NoProfile", "-Command", f"Get-Content -Path '{(proj / 'vasp.out')}' -Wait"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 else:
                     # 退化为 Python 轮询
                     self.proc = None
-                self.run_log.insert(tk.END, "日志跟随 vasp.out（Windows 侧）已启动。")
-                self.run_log.see(tk.END)
+                self.append_run_log("日志跟随 vasp.out（Windows 侧）已启动。")
                 self.start_monitor()
             except Exception as e:
                 messagebox.showerror(APP_NAME, f"WSL 启动失败：{e}")
@@ -1135,8 +1216,8 @@ srun {vcmd}
                 self.write_job_script()
             try:
                 out = subprocess.check_output(["bash", "-lc", f"cd '{proj}' && sbatch '{script.name}'"], text=True)
-                self.run_log.insert(tk.END, out + "")
-                self.run_log.see(tk.END)
+                if out:
+                    self.append_run_log(out)
                 self.start_monitor()
             except subprocess.CalledProcessError as e:
                 messagebox.showerror(APP_NAME, f"sbatch 失败：{e}{e.output}")
@@ -1147,8 +1228,8 @@ srun {vcmd}
         try:
             # 粗暴但简单：pkill -f "vasp.*{proj}"
             subprocess.call(["bash", "-lc", f"pkill -f 'vasp' || true"])  # 保守处理
-            self.run_log.insert(tk.END, "已尝试停止本地 VASP 进程（pkill -f 'vasp'）。\n")
-            self.run_log.see(tk.END)
+
+            self.append_run_log("已尝试停止本地 VASP 进程（pkill -f 'vasp'）。")
             self.refresh_run_status()
         except Exception as e:
             messagebox.showerror(APP_NAME, f"停止失败：{e}")
@@ -1194,7 +1275,8 @@ srun {vcmd}
         sys_frame.pack(fill=tk.BOTH, expand=False, padx=8, pady=6)
         self.sys_info = tk.Text(sys_frame, height=10)
         self.sys_info.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-        self.sys_info.insert(tk.END, "点击"开始监视"以获取实时系统信息。\n")
+
+        self.sys_info.insert(tk.END, "点击“开始监视”以获取实时系统信息。\n")
 
         return frame
 
@@ -1217,12 +1299,10 @@ srun {vcmd}
             self.monitor.stop()
             self.monitor = None
         if self.sys_monitor:
-            self.sys_monitor.stop()
-            try:
-                self.sys_monitor.join(timeout=1.0)
-            except Exception:
-                pass
+
+            monitor = self.sys_monitor
             self.sys_monitor = None
+            monitor.stop()
         self.mon_info.insert(tk.END, "已停止监视。\n")
         self.mon_info.see(tk.END)
         self.sys_info.insert(tk.END, "系统监视已停止。\n")
@@ -1411,13 +1491,18 @@ srun {vcmd}
             "pot_dir": self.pot_dir_var.get(),
             "run_mode": self.run_mode.get(),
             "vasp_cmd": self.vasp_cmd.get(),
-            "mpi_np": self.mpi_np.get(),
+            "mpi_np": self._int_from_var(self.mpi_np, 8),
             "slurm_part": self.slurm_part.get(),
             "slurm_time": self.slurm_time.get(),
-            "slurm_nodes": self.slurm_nodes.get(),
-            "slurm_ntasks": self.slurm_ntasks.get(),
+            "slurm_nodes": self._int_from_var(self.slurm_nodes, 1),
+            "slurm_ntasks": self._int_from_var(self.slurm_ntasks, 32),
             "slurm_account": self.slurm_account.get(),
-            "kgrid": {"nx": self.k_nx.get(), "ny": self.k_ny.get(), "nz": self.k_nz.get(), "gamma": bool(self.k_gamma.get())},
+            "kgrid": {
+                "nx": self._int_from_var(self.k_nx, 5),
+                "ny": self._int_from_var(self.k_ny, 5),
+                "nz": self._int_from_var(self.k_nz, 5),
+                "gamma": bool(self.k_gamma.get()),
+            },
             "tab_index": self.nb.index("current"),
             "file_watch": self.file_watch_var.get(),
         }
@@ -1588,8 +1673,8 @@ srun {vcmd}
                 msgs.append(f"which {cmd:8s} -> {which(cmd) or '未找到'}")
         potroot = Path(self.pot_dir_var.get())
         msgs.append(f"POT 库: {potroot} {'(存在)' if potroot.exists() else '(不存在)'}")
-        self.run_log.insert(tk.END, "\n".join(msgs) + "\n")
-        self.run_log.see(tk.END)
+        for msg in msgs:
+            self.append_run_log(msg)
         self.refresh_project_overview()
         self.refresh_run_status()
 
