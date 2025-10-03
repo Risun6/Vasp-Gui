@@ -21,7 +21,7 @@ POTCAR 拼接（本地已有赝势）、K 点生成、作业脚本生成与提�
 
 说明：
 - 本工具不包含、也不会分发任何 VASP 程序或赝势文件。请确保你拥有 VASP 许可，
-  并在“POTCAR 面板”正确设置本地赝势库路径。
+  并在"POTCAR 面板"正确设置本地赝势库路径。
 - 监视功能主要解析 OSZICAR（F= 或 E0= 行），用于快速查看收敛趋势。
 - SLURM 模板可在 GUI 中一键生成，你可以直接提交或先手动修改。
 
@@ -228,6 +228,7 @@ class SystemStatsMonitor(threading.Thread):
 
     def stop(self):
         self._stop.set()
+
         if self.is_alive():
             try:
                 self.join(timeout=2.0)
@@ -333,6 +334,7 @@ class SystemStatsMonitor(threading.Thread):
         return stats
 
     def _process_stats(self) -> list[dict]:
+
         cmd = ["ps", "-eo", "pid,%cpu,%mem,cmd", "--sort=-%cpu"]
         try:
             out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
@@ -342,6 +344,7 @@ class SystemStatsMonitor(threading.Thread):
         procs = []
         for line in lines[1:6]:  # 跳过表头，仅取前5项
             parts = line.split(None, 3)
+
             if len(parts) < 3:
                 continue
             pid = parts[0]
@@ -352,6 +355,7 @@ class SystemStatsMonitor(threading.Thread):
             in_project = False
             try:
                 if cwd:
+
                     resolved = Path(cwd).resolve()
                     in_project = resolved == self.workdir_resolved
                     if not in_project:
@@ -598,7 +602,7 @@ class VaspGUI(tk.Tk):
 
         ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
-        ttk.Label(right, text="KPOINTS 编辑（可在“K 点生成”页自动生成）").pack(anchor=tk.W)
+        ttk.Label(right, text="KPOINTS 编辑（可在"K 点生成"页自动生成）").pack(anchor=tk.W)
         self.kpoints_text = tk.Text(right, height=10)
         self.kpoints_text.pack(fill=tk.BOTH, expand=True)
         row2 = ttk.Frame(right)
@@ -1000,6 +1004,7 @@ class VaspGUI(tk.Tk):
         except Exception:
             pass
 
+
     def append_run_log(self, msg: str):
         text = (msg or "")
         lines = text.splitlines() or [""]
@@ -1223,6 +1228,7 @@ srun {vcmd}
         try:
             # 粗暴但简单：pkill -f "vasp.*{proj}"
             subprocess.call(["bash", "-lc", f"pkill -f 'vasp' || true"])  # 保守处理
+
             self.append_run_log("已尝试停止本地 VASP 进程（pkill -f 'vasp'）。")
             self.refresh_run_status()
         except Exception as e:
@@ -1269,6 +1275,7 @@ srun {vcmd}
         sys_frame.pack(fill=tk.BOTH, expand=False, padx=8, pady=6)
         self.sys_info = tk.Text(sys_frame, height=10)
         self.sys_info.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
         self.sys_info.insert(tk.END, "点击“开始监视”以获取实时系统信息。\n")
 
         return frame
@@ -1292,6 +1299,7 @@ srun {vcmd}
             self.monitor.stop()
             self.monitor = None
         if self.sys_monitor:
+
             monitor = self.sys_monitor
             self.sys_monitor = None
             monitor.stop()
