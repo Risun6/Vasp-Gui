@@ -534,6 +534,7 @@ class VaspGUI(tk.Tk):
         self.project_var = tk.StringVar(value=str(self.project_dir))
         self.project_entry = ttk.Entry(toolbar, textvariable=self.project_var, width=80)
         self.project_entry.pack(side=tk.LEFT, padx=4)
+        self.project_entry.bind("<Return>", self._on_project_entry_return)
         ttk.Button(toolbar, text="选择…", command=self.choose_project).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="新建项目", command=self.create_project).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="快速体检", command=self.quick_check).pack(side=tk.LEFT, padx=4)
@@ -558,15 +559,78 @@ class VaspGUI(tk.Tk):
         self.nb.add(self.page_monitor, text="监视")
         self.nb.add(self.page_post, text="后处理 (简)")
 
+        # 状态栏
+        self.status_var = tk.StringVar(value="准备就绪")
+        self._status_job = None
+        self.status_bar = ttk.Label(self, textvariable=self.status_var, anchor=tk.W)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=(0, 2))
+
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _create_text_area(
+        self,
+        parent,
+        *,
+        height: int = 10,
+        wrap: str = "none",
+        pack_kwargs: dict | None = None,
+        add_xscroll: bool = True,
+        text_kwargs: dict | None = None,
+    ) -> tk.Text:
+        """创建带滚动条的 Text 组件，统一风格，避免布局错乱。"""
+        if pack_kwargs is None:
+            pack_kwargs = {"fill": tk.BOTH, "expand": True}
+        if text_kwargs is None:
+            text_kwargs = {}
+        container = ttk.Frame(parent)
+        container.pack(**pack_kwargs)
+        container.grid_rowconfigure(0, weight=1)
+        container.grid_columnconfigure(0, weight=1)
+
+        text = tk.Text(container, height=height, wrap=wrap, **text_kwargs)
+        text.grid(row=0, column=0, sticky="nsew")
+
+        yscroll = ttk.Scrollbar(container, orient=tk.VERTICAL, command=text.yview)
+        yscroll.grid(row=0, column=1, sticky="ns")
+        text.configure(yscrollcommand=yscroll.set)
+
+        if add_xscroll:
+            xscroll = ttk.Scrollbar(container, orient=tk.HORIZONTAL, command=text.xview)
+            xscroll.grid(row=1, column=0, sticky="ew")
+            text.configure(xscrollcommand=xscroll.set)
+        return text
+
+    def set_status(self, message: str, *, timeout_ms: int = 8000):
+        """更新状态栏文本，并在一段时间后恢复默认。"""
+        self.status_var.set(message)
+        if self._status_job:
+            try:
+                self.after_cancel(self._status_job)
+            except Exception:
+                pass
+            self._status_job = None
+        if timeout_ms > 0:
+            def reset():
+                self.status_var.set("准备就绪")
+                self._status_job = None
+
+            self._status_job = self.after(timeout_ms, reset)
+
+    def _on_project_entry_return(self, _event):
+        self.set_project(Path(self.project_var.get()))
+        self.set_status(f"项目目录设置为 {self.project_var.get()}")
+        return "break"
 
     # ------------------------- 页面：输入文件 -----------------------------
     def _build_inputs_page(self, parent):
         frame = ttk.Frame(parent)
 
+        paned = ttk.Panedwindow(frame, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
         # 左边：INCAR 模板
-        left = ttk.Frame(frame)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        left = ttk.Frame(paned, padding=8)
+        paned.add(left, weight=1)
 
         ttk.Label(left, text="INCAR 模板与编辑").pack(anchor=tk.W)
         temp_bar = ttk.Frame(left)
@@ -578,23 +642,39 @@ class VaspGUI(tk.Tk):
             ("dos", "态密度"),
             ("bands", "能带预设"),
         ]:
-            ttk.Radiobutton(temp_bar, text=txt, value=key, variable=self.incar_template, command=self.load_incar_template).pack(side=tk.LEFT)
+            ttk.Radiobutton(
+                temp_bar,
+                text=txt,
+                value=key,
+                variable=self.incar_template,
+                command=self.load_incar_template,
+            ).pack(side=tk.LEFT)
         ttk.Button(temp_bar, text="加载模板到编辑器", command=self.load_incar_template).pack(side=tk.RIGHT)
 
-        self.incar_text = tk.Text(left, height=20)
-        self.incar_text.pack(fill=tk.BOTH, expand=True)
+        self.incar_text = self._create_text_area(
+            left,
+            height=20,
+            add_xscroll=True,
+            pack_kwargs={"fill": tk.BOTH, "expand": True, "pady": 4},
+            text_kwargs={"undo": True},
+        )
         btns = ttk.Frame(left)
         btns.pack(fill=tk.X, pady=4)
         ttk.Button(btns, text="打开现有 INCAR", command=lambda: self.open_into_editor("INCAR", self.incar_text)).pack(side=tk.LEFT)
         ttk.Button(btns, text="保存到项目", command=lambda: self.save_from_editor("INCAR", self.incar_text)).pack(side=tk.LEFT, padx=6)
 
         # 右边：POSCAR & KPOINTS 编辑
-        right = ttk.Frame(frame)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        right = ttk.Frame(paned, padding=8)
+        paned.add(right, weight=1)
 
         ttk.Label(right, text="POSCAR 编辑").pack(anchor=tk.W)
-        self.poscar_text = tk.Text(right, height=10)
-        self.poscar_text.pack(fill=tk.BOTH, expand=True)
+        self.poscar_text = self._create_text_area(
+            right,
+            height=10,
+            add_xscroll=True,
+            pack_kwargs={"fill": tk.BOTH, "expand": True, "pady": 4},
+            text_kwargs={"undo": True},
+        )
         row = ttk.Frame(right)
         row.pack(fill=tk.X, pady=4)
         ttk.Button(row, text="打开 POSCAR", command=lambda: self.open_into_editor("POSCAR", self.poscar_text)).pack(side=tk.LEFT)
@@ -603,9 +683,14 @@ class VaspGUI(tk.Tk):
 
         ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
-        ttk.Label(right, text="KPOINTS 编辑（可在"K 点生成"页自动生成）").pack(anchor=tk.W)
-        self.kpoints_text = tk.Text(right, height=10)
-        self.kpoints_text.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(right, text="KPOINTS 编辑（可在“K 点生成”页自动生成）").pack(anchor=tk.W)
+        self.kpoints_text = self._create_text_area(
+            right,
+            height=10,
+            add_xscroll=True,
+            pack_kwargs={"fill": tk.BOTH, "expand": True, "pady": 4},
+            text_kwargs={"undo": True},
+        )
         row2 = ttk.Frame(right)
         row2.pack(fill=tk.X, pady=4)
         ttk.Button(row2, text="打开 KPOINTS", command=lambda: self.open_into_editor("KPOINTS", self.kpoints_text)).pack(side=tk.LEFT)
@@ -653,16 +738,20 @@ class VaspGUI(tk.Tk):
             write_text(p, editor.get("1.0", tk.END))
             messagebox.showinfo(APP_NAME, f"已保存 {name} -> {p}")
             self.refresh_project_overview()
+            self.set_status(f"{name} 已保存到 {p}")
         except Exception as e:
             messagebox.showerror(APP_NAME, f"保存失败：{e}")
+            self.set_status(f"保存 {name} 失败：{e}", timeout_ms=10000)
 
     def show_poscar_elements(self):
         s = self.poscar_text.get("1.0", tk.END)
         elems = unique_elements_from_poscar(s)
         if elems:
             messagebox.showinfo(APP_NAME, f"POSCAR 元素：{', '.join(elems)}")
+            self.set_status(f"POSCAR 元素：{', '.join(elems)}")
         else:
             messagebox.showwarning(APP_NAME, "未解析到元素，请检查第6/7行。")
+            self.set_status("未能解析 POSCAR 元素", timeout_ms=8000)
 
     # ------------------------- 页面：POTCAR --------------------------------
     def _build_potcar_page(self, parent):
@@ -681,8 +770,13 @@ class VaspGUI(tk.Tk):
         ttk.Label(row2, text="从 POSCAR 自动解析元素并生成 POTCAR：").pack(side=tk.LEFT)
         ttk.Button(row2, text="生成 POTCAR", command=self.do_build_potcar).pack(side=tk.LEFT, padx=8)
 
-        self.pot_msg = tk.Text(frame, height=18)
-        self.pot_msg.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.pot_msg = self._create_text_area(
+            frame,
+            height=18,
+            wrap="word",
+            add_xscroll=False,
+            pack_kwargs={"fill": tk.BOTH, "expand": True, "padx": 8, "pady": 8},
+        )
 
         return frame
 
@@ -690,6 +784,7 @@ class VaspGUI(tk.Tk):
         d = filedialog.askdirectory(initialdir=self.pot_dir_var.get(), title="选择赝势库根目录")
         if d:
             self.pot_dir_var.set(d)
+            self.set_status(f"已设置赝势库目录：{d}")
 
     def do_build_potcar(self):
         proj = self.current_project_path()
@@ -701,10 +796,12 @@ class VaspGUI(tk.Tk):
                 write_text(pos, s)
             else:
                 messagebox.showwarning(APP_NAME, "项目目录中不存在 POSCAR，且编辑器为空。")
+                self.set_status("生成 POTCAR 失败：POSCAR 不存在或为空", timeout_ms=10000)
                 return
         elems, _ = parse_poscar(read_text(pos))
         if not elems:
             messagebox.showwarning(APP_NAME, "未从 POSCAR 解析到元素。")
+            self.set_status("未能解析 POSCAR 元素，无法生成 POTCAR", timeout_ms=10000)
             return
         pot_base = Path(self.pot_dir_var.get())
         selections: list[Path] = []
@@ -714,6 +811,7 @@ class VaspGUI(tk.Tk):
                 msg = f"未找到元素 {e} 的 POTCAR（在 {pot_base} 下）。"
                 self.pot_msg.insert(tk.END, msg + "\n")
                 messagebox.showerror(APP_NAME, msg)
+                self.set_status(msg, timeout_ms=12000)
                 return
             if len(cands) == 1:
                 selected = cands[0]
@@ -724,6 +822,7 @@ class VaspGUI(tk.Tk):
                     cancel_msg = f"已取消 {e} 的 POTCAR 选择，终止生成。"
                     self.pot_msg.insert(tk.END, cancel_msg + "\n")
                     messagebox.showinfo(APP_NAME, cancel_msg)
+                    self.set_status(cancel_msg, timeout_ms=8000)
                     return
                 selected = Path(sel)
             selections.append(selected)
@@ -734,23 +833,28 @@ class VaspGUI(tk.Tk):
         self.pot_msg.see(tk.END)
         if not ok:
             messagebox.showerror(APP_NAME, msg)
+            self.set_status(f"生成 POTCAR 失败：{msg}", timeout_ms=12000)
         else:
             messagebox.showinfo(APP_NAME, msg)
             self.refresh_project_overview()
+            self.set_status("POTCAR 已成功生成")
 
     # --------- 赝势库探测与选择 ---------
     def detect_pot_roots(self):
         cands = self.scan_pot_roots(limit=30)
         if not cands:
             messagebox.showwarning(APP_NAME, "未在常见位置发现赝势库候选。你也可以手动选择根目录。")
+            self.set_status("未找到赝势库候选，请手动指定目录。", timeout_ms=10000)
             return
         if len(cands) == 1:
             self.pot_dir_var.set(cands[0])
             messagebox.showinfo(APP_NAME, f"已设置赝势库根目录：\n{cands[0]}")
+            self.set_status(f"自动选择赝势库：{cands[0]}")
             return
         sel = self.select_from_list("选择赝势库根目录", cands)
         if sel:
             self.pot_dir_var.set(sel)
+            self.set_status(f"已选择赝势库：{sel}")
 
     def select_from_list(self, title, items):
         top = tk.Toplevel(self)
@@ -898,8 +1002,14 @@ class VaspGUI(tk.Tk):
         sugg = ttk.Frame(status_box)
         sugg.pack(fill=tk.BOTH, expand=False, padx=8, pady=(0, 6))
         ttk.Label(sugg, text="运行建议：").pack(anchor=tk.W)
-        wf_suggest = tk.Text(sugg, height=4, wrap="word", state="disabled")
-        wf_suggest.pack(fill=tk.X, expand=True)
+        wf_suggest = self._create_text_area(
+            sugg,
+            height=4,
+            wrap="word",
+            add_xscroll=False,
+            pack_kwargs={"fill": tk.X, "expand": True},
+            text_kwargs={"state": "disabled"},
+        )
         self._register_suggestion_widget(wf_suggest)
 
         steps = [
@@ -978,8 +1088,13 @@ class VaspGUI(tk.Tk):
 
         notes = ttk.LabelFrame(frame, text="流程备注 / 待办")
         notes.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
-        self.workflow_notes = tk.Text(notes, height=8)
-        self.workflow_notes.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.workflow_notes = self._create_text_area(
+            notes,
+            height=8,
+            wrap="word",
+            add_xscroll=False,
+            pack_kwargs={"fill": tk.BOTH, "expand": True, "padx": 6, "pady": 6},
+        )
         self.workflow_notes.insert(
             tk.END,
             "可在此记录当前任务的特殊参数、检查列表或备注。内容不会自动保存。",
@@ -990,6 +1105,7 @@ class VaspGUI(tk.Tk):
         s = gen_kpoints_monkhorst(self.k_nx.get(), self.k_ny.get(), self.k_nz.get(), self.k_gamma.get())
         self.kpoints_text.delete("1.0", tk.END)
         self.kpoints_text.insert("1.0", s)
+        self.set_status("已生成 KPOINTS 网格到编辑器")
 
     def kpoints_save(self):
         proj = self.current_project_path()
@@ -998,6 +1114,7 @@ class VaspGUI(tk.Tk):
         write_text(proj / "KPOINTS", s)
         messagebox.showinfo(APP_NAME, f"KPOINTS 已保存到 {proj/'KPOINTS'}")
         self.refresh_project_overview()
+        self.set_status("KPOINTS 已写入项目目录")
 
     def goto_tab(self, page):
         try:
@@ -1091,8 +1208,14 @@ class VaspGUI(tk.Tk):
         ttk.Label(row, text="当前状态：").pack(side=tk.LEFT)
         ttk.Label(row, textvariable=self.run_status_var).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text="刷新状态", command=self.refresh_run_status).pack(side=tk.RIGHT)
-        run_suggest = tk.Text(status, height=3, wrap="word", state="disabled")
-        run_suggest.pack(fill=tk.X, padx=6, pady=(0, 6))
+        run_suggest = self._create_text_area(
+            status,
+            height=3,
+            wrap="word",
+            add_xscroll=False,
+            pack_kwargs={"fill": tk.X, "padx": 6, "pady": (0, 6)},
+            text_kwargs={"state": "disabled"},
+        )
         self._register_suggestion_widget(run_suggest)
 
         # 运行方式
@@ -1140,8 +1263,13 @@ class VaspGUI(tk.Tk):
         ttk.Button(btns, text="启动/提交", command=self.start_run).pack(side=tk.LEFT, padx=8)
         ttk.Button(btns, text="停止本地进程", command=self.stop_local).pack(side=tk.LEFT)
 
-        self.run_log = tk.Text(frame, height=14)
-        self.run_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.run_log = self._create_text_area(
+            frame,
+            height=14,
+            wrap="none",
+            add_xscroll=True,
+            pack_kwargs={"fill": tk.BOTH, "expand": True, "padx": 8, "pady": 8},
+        )
 
         return frame
 
@@ -1302,8 +1430,14 @@ srun {vcmd}
         ttk.Label(row, text="当前状态：").pack(side=tk.LEFT)
         ttk.Label(row, textvariable=self.run_status_var).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text="刷新状态", command=self.refresh_run_status).pack(side=tk.RIGHT)
-        monitor_suggest = tk.Text(status_box, height=3, wrap="word", state="disabled")
-        monitor_suggest.pack(fill=tk.X, padx=6, pady=(0, 6))
+        monitor_suggest = self._create_text_area(
+            status_box,
+            height=3,
+            wrap="word",
+            add_xscroll=False,
+            pack_kwargs={"fill": tk.X, "padx": 6, "pady": (0, 6)},
+            text_kwargs={"state": "disabled"},
+        )
         self._register_suggestion_widget(monitor_suggest)
 
         top = ttk.Frame(frame)
@@ -1325,13 +1459,23 @@ srun {vcmd}
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        self.mon_info = tk.Text(frame, height=6)
-        self.mon_info.pack(fill=tk.BOTH, expand=False, padx=8, pady=4)
+        self.mon_info = self._create_text_area(
+            frame,
+            height=6,
+            wrap="word",
+            add_xscroll=False,
+            pack_kwargs={"fill": tk.BOTH, "expand": False, "padx": 8, "pady": 4},
+        )
 
         sys_frame = ttk.LabelFrame(frame, text="系统状态：CPU / 进程 / 文件增长")
         sys_frame.pack(fill=tk.BOTH, expand=False, padx=8, pady=6)
-        self.sys_info = tk.Text(sys_frame, height=10)
-        self.sys_info.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.sys_info = self._create_text_area(
+            sys_frame,
+            height=10,
+            wrap="word",
+            add_xscroll=False,
+            pack_kwargs={"fill": tk.BOTH, "expand": True, "padx": 6, "pady": 6},
+        )
 
         self.sys_info.insert(tk.END, "点击“开始监视”以获取实时系统信息。\n")
 
@@ -1350,6 +1494,7 @@ srun {vcmd}
         self.sys_info.delete("1.0", tk.END)
         self.sys_info.insert(tk.END, "系统监视线程已启动……\n")
         self.apply_run_status("🟡 正在监视…", ["系统监视线程已启动，等待数据更新。"])
+        self.set_status("监视线程已启动")
 
     def stop_monitor(self):
         if self.monitor:
@@ -1364,6 +1509,7 @@ srun {vcmd}
         self.mon_info.see(tk.END)
         self.sys_info.insert(tk.END, "系统监视已停止。\n")
         self.refresh_run_status()
+        self.set_status("监视已停止")
 
     def on_energy_update(self, steps, energies):
         # Tk 线程安全：使用 after 回到主线程更新
@@ -1430,8 +1576,13 @@ srun {vcmd}
         ttk.Button(row, text="读取 OSZICAR 绘制（一次性）", command=self.plot_once_from_oszicar).pack(side=tk.LEFT)
         ttk.Button(row, text="提取最终能量", command=self.extract_final_energy).pack(side=tk.LEFT, padx=8)
 
-        self.post_log = tk.Text(frame, height=18)
-        self.post_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.post_log = self._create_text_area(
+            frame,
+            height=18,
+            wrap="word",
+            add_xscroll=False,
+            pack_kwargs={"fill": tk.BOTH, "expand": True, "padx": 8, "pady": 8},
+        )
         return frame
 
     def plot_once_from_oszicar(self):
@@ -1614,8 +1765,34 @@ srun {vcmd}
         else:
             status = "⚠️ 状态未知"
         suggestions = stats.get("suggestions") or []
-        self.apply_run_status(status, suggestions)
+        suggestions.extend(self._smart_missing_inputs())
+        unique = []
+        seen = set()
+        for item in suggestions:
+            if not item:
+                continue
+            if item in seen:
+                continue
+            seen.add(item)
+            unique.append(item)
+        self.apply_run_status(status, unique)
         self.update_overview_with_file_stats(stats.get("files", []))
+
+    def _smart_missing_inputs(self) -> list[str]:
+        """根据项目文件缺失情况给出提示。"""
+        proj = self.current_project_path()
+        hints: list[str] = []
+        essentials = [
+            ("INCAR", "在“输入文件”页加载模板或手动填写。"),
+            ("POSCAR", "可从结构文件导入或手动编辑。"),
+            ("POTCAR", "在“POTCAR 赝势”页自动拼接。"),
+        ]
+        for name, action in essentials:
+            if not (proj / name).exists():
+                hints.append(f"{name} 尚未准备，{action}")
+        if not (proj / "KPOINTS").exists():
+            hints.append("KPOINTS 缺失，可在“K 点生成”页一键生成。")
+        return hints
 
     def update_overview_with_file_stats(self, file_stats: list[dict]):
         tree = getattr(self, "workflow_tree", None)
@@ -1695,17 +1872,26 @@ srun {vcmd}
             path = Path(path).expanduser()
         except Exception:
             path = Path(path)
-        self.project_dir = path
-        self.project_var.set(str(path))
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+        self.project_dir = resolved
+        self.project_var.set(str(resolved))
         self.load_project_inputs()
         self.refresh_project_overview()
         self.refresh_run_status()
+        if resolved.exists():
+            self.set_status(f"当前项目目录：{resolved}")
+        else:
+            self.set_status(f"项目目录不存在：{resolved}", timeout_ms=10000)
 
     # ------------------------- 项目与体检 ----------------------------------
     def choose_project(self):
         d = filedialog.askdirectory(initialdir=self.project_var.get(), title="选择项目目录")
         if d:
             self.set_project(Path(d))
+            self.set_status(f"已切换到项目：{d}")
 
     def create_project(self):
         d = filedialog.askdirectory(initialdir=str(Path.home()), title="选择或创建项目父目录")
@@ -1718,6 +1904,7 @@ srun {vcmd}
         p.mkdir(parents=True, exist_ok=True)
         self.set_project(p)
         messagebox.showinfo(APP_NAME, f"已创建项目目录：{p}")
+        self.set_status(f"已创建新项目：{p}")
 
     def quick_check(self):
         proj = self.current_project_path()
@@ -1734,6 +1921,7 @@ srun {vcmd}
             self.append_run_log(msg)
         self.refresh_project_overview()
         self.refresh_run_status()
+        self.set_status("快速体检结果已输出至运行日志")
 
     # ------------------------- 退出清理 ------------------------------------
     def on_close(self):
