@@ -222,12 +222,12 @@ class SystemStatsMonitor(threading.Thread):
             self.workdir_resolved = self.workdir
         self.watch_files = watch_files or []
         self.on_update = on_update  # callback(dict)
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._prev_cpu = None  # tuple(total, idle)
         self._prev_sizes: dict[Path, int] = {}
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
         if self.is_alive():
             try:
@@ -236,7 +236,7 @@ class SystemStatsMonitor(threading.Thread):
                 pass
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             stats = self._collect_stats()
             if self.on_update:
                 try:
@@ -244,7 +244,7 @@ class SystemStatsMonitor(threading.Thread):
                 except Exception:
                     pass
             for _ in range(6):
-                if self._stop.is_set():
+                if self._stop_event.is_set():
                     break
                 time.sleep(0.5)
 
@@ -424,14 +424,14 @@ class EnergyMonitor(threading.Thread):
         super().__init__(daemon=True)
         self.workdir = workdir
         self.on_update = on_update  # callback(steps:list[int], energies:list[float])
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self.steps = []
         self.energies = []
         self._last_size = 0
         self._last_pos = 0
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
         if self.is_alive():
             try:
                 self.join(timeout=2.0)
@@ -440,7 +440,7 @@ class EnergyMonitor(threading.Thread):
 
     def run(self):
         osz = self.workdir / "OSZICAR"
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 if osz.exists():
                     size = osz.stat().st_size
@@ -544,10 +544,14 @@ class VaspGUI(tk.Tk):
         self.page_inputs = self._build_inputs_page(self.nb)
         self.page_potcar = self._build_potcar_page(self.nb)
         self.page_kpoints = self._build_kpoints_page(self.nb)
-        self.page_workflow = self._build_workflow_page(self.nb)
+
+        # 先把 workflow 会引用到的页面都建好
         self.page_run = self._build_run_page(self.nb)
         self.page_monitor = self._build_monitor_page(self.nb)
         self.page_post = self._build_post_page(self.nb)
+
+        # 最后再建 workflow（里面会引用上面三个）
+        self.page_workflow = self._build_workflow_page(self.nb)
 
         self.nb.add(self.page_inputs, text="输入文件")
         self.nb.add(self.page_potcar, text="POTCAR 赝势")
@@ -602,7 +606,7 @@ class VaspGUI(tk.Tk):
 
         ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
-        ttk.Label(right, text="KPOINTS 编辑（可在"K 点生成"页自动生成）").pack(anchor=tk.W)
+        ttk.Label(right, text="KPOINTS 编辑（可在K 点生成页自动生成）").pack(anchor=tk.W)
         self.kpoints_text = tk.Text(right, height=10)
         self.kpoints_text.pack(fill=tk.BOTH, expand=True)
         row2 = ttk.Frame(right)
@@ -1090,8 +1094,9 @@ class VaspGUI(tk.Tk):
 
         return frame
 
+    @staticmethod
     def is_windows() -> bool:
-        return os.name == "nt"
+        return os.name == "nt" or sys.platform.startswith("win")
 
     def win_to_wsl_path(self, p: Path) -> str:
         # 将 Windows 路径 C:\foo\bar 转为 /mnt/c/foo/bar
@@ -1113,107 +1118,136 @@ class VaspGUI(tk.Tk):
     def write_job_script(self):
         proj = self.current_project_path()
         proj.mkdir(parents=True, exist_ok=True)
-        mode = self.run_mode.get()
+
+        aocl_lib = "/home/yu/apps/aocl/4.1.0/aocc/lib"
+        aocc_lib = "/home/yu/apps/aocc-compiler-4.1.0/lib"
+
+        env_lines = f"""\
+    # --- AOCL/AOCC runtime libs ---
+    : "${{LD_LIBRARY_PATH:=}}"
+    export LD_LIBRARY_PATH="{aocl_lib}:{aocc_lib}:${{LD_LIBRARY_PATH}}"
+    export OMP_NUM_THREADS="${{OMP_NUM_THREADS:-1}}"
+    """
+
         vcmd = self.vasp_cmd.get().strip()
-        if mode == "local":
+        mpirun_path = which("mpirun") or "mpirun"
+
+        if self.run_mode.get() == "local":
             script = f"""#!/bin/bash
-# 本地运行 VASP（mpirun）
-set -e
-cd "{proj}"
-echo "[INFO] Workdir: $(pwd)"
-mpirun -np {self.mpi_np.get()} {vcmd} > vasp.out 2>&1
-"""
+    set -euo pipefail
+    {env_lines}
+    cd "{proj}"
+    echo "[INFO] Workdir: $(pwd)"
+    echo "[INFO] LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+    {mpirun_path} -np {self.mpi_np.get()} {vcmd} > vasp.out 2>&1
+    """
             write_text(proj / "run_local.sh", script)
             os.chmod(proj / "run_local.sh", 0o755)
-            self.append_run_log(f"已生成 {proj/'run_local.sh'}")
+            self.append_run_log(f"已生成 {proj / 'run_local.sh'}")
         else:
             acc = f"#SBATCH --account={self.slurm_account.get()}\n" if self.slurm_account.get().strip() else ""
             script = f"""#!/bin/bash
-#SBATCH --job-name=vasp
-#SBATCH --partition={self.slurm_part.get()}
-#SBATCH --time={self.slurm_time.get()}
-#SBATCH --nodes={self.slurm_nodes.get()}
-#SBATCH --ntasks={self.slurm_ntasks.get()}
-{acc}
-
-cd "{proj}"
-echo "SLURM_JOB_ID=$SLURM_JOB_ID"
-
-# 视集群环境加载模块或设置变量
-# module load vasp
-
-srun {vcmd}
-"""
+    #SBATCH --job-name=vasp
+    #SBATCH --partition={self.slurm_part.get()}
+    #SBATCH --time={self.slurm_time.get()}
+    #SBATCH --nodes={self.slurm_nodes.get()}
+    #SBATCH --ntasks={self.slurm_ntasks.get()}
+    {acc}
+    set -euo pipefail
+    {env_lines}
+    cd "{proj}"
+    echo "SLURM_JOB_ID=$SLURM_JOB_ID"
+    echo "[INFO] Workdir: $(pwd)"
+    echo "[INFO] LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+    srun {vcmd}
+    """
             write_text(proj / "run_slurm.sh", script)
             os.chmod(proj / "run_slurm.sh", 0o755)
-            self.append_run_log(f"已生成 {proj/'run_slurm.sh'}")
+            self.append_run_log(f"已生成 {proj / 'run_slurm.sh'}")
 
     def start_run(self):
         proj = self.current_project_path()
         mode = self.run_mode.get()
         vcmd = self.vasp_cmd.get().strip()
+
         if not proj.exists():
             messagebox.showerror(APP_NAME, f"项目目录不存在：{proj}")
             return
+
+        # 关键输入文件缺失时提示，但允许继续
         missing = [f for f in ["INCAR", "POSCAR", "POTCAR"] if not (proj / f).exists()]
         if missing:
             if not messagebox.askyesno(
-                APP_NAME,
-                "检测到以下关键输入文件缺失：\n"
-                + "\n".join(missing)
-                + "\n仍要继续启动吗？",
+                    APP_NAME,
+                    "检测到以下关键输入文件缺失：\n"
+                    + "\n".join(missing)
+                    + "\n仍要继续启动吗？",
             ):
                 return
+
         if mode == "local":
+            # 防止重复起
             if self.proc and self.proc.poll() is None:
                 messagebox.showwarning(APP_NAME, "已有本地 VASP 进程在运行。先停止或等待结束。")
                 return
+
+            # 基础可用性检查
             if not which("mpirun"):
-                messagebox.showerror(APP_NAME, "未找到 mpirun。请安装 OpenMPI 或 Intel MPI。")
+                messagebox.showerror(APP_NAME, "未找到 mpirun。请安装 OpenMPI/IntelMPI 并加入 PATH。")
                 return
             if not which(vcmd):
-                messagebox.showerror(APP_NAME, f"未找到 VASP 命令：{vcmd}")
+                messagebox.showerror(APP_NAME, f"未找到 VASP 命令：{vcmd}\n可改填绝对路径，例如 /opt/vasp/vasp_std")
                 return
-            cmd = ["bash", "-lc", f"cd '{proj}' && mpirun -np {self.mpi_np.get()} {vcmd} > vasp.out 2>&1 & echo $!"]
+
+            # 总是重写一次脚本，确保环境最新
+            self.write_job_script()
+            runsh = proj / "run_local.sh"
+
+            # 后台运行脚本，并返回脚本进程 PID
+            cmd = ["bash", "-lc", f"cd '{proj}' && './{runsh.name}' & echo $!"]
             try:
-                out = subprocess.check_output(cmd, text=True)
-                pid = int(out.strip())
-                self.append_run_log(f"已启动本地 VASP，PID={pid}")
-                self.proc = subprocess.Popen(["bash", "-lc", f"tail -f -n +1 '{proj / 'vasp.out'}'"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT).strip()
+                pid_txt = out.splitlines()[-1].strip()
+                self.append_run_log(f"[run_local.sh pid] {pid_txt}")
+
+                # 启动 tail 跟随 vasp.out
+                self.proc = subprocess.Popen(
+                    ["bash", "-lc", f"cd '{proj}' && (test -f vasp.out || touch vasp.out) && tail -f -n +1 'vasp.out'"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
                 self.append_run_log("日志跟随 vasp.out（tail -f）已启动。")
-                self.start_monitor()
-            except Exception as e:
-                messagebox.showerror(APP_NAME, f"启动失败：{e}")
-        elif mode == "wsl":
-            # Windows GUI -> 在 WSL 内调用 mpirun 运行 VASP
-            if not is_windows() or not which("wsl"):
-                messagebox.showerror(APP_NAME, "未检测到 Windows/WSL 环境或 wsl.exe 不可用。")
-                return
-            # 建议把项目放在 Windows 盘，如 C:\... ，WSL 中对应 /mnt/c/...
-            proj_wsl = self.win_to_wsl_path(proj)
-            cmd = ["wsl", "-e", "bash", "-lc", f"cd '{proj_wsl}' && mpirun -np {self.mpi_np.get()} {vcmd} > vasp.out 2>&1 & echo $!"]
-            try:
-                out = subprocess.check_output(cmd, text=True)
-                pid = out.strip()
-                self.append_run_log(f"已在 WSL 启动 VASP，PID={pid}")
-                # 在 Windows 侧跟随同一路径（使用 Windows 路径监视 vasp.out）
-                if which("powershell"):
-                    self.proc = subprocess.Popen(["powershell", "-NoProfile", "-Command", f"Get-Content -Path '{(proj / 'vasp.out')}' -Wait"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+                # 简单健康检查：1 秒后看 vasp.out 是否产生/增长，不增长就读末 60 行给出原因
+                time.sleep(1.0)
+                vout = proj / "vasp.out"
+                if not vout.exists() or vout.stat().st_size == 0:
+                    tail = "(未生成或为空)"
                 else:
-                    # 退化为 Python 轮询
-                    self.proc = None
-                self.append_run_log("日志跟随 vasp.out（Windows 侧）已启动。")
+                    try:
+                        tail = subprocess.check_output(
+                            ["bash", "-lc", f"cd '{proj}' && tail -n 60 vasp.out"],
+                            text=True, stderr=subprocess.STDOUT
+                        )
+                    except Exception as _e:
+                        tail = f"(tail 失败：{_e})"
+                # 如果此时文件很小，继续让监视器判断是否在增长
                 self.start_monitor()
             except Exception as e:
-                messagebox.showerror(APP_NAME, f"WSL 启动失败：{e}")
+                self.append_run_log(f"[EXC] 启动失败：{e}")
+                messagebox.showerror(APP_NAME, f"启动失败：{e}")
+                return
+
+        elif mode == "wsl":
+            messagebox.showerror(APP_NAME, "WSL 分支未内置 AOCL/AOCC 环境设置，请使用本地或 SLURM。")
+            return
+
         else:
-            # 提交 SLURM
+            # SLURM：写脚本并 sbatch
             if not which("sbatch"):
                 messagebox.showerror(APP_NAME, "未找到 sbatch。请在 SLURM 节点上运行或配置环境。")
                 return
+            self.write_job_script()
             script = proj / "run_slurm.sh"
-            if not script.exists():
-                self.write_job_script()
             try:
                 out = subprocess.check_output(["bash", "-lc", f"cd '{proj}' && sbatch '{script.name}'"], text=True)
                 if out:
@@ -1292,7 +1326,7 @@ srun {vcmd}
         self.sys_monitor.start()
         self.sys_info.delete("1.0", tk.END)
         self.sys_info.insert(tk.END, "系统监视线程已启动……\n")
-        self.apply_run_status("🟡 正在监视…", ["系统监视线程已启动，等待数据更新。"])
+        self.apply_run_status("�� 正在监视…", ["系统监视线程已启动，等待数据更新。"])
 
     def stop_monitor(self):
         if self.monitor:
@@ -1551,7 +1585,7 @@ srun {vcmd}
         run_state = stats.get("run_state")
         run_pids = stats.get("run_pids", [])
         if run_state == "running" and run_pids:
-            status = f"🟢 运行中 (PID {', '.join(run_pids)})"
+            status = f"�� 运行中 (PID {', '.join(run_pids)})"
         elif run_state == "idle":
             status = "⚪ 未检测到 VASP 进程"
         else:
@@ -1578,7 +1612,7 @@ srun {vcmd}
                 delta = item.get("delta")
                 if isinstance(delta, (int, float)):
                     detail += f" | Δ {format_bytes(delta)}"
-                status = "🟡 输出中" if isinstance(delta, (int, float)) and delta > 0 else "✅ 已存在"
+                status = "�� 输出增长" if isinstance(delta, (int, float)) and delta > 0 else "✅ 已存在"
             else:
                 status = "⚠️ 未找到"
                 detail = "尚未生成或路径不匹配"
