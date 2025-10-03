@@ -1,0 +1,815 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+VASP GUI（Beginner+Examples, Linux/WSL, Tkinter）
+================================================
+面向新手的“一体化”图形界面：项目管理、输入文件（INCAR/POSCAR/KPOINTS）编辑、
+POTCAR 拼接、K 点生成、本地/WSL/SLURM 启动、OSZICAR 监视、简要后处理，
+并新增：
+- QuickStart（快速上手/示例）页：一键生成 Si 示例、模拟运行（无 VASP 也能看曲线）
+- 建议引擎：基于 POSCAR/POTCAR/INCAR 给出参数建议（ENCUT/ISMEAR/SIGMA/ISPIN、K网格）
+- 面板可见的建议区 + 一键应用到编辑器
+
+依赖：Python3、tkinter、matplotlib（建议）
+可选：ttkbootstrap（更美观）
+
+注意：本工具不会、也不应当分发 VASP 可执行文件或赝势；请确保你有 VASP 许可并在本地配置好。
+"""
+from __future__ import annotations
+import os
+import re
+import json
+import time
+import math
+import shutil
+import threading
+import subprocess
+from pathlib import Path
+
+# ---------------- Tk/Matplotlib -----------------
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+except Exception as e:
+    print("[FATAL] tkinter 不可用：", e)
+    raise
+
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+APP_NAME = "VASP GUI (Beginner+Examples)"
+APP_VER = "0.2.0"
+
+# ----------------- 小工具函数 -------------------
+ENERGY_RX = re.compile(r"F=\s*([-+]?\d+\.\d+)|E0=\s*([-+]?\d+\.\d+)")
+ENMAX_RX = re.compile(r"ENMAX\s*=\s*([0-9]+\.?[0-9]*)")
+
+METALS = {"Fe","Co","Ni","Cu","V","Cr","Mn","Mo","W","Ti","Zr","Hf","Nb","Ta","Ag","Au","Pt","Pd","Rh","Ir","Al","Mg","Ca","Na","K"}
+OPEN_SHELL = {"Fe","Co","Ni","V","Cr","Mn","Mo","W","Ti","Zr","Hf","Cu"}
+
+
+def which(cmd: str) -> str | None:
+    return shutil.which(cmd)
+
+
+def read_text(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8")
+    except Exception:
+        try:
+            return p.read_text(encoding="latin-1")
+        except Exception:
+            return ""
+
+
+def write_text(p: Path, s: str) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(s, encoding="utf-8")
+
+
+# ----------- POSCAR 粗解析 + 晶格/原子数 --------------
+POSCAR_ELEM_LINE_RX = re.compile(r"^\s*([A-Za-z][a-z]?(?:\s+[A-Za-z][a-z]?)*?)\s*$")
+COUNTS_RX = re.compile(r"^\s*(\d+(?:\s+\d+)*)\s*$")
+
+
+def parse_poscar(poscar_text: str):
+    lines = [ln.rstrip("\n") for ln in poscar_text.splitlines() if ln.strip() != ""]
+    if len(lines) < 8:
+        return [], []
+    elem_line = None
+    cnt_line = None
+    l6 = lines[5]; l7 = lines[6]
+    if POSCAR_ELEM_LINE_RX.match(l6) and COUNTS_RX.match(l7):
+        elem_line = l6; cnt_line = l7
+    else:
+        if COUNTS_RX.match(l6):
+            cnt_line = l6
+    elements = elem_line.split() if elem_line else []
+    counts = [int(x) for x in cnt_line.split()] if cnt_line else []
+    return elements, counts
+
+
+def parse_poscar_lattice(text: str):
+    lines = [ln for ln in text.splitlines() if ln.strip() != ""]
+    if len(lines) < 8:
+        return 1.0, None, None, None, [], [], 0
+    try:
+        scale = float(lines[1].strip())
+    except Exception:
+        scale = 1.0
+    def vec(i):
+        parts = [float(x) for x in lines[i].split()[:3]]
+        return [p*scale for p in parts]
+    a = vec(2); b = vec(3); c = vec(4)
+    elems, counts = parse_poscar("\n".join(lines))
+    total = sum(counts) if counts else 0
+    return scale, a, b, c, elems, counts, total
+
+
+def _norm(v):
+    return math.sqrt(sum(vi*vi for vi in v))
+
+
+def _cross(a,b):
+    return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]
+
+
+def reciprocal_lengths(a,b,c):
+    vol = a[0]* (b[1]*c[2]-b[2]*c[1]) - a[1]*(b[0]*c[2]-b[2]*c[0]) + a[2]*(b[0]*c[1]-b[1]*c[0])
+    if abs(vol) < 1e-12:
+        return None, None, None
+    b1 = _cross(b,c); b2 = _cross(c,a); b3 = _cross(a,b)
+    b1 = [x/vol for x in b1]; b2 = [x/vol for x in b2]; b3 = [x/vol for x in b3]
+    return _norm(b1), _norm(b2), _norm(b3)
+
+
+def suggest_kgrid_from_kspacing(poscar_text: str, kspacing: float = 0.22):
+    _, a,b,c, *_ = parse_poscar_lattice(poscar_text)
+    if a is None:
+        return 3,3,3
+    bl = reciprocal_lengths(a,b,c)
+    if not bl[0]:
+        return 3,3,3
+    nx = max(1, int(round(bl[0]/kspacing)))
+    ny = max(1, int(round(bl[1]/kspacing)))
+    nz = max(1, int(round(bl[2]/kspacing)))
+    return nx,ny,nz
+
+
+def extract_enmax_from_potcar(potcar_path: Path):
+    try:
+        data = potcar_path.read_text(errors="ignore")
+        vals = [float(m.group(1)) for m in ENMAX_RX.finditer(data)]
+        return max(vals) if vals else None
+    except Exception:
+        return None
+
+
+def guess_metallic(elements):
+    return any(e in METALS for e in elements)
+
+
+def guess_spin(elements):
+    return any(e in OPEN_SHELL for e in elements)
+
+
+# ----------------- KPOINTS 生成 -----------------
+
+def gen_kpoints_monkhorst(nx: int, ny: int, nz: int, gamma_center: bool) -> str:
+    lines = [
+        "Auto KPOINTS",
+        "0",
+        "Gamma" if gamma_center else "Monkhorst-Pack",
+        f"{nx} {ny} {nz}",
+        "0 0 0",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+# ----------------- 监视线程 ---------------------
+class EnergyMonitor(threading.Thread):
+    def __init__(self, workdir: Path, on_update):
+        super().__init__(daemon=True)
+        self.workdir = workdir
+        self.on_update = on_update
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        last_size = 0
+        osz = self.workdir / "OSZICAR"
+        while not self._stop.is_set():
+            try:
+                if osz.exists():
+                    size = osz.stat().st_size
+                    if size != last_size:
+                        last_size = size
+                        steps, energies = [], []
+                        with osz.open("r", encoding="utf-8", errors="ignore") as f:
+                            i = 0
+                            for line in f:
+                                m = ENERGY_RX.search(line)
+                                if m:
+                                    val = m.group(1) or m.group(2)
+                                    try:
+                                        i += 1
+                                        energies.append(float(val))
+                                        steps.append(i)
+                                    except Exception:
+                                        pass
+                        self.on_update(steps, energies)
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+
+# ----------------- 主 GUI -----------------------
+class VaspGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(f"{APP_NAME} v{APP_VER}")
+        self.geometry("1240x860")
+        try:
+            import ttkbootstrap as tb
+            tb.Style("cosmo")
+        except Exception:
+            pass
+
+        self.project_dir = Path.cwd()
+        self.proc = None
+        self.monitor = None
+
+        self._build_ui()
+
+    # ------------ UI 构建 -------------
+    def _build_ui(self):
+        toolbar = ttk.Frame(self)
+        toolbar.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(toolbar, text="项目目录:").pack(side=tk.LEFT, padx=6)
+        self.project_var = tk.StringVar(value=str(self.project_dir))
+        ttk.Entry(toolbar, textvariable=self.project_var, width=86).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="选择…", command=self.choose_project).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="新建项目", command=self.create_project).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="快速体检", command=self.quick_check).pack(side=tk.LEFT, padx=4)
+
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill=tk.BOTH, expand=True)
+
+        # 页签
+        self.page_quick = self._build_quickstart_page(self.nb)
+        self.page_inputs = self._build_inputs_page(self.nb)
+        self.page_potcar = self._build_potcar_page(self.nb)
+        self.page_kpoints = self._build_kpoints_page(self.nb)
+        self.page_run = self._build_run_page(self.nb)
+        self.page_monitor = self._build_monitor_page(self.nb)
+        self.page_post = self._build_post_page(self.nb)
+
+        self.nb.add(self.page_quick, text="快速上手 / 示例")
+        self.nb.add(self.page_inputs, text="输入文件")
+        self.nb.add(self.page_potcar, text="POTCAR 赝势")
+        self.nb.add(self.page_kpoints, text="K 点生成 + 建议")
+        self.nb.add(self.page_run, text="运行 / 提交 + 建议")
+        self.nb.add(self.page_monitor, text="监视")
+        self.nb.add(self.page_post, text="后处理 (简)")
+
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # ---------- QuickStart / 示例 ----------
+    def _build_quickstart_page(self, parent):
+        frame = ttk.Frame(parent)
+
+        left = ttk.LabelFrame(frame, text="一键操作")
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=8)
+        ttk.Button(left, text="生成 Si 示例文件", command=self.create_demo_files).pack(fill=tk.X, padx=8, pady=6)
+        ttk.Button(left, text="模拟运行（无 VASP）", command=self.simulate_run).pack(fill=tk.X, padx=8, pady=6)
+        ttk.Button(left, text="刷新建议", command=self.refresh_suggestions).pack(fill=tk.X, padx=8, pady=6)
+        ttk.Button(left, text="打开项目目录", command=self.open_project_folder).pack(fill=tk.X, padx=8, pady=6)
+
+        right = ttk.LabelFrame(frame, text="新手清单（强烈建议按顺序走一遍）")
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        txt = tk.Text(right, height=22, wrap=tk.WORD)
+        txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        checklist = (
+            "1) 选择或新建项目目录\n"
+            "2) 在“输入文件”页：\n   - 选择一个 INCAR 模板并保存\n   - 编辑/导入 POSCAR（或先用示例）\n   - 需要 KPOINTS 的话可先跳过，后面自动建议\n"
+            "3) 在“POTCAR 赝势”页：设置赝势库根目录并一键生成 POTCAR\n"
+            "4) 在“K 点生成 + 建议”页：一键‘刷新建议’，可‘应用到编辑器’\n"
+            "5) 在‘运行/提交 + 建议’页：选择 Local/WSL/SLURM，刷新建议并启动\n"
+            "6) 在‘监视’页：看 OSZICAR 曲线是否收敛（示例可先用‘模拟运行’）\n"
+            "7) 完成后在‘后处理（简）’页提取最终能量/简单作图\n"
+        )
+        txt.insert("1.0", checklist)
+        txt.config(state=tk.DISABLED)
+
+        return frame
+
+    def open_project_folder(self):
+        p = Path(self.project_var.get())
+        try:
+            if os.name == "nt":
+                subprocess.Popen(["explorer", str(p)])
+            else:
+                subprocess.Popen(["xdg-open", str(p)])
+        except Exception as e:
+            messagebox.showwarning(APP_NAME, f"无法打开目录：{e}")
+
+    def create_demo_files(self):
+        proj = Path(self.project_var.get())
+        poscar = (
+            "Si diamond\n"
+            "5.431\n"
+            "0.0 0.5 0.5\n"
+            "0.5 0.0 0.5\n"
+            "0.5 0.5 0.0\n"
+            "Si\n"
+            "2\n"
+            "Direct\n"
+            "0.0 0.0 0.0\n"
+            "0.25 0.25 0.25\n"
+        )
+        incar = (
+            "# ==== 示例：几何优化（PBE）====\n"
+            "SYSTEM = Si_relax\nENCUT = 520\nPREC = Accurate\nEDIFF = 1e-6\nEDIFFG = -0.02\nISMEAR = 0\nSIGMA = 0.05\nIBRION = 2\nISIF = 3\nNSW = 60\nLREAL = Auto\n"
+        )
+        kpoints = gen_kpoints_monkhorst(6,6,6, True)
+        write_text(proj/"POSCAR", poscar)
+        write_text(proj/"INCAR", incar)
+        write_text(proj/"KPOINTS", kpoints)
+        messagebox.showinfo(APP_NAME, f"已生成示例文件到：\n{proj}")
+
+    def simulate_run(self):
+        """无 VASP 环境也能演示监视曲线：写一个假的 OSZICAR。"""
+        proj = Path(self.project_var.get())
+        E0 = -10.0
+        lines = []
+        for i in range(1, 81):
+            # 指数衰减 + 微小噪声
+            val = E0 - 0.5*math.exp(-i/15.0) + (0.0005*math.sin(i))
+            lines.append(f" {i:4d} F= {val:.6f} E0= {val-0.2:.6f}\n")
+        write_text(proj/"OSZICAR", "".join(lines))
+        messagebox.showinfo(APP_NAME, f"已写入模拟 OSZICAR：{proj/'OSZICAR'}\n到‘监视’页看看收敛曲线吧！")
+
+    # ---------- 输入文件页 ----------
+    def _build_inputs_page(self, parent):
+        frame = ttk.Frame(parent)
+        left = ttk.Frame(frame); left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        right = ttk.Frame(frame); right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        ttk.Label(left, text="INCAR 模板与编辑").pack(anchor=tk.W)
+        temp_bar = ttk.Frame(left); temp_bar.pack(fill=tk.X, pady=4)
+        self.incar_template = tk.StringVar(value="relax")
+        for key, txt in [("relax","几何优化"),("static","静态自洽"),("dos","态密度"),("bands","能带预设")]:
+            ttk.Radiobutton(temp_bar, text=txt, value=key, variable=self.incar_template, command=self.load_incar_template).pack(side=tk.LEFT)
+        ttk.Button(temp_bar, text="加载模板到编辑器", command=self.load_incar_template).pack(side=tk.RIGHT)
+
+        self.incar_text = tk.Text(left, height=18)
+        self.incar_text.pack(fill=tk.BOTH, expand=True)
+        row = ttk.Frame(left); row.pack(fill=tk.X, pady=4)
+        ttk.Button(row, text="打开 INCAR", command=lambda: self.open_into_editor("INCAR", self.incar_text)).pack(side=tk.LEFT)
+        ttk.Button(row, text="保存 INCAR", command=lambda: self.save_from_editor("INCAR", self.incar_text)).pack(side=tk.LEFT, padx=6)
+
+        ttk.Label(right, text="POSCAR 编辑").pack(anchor=tk.W)
+        self.poscar_text = tk.Text(right, height=9)
+        self.poscar_text.pack(fill=tk.BOTH, expand=True)
+        row2 = ttk.Frame(right); row2.pack(fill=tk.X, pady=4)
+        ttk.Button(row2, text="打开 POSCAR", command=lambda: self.open_into_editor("POSCAR", self.poscar_text)).pack(side=tk.LEFT)
+        ttk.Button(row2, text="保存 POSCAR", command=lambda: self.save_from_editor("POSCAR", self.poscar_text)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(row2, text="解析元素", command=self.show_poscar_elements).pack(side=tk.LEFT, padx=6)
+
+        ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+        ttk.Label(right, text="KPOINTS 编辑（或去下一页一键生成/应用建议）").pack(anchor=tk.W)
+        self.kpoints_text = tk.Text(right, height=8)
+        self.kpoints_text.pack(fill=tk.BOTH, expand=True)
+        row3 = ttk.Frame(right); row3.pack(fill=tk.X, pady=4)
+        ttk.Button(row3, text="打开 KPOINTS", command=lambda: self.open_into_editor("KPOINTS", self.kpoints_text)).pack(side=tk.LEFT)
+        ttk.Button(row3, text="保存 KPOINTS", command=lambda: self.save_from_editor("KPOINTS", self.kpoints_text)).pack(side=tk.LEFT, padx=6)
+
+        self.load_incar_template()
+        return frame
+
+    def load_incar_template(self):
+        tpl = self.incar_template.get()
+        presets = {
+            "relax": (
+                """# ==== 几何优化（PBE）====\nSYSTEM = relax\nENCUT = 520\nPREC  = Accurate\nEDIFF = 1e-6\nEDIFFG = -0.02\nISMEAR = 0\nSIGMA  = 0.05\nIBRION = 2\nISIF   = 3\nNSW    = 100\nISPIN  = 1\nLREAL  = Auto\n"""
+            ),
+            "static": (
+                """# ==== 静态自洽（SCF）====\nSYSTEM = scf\nENCUT = 520\nPREC  = Accurate\nEDIFF = 1e-6\nISMEAR = 0\nSIGMA  = 0.05\nIBRION = -1\nNSW    = 0\nLREAL  = Auto\nLWAVE  = .FALSE.\nLCHARG = .TRUE.\n"""
+            ),
+            "dos": (
+                """# ==== DOS 计算（在已收敛电荷上）====\nSYSTEM = dos\nENCUT = 520\nPREC  = Accurate\nEDIFF = 1e-6\nISMEAR = 0\nSIGMA  = 0.05\nIBRION = -1\nNSW    = 0\nLORBIT = 11\nNEDOS  = 2000\nLCHARG = .TRUE.\nLWAVE  = .FALSE.\n"""
+            ),
+            "bands": (
+                """# ==== 能带预设（非自洽）====\nSYSTEM = bands\nENCUT = 520\nPREC  = Accurate\nEDIFF = 1e-6\nISMEAR = 0\nSIGMA  = 0.05\nIBRION = -1\nNSW    = 0\nICHARG = 11\nLORBIT = 11\nLCHARG = .FALSE.\nLWAVE  = .TRUE.\n"""
+            ),
+        }
+        self.incar_text.delete("1.0", tk.END)
+        self.incar_text.insert("1.0", presets.get(tpl, presets["relax"]))
+
+    def open_into_editor(self, name: str, editor: tk.Text):
+        p = filedialog.askopenfilename(initialdir=self.project_var.get(), title=f"打开 {name}")
+        if not p:
+            return
+        s = read_text(Path(p))
+        editor.delete("1.0", tk.END); editor.insert("1.0", s)
+
+    def save_from_editor(self, name: str, editor: tk.Text):
+        proj = Path(self.project_var.get()).expanduser(); proj.mkdir(parents=True, exist_ok=True)
+        write_text(proj / name, editor.get("1.0", tk.END))
+        messagebox.showinfo(APP_NAME, f"已保存 {name} -> {proj/name}")
+
+    def show_poscar_elements(self):
+        elems, _ = parse_poscar(self.poscar_text.get("1.0", tk.END))
+        messagebox.showinfo(APP_NAME, f"POSCAR 元素：{', '.join(elems) if elems else '(未解析)'}")
+
+    # ---------- POTCAR 页 ----------
+    def _build_potcar_page(self, parent):
+        frame = ttk.Frame(parent)
+        row1 = ttk.Frame(frame); row1.pack(fill=tk.X, padx=8, pady=8)
+        ttk.Label(row1, text="赝势库根目录：").pack(side=tk.LEFT)
+        self.pot_dir_var = tk.StringVar(value=str(Path.home()/"potcars"))
+        ttk.Entry(row1, textvariable=self.pot_dir_var, width=82).pack(side=tk.LEFT, padx=6)
+        ttk.Button(row1, text="选择…", command=self.choose_pot_dir).pack(side=tk.LEFT)
+
+        row2 = ttk.Frame(frame); row2.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Label(row2, text="从 POSCAR 解析元素并生成 POTCAR：").pack(side=tk.LEFT)
+        ttk.Button(row2, text="生成 POTCAR", command=self.do_build_potcar).pack(side=tk.LEFT, padx=8)
+
+        tip = ttk.LabelFrame(frame, text="新手小贴士")
+        tip.pack(fill=tk.X, padx=8, pady=4)
+        lab = tk.Text(tip, height=5, wrap=tk.WORD)
+        lab.pack(fill=tk.X, padx=8, pady=6)
+        lab.insert("1.0", "建议把不同库（如 PBE.54）放在同一根目录下，子目录名是元素名，如 .../PBE.54/Si/POTCAR；本工具会在根目录下递归 ≤3 层找 POTCAR。生成后可在‘运行/提交 + 建议’页用 POTCAR 的 ENMAX 建议 ENCUT。")
+        lab.config(state=tk.DISABLED)
+
+        self.pot_msg = tk.Text(frame, height=14)
+        self.pot_msg.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        return frame
+
+    def choose_pot_dir(self):
+        d = filedialog.askdirectory(initialdir=self.pot_dir_var.get(), title="选择赝势库根目录")
+        if d:
+            self.pot_dir_var.set(d)
+
+    def find_potcar_for_element(self, elem: str, pot_dir: Path) -> Path | None:
+        elem = elem.strip(); max_depth = 3
+        queue = [(pot_dir, 0)]; candidates = []
+        while queue:
+            d, depth = queue.pop(0)
+            if depth > max_depth: continue
+            try:
+                for entry in Path(d).iterdir():
+                    if entry.is_dir():
+                        if entry.name == elem and (entry/"POTCAR").exists():
+                            candidates.append(entry/"POTCAR")
+                        queue.append((entry, depth+1))
+            except Exception:
+                pass
+        return candidates[0] if candidates else None
+
+    def do_build_potcar(self):
+        proj = Path(self.project_var.get())
+        pos = proj/"POSCAR"
+        if not pos.exists():
+            s = self.poscar_text.get("1.0", tk.END).strip()
+            if s: write_text(pos, s)
+        elems, _ = parse_poscar(read_text(pos))
+        if not elems:
+            messagebox.showwarning(APP_NAME, "未从 POSCAR 解析到元素。")
+            return
+        out = proj/"POTCAR"
+        try:
+            with out.open("wb") as fout:
+                for e in elems:
+                    p = self.find_potcar_for_element(e, Path(self.pot_dir_var.get()))
+                    if not p:
+                        raise FileNotFoundError(f"未找到 {e} 的 POTCAR")
+                    fout.write(Path(p).read_bytes())
+            msg = f"POTCAR 已生成：{out}"
+            self.pot_msg.insert(tk.END, msg+"\n"); self.pot_msg.see(tk.END)
+            messagebox.showinfo(APP_NAME, msg)
+        except Exception as ex:
+            messagebox.showerror(APP_NAME, f"生成 POTCAR 失败：{ex}")
+
+    # ---------- KPOINTS 页 + 建议 ----------
+    def _build_kpoints_page(self, parent):
+        frame = ttk.Frame(parent)
+        box = ttk.LabelFrame(frame, text="Monkhorst-Pack 网格")
+        box.pack(fill=tk.X, padx=8, pady=8)
+        self.k_nx = tk.IntVar(value=5); self.k_ny = tk.IntVar(value=5); self.k_nz = tk.IntVar(value=5)
+        self.k_gamma = tk.BooleanVar(value=True)
+
+        row = ttk.Frame(box); row.pack(fill=tk.X, pady=4)
+        for lab, var in [("Nx", self.k_nx), ("Ny", self.k_ny), ("Nz", self.k_nz)]:
+            ttk.Label(row, text=lab).pack(side=tk.LEFT); ttk.Spinbox(row, from_=1, to=50, textvariable=var, width=6).pack(side=tk.LEFT, padx=6)
+        ttk.Checkbutton(box, text="Gamma 中心", variable=self.k_gamma).pack(anchor=tk.W, padx=8)
+
+        btns = ttk.Frame(frame); btns.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Button(btns, text="生成到编辑器", command=self.kpoints_to_editor).pack(side=tk.LEFT)
+        ttk.Button(btns, text="保存为 KPOINTS", command=self.kpoints_save).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btns, text="基于 KSPACING 建议", command=self.apply_kspacing_suggestion).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btns, text="刷新建议", command=self.refresh_suggestions).pack(side=tk.LEFT, padx=8)
+
+        tip = ttk.Label(frame, text="提示：也可在 INCAR 使用 KSPACING（如 0.22 Å⁻¹），省去 KPOINTS。")
+        tip.pack(anchor=tk.W, padx=12, pady=4)
+
+        sugg = ttk.LabelFrame(frame, text="建议（只读，可将建议一键应用）")
+        sugg.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.k_sugg = tk.Text(sugg, height=8, wrap=tk.WORD)
+        self.k_sugg.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.k_sugg.config(state=tk.DISABLED)
+        return frame
+
+    def kpoints_to_editor(self):
+        s = gen_kpoints_monkhorst(self.k_nx.get(), self.k_ny.get(), self.k_nz.get(), self.k_gamma.get())
+        self.kpoints_text.delete("1.0", tk.END); self.kpoints_text.insert("1.0", s)
+
+    def kpoints_save(self):
+        proj = Path(self.project_var.get()); proj.mkdir(parents=True, exist_ok=True)
+        write_text(proj/"KPOINTS", self.kpoints_text.get("1.0", tk.END))
+        messagebox.showinfo(APP_NAME, f"KPOINTS 已保存到 {proj/'KPOINTS'}")
+
+    def apply_kspacing_suggestion(self):
+        pos_text = self.poscar_text.get("1.0", tk.END)
+        nx,ny,nz = suggest_kgrid_from_kspacing(pos_text, 0.22)
+        self.k_nx.set(nx); self.k_ny.set(ny); self.k_nz.set(nz)
+        self.kpoints_to_editor()
+
+    # ---------- 运行/提交 页 + 建议 ----------
+    def _build_run_page(self, parent):
+        frame = ttk.Frame(parent)
+        row0 = ttk.LabelFrame(frame, text="运行方式")
+        row0.pack(fill=tk.X, padx=8, pady=8)
+        self.run_mode = tk.StringVar(value="local")
+        ttk.Radiobutton(row0, text="本地 mpirun", value="local", variable=self.run_mode).pack(side=tk.LEFT, padx=8)
+        ttk.Radiobutton(row0, text="WSL2 (Windows)", value="wsl", variable=self.run_mode).pack(side=tk.LEFT, padx=8)
+        ttk.Radiobutton(row0, text="SLURM 集群", value="slurm", variable=self.run_mode).pack(side=tk.LEFT, padx=8)
+
+        row1 = ttk.LabelFrame(frame, text="VASP 执行配置")
+        row1.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Label(row1, text="VASP 命令").grid(row=0, column=0, sticky=tk.W, padx=6, pady=4)
+        self.vasp_cmd = tk.StringVar(value="vasp_std")
+        ttk.Entry(row1, textvariable=self.vasp_cmd, width=28).grid(row=0, column=1, sticky=tk.W)
+        ttk.Button(row1, text="which?", command=self.which_vasp).grid(row=0, column=2, padx=6)
+        ttk.Label(row1, text="MPI 进程数 -np").grid(row=1, column=0, sticky=tk.W, padx=6, pady=4)
+        self.mpi_np = tk.IntVar(value=8)
+        ttk.Spinbox(row1, from_=1, to=2048, textvariable=self.mpi_np, width=8).grid(row=1, column=1, sticky=tk.W)
+
+        row2 = ttk.LabelFrame(frame, text="SLURM 提交（仅在 SLURM 运行时使用）")
+        row2.pack(fill=tk.X, padx=8, pady=4)
+        self.slurm_part = tk.StringVar(value="normal"); self.slurm_time = tk.StringVar(value="02:00:00")
+        self.slurm_nodes = tk.IntVar(value=1); self.slurm_ntasks = tk.IntVar(value=32)
+        self.slurm_account = tk.StringVar(value="")
+        ttk.Label(row2, text="分区").grid(row=0, column=0, sticky=tk.W, padx=6, pady=4); ttk.Entry(row2, textvariable=self.slurm_part, width=12).grid(row=0, column=1)
+        ttk.Label(row2, text="时长").grid(row=0, column=2, sticky=tk.W, padx=6); ttk.Entry(row2, textvariable=self.slurm_time, width=12).grid(row=0, column=3)
+        ttk.Label(row2, text="节点").grid(row=0, column=4, sticky=tk.W, padx=6); ttk.Spinbox(row2, from_=1, to=128, textvariable=self.slurm_nodes, width=6).grid(row=0, column=5)
+        ttk.Label(row2, text="ntasks").grid(row=0, column=6, sticky=tk.W, padx=6); ttk.Spinbox(row2, from_=1, to=8192, textvariable=self.slurm_ntasks, width=8).grid(row=0, column=7)
+        ttk.Label(row2, text="账号").grid(row=0, column=8, sticky=tk.W, padx=6); ttk.Entry(row2, textvariable=self.slurm_account, width=12).grid(row=0, column=9)
+
+        btns = ttk.Frame(frame); btns.pack(fill=tk.X, padx=8, pady=8)
+        ttk.Button(btns, text="生成运行脚本", command=self.write_job_script).pack(side=tk.LEFT)
+        ttk.Button(btns, text="启动/提交", command=self.start_run).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btns, text="停止本地进程", command=self.stop_local).pack(side=tk.LEFT)
+        ttk.Button(btns, text="刷新建议", command=self.refresh_suggestions).pack(side=tk.LEFT, padx=8)
+
+        self.run_log = tk.Text(frame, height=10)
+        self.run_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        sugg = ttk.LabelFrame(frame, text="建议（ENCUT / ISMEAR / SIGMA / ISPIN / 运行环境）")
+        sugg.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.run_sugg = tk.Text(sugg, height=8, wrap=tk.WORD)
+        self.run_sugg.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.run_sugg.config(state=tk.DISABLED)
+        return frame
+
+    def which_vasp(self):
+        cmd = self.vasp_cmd.get().strip(); path = which(cmd)
+        messagebox.showinfo(APP_NAME, f"{cmd} -> {path or '未找到'}")
+
+    def write_job_script(self):
+        proj = Path(self.project_var.get()); proj.mkdir(parents=True, exist_ok=True)
+        mode = self.run_mode.get(); vcmd = self.vasp_cmd.get().strip()
+        if mode == "local":
+            script = f"""#!/bin/bash
+set -e
+cd "{proj}"
+echo "[INFO] Workdir: $(pwd)"
+mpirun -np {self.mpi_np.get()} {vcmd} > vasp.out 2>&1
+"""
+            write_text(proj/"run_local.sh", script); os.chmod(proj/"run_local.sh", 0o755)
+            self.run_log.insert(tk.END, f"已生成 {proj/'run_local.sh'}\n"); self.run_log.see(tk.END)
+        else:
+            acc = f"#SBATCH --account={self.slurm_account.get()}\n" if self.slurm_account.get().strip() else ""
+            script = f"""#!/bin/bash
+#SBATCH --job-name=vasp
+#SBATCH --partition={self.slurm_part.get()}
+#SBATCH --time={self.slurm_time.get()}
+#SBATCH --nodes={self.slurm_nodes.get()}
+#SBATCH --ntasks={self.slurm_ntasks.get()}
+{acc}
+cd "{proj}"
+srun {vcmd}
+"""
+            write_text(proj/"run_slurm.sh", script); os.chmod(proj/"run_slurm.sh", 0o755)
+            self.run_log.insert(tk.END, f"已生成 {proj/'run_slurm.sh'}\n"); self.run_log.see(tk.END)
+
+    def is_windows(self) -> bool:
+        return os.name == "nt"
+
+    def win_to_wsl_path(self, p: Path) -> str:
+        s = str(p)
+        if len(s) >= 2 and s[1] == ":":
+            drive = s[0].lower(); rest = s[2:].replace("\\", "/")
+            return f"/mnt/{drive}{rest if rest.startswith('/') else '/' + rest}"
+        return s.replace("\\", "/")
+
+    def start_run(self):
+        proj = Path(self.project_var.get()); mode = self.run_mode.get(); vcmd = self.vasp_cmd.get().strip()
+        if mode == "local":
+            if not which("mpirun"): messagebox.showerror(APP_NAME, "未找到 mpirun"); return
+            if not which(vcmd): messagebox.showerror(APP_NAME, f"未找到 VASP 命令：{vcmd}"); return
+            cmd = ["bash", "-lc", f"cd '{proj}' && mpirun -np {self.mpi_np.get()} {vcmd} > vasp.out 2>&1 & echo $!"]
+            try:
+                out = subprocess.check_output(cmd, text=True)
+                self.run_log.insert(tk.END, f"已启动本地 VASP，PID={out.strip()}\n")
+                self.run_log.see(tk.END)
+                self.start_monitor()
+            except Exception as e:
+                messagebox.showerror(APP_NAME, f"启动失败：{e}")
+        elif mode == "wsl":
+            if not self.is_windows() or not which("wsl"):
+                messagebox.showerror(APP_NAME, "未检测到 Windows/WSL 环境或 wsl.exe 不可用。")
+                return
+            proj_wsl = self.win_to_wsl_path(proj)
+            cmd = ["wsl", "-e", "bash", "-lc", f"cd '{proj_wsl}' && mpirun -np {self.mpi_np.get()} {vcmd} > vasp.out 2>&1 & echo $!"]
+            try:
+                out = subprocess.check_output(cmd, text=True)
+                self.run_log.insert(tk.END, f"已在 WSL 启动 VASP，PID={out.strip()}\n"); self.run_log.see(tk.END)
+                self.start_monitor()
+            except Exception as e:
+                messagebox.showerror(APP_NAME, f"WSL 启动失败：{e}")
+        else:
+            if not which("sbatch"):
+                messagebox.showerror(APP_NAME, "未找到 sbatch。请在 SLURM 节点上运行或配置环境。")
+                return
+            script = proj/"run_slurm.sh"
+            if not script.exists(): self.write_job_script()
+            try:
+                out = subprocess.check_output(["bash", "-lc", f"cd '{proj}' && sbatch '{script.name}'"], text=True)
+                self.run_log.insert(tk.END, out+"\n"); self.run_log.see(tk.END)
+                self.start_monitor()
+            except subprocess.CalledProcessError as e:
+                messagebox.showerror(APP_NAME, f"sbatch 失败：{e}\n{e.output}")
+
+    def stop_local(self):
+        try:
+            subprocess.call(["bash", "-lc", "pkill -f 'vasp' || true"])  # 保守
+            self.run_log.insert(tk.END, "已尝试停止本地 VASP 进程（pkill -f 'vasp'）。\n"); self.run_log.see(tk.END)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"停止失败：{e}")
+
+    # ---------- 监视 ----------
+    def _build_monitor_page(self, parent):
+        frame = ttk.Frame(parent)
+        top = ttk.Frame(frame); top.pack(fill=tk.X, padx=8, pady=6)
+        ttk.Button(top, text="开始监视", command=self.start_monitor).pack(side=tk.LEFT)
+        ttk.Button(top, text="停止监视", command=self.stop_monitor).pack(side=tk.LEFT, padx=6)
+
+        fig = Figure(figsize=(6,4), dpi=100)
+        self.ax = fig.add_subplot(111)
+        self.ax.set_xlabel("Step"); self.ax.set_ylabel("Total energy (F or E0) [eV]")
+        self.ax.grid(True, linestyle=":", linewidth=0.8)
+        self.line, = self.ax.plot([], [], marker="o", linestyle="-")
+        self.canvas = FigureCanvasTkAgg(fig, master=frame)
+        self.canvas.draw(); self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        self.mon_info = tk.Text(frame, height=7)
+        self.mon_info.pack(fill=tk.BOTH, expand=False, padx=8, pady=8)
+        return frame
+
+    def start_monitor(self):
+        self.stop_monitor()
+        proj = Path(self.project_var.get())
+        self.monitor = EnergyMonitor(proj, self.on_energy_update)
+        self.monitor.start()
+        self.mon_info.insert(tk.END, f"Watching {proj/'OSZICAR'}\n"); self.mon_info.see(tk.END)
+
+    def stop_monitor(self):
+        if self.monitor:
+            self.monitor.stop(); self.monitor = None
+
+    def on_energy_update(self, steps, energies):
+        def _upd():
+            self.ax.cla(); self.ax.set_xlabel("Step"); self.ax.set_ylabel("Total energy (F or E0) [eV]")
+            self.ax.grid(True, linestyle=":", linewidth=0.8)
+            if steps and energies:
+                self.ax.plot(steps, energies, marker="o", linestyle="-")
+            self.canvas.draw_idle()
+            if energies:
+                self.mon_info.insert(tk.END, f"last step={steps[-1]}, E={energies[-1]:.6f} eV\n"); self.mon_info.see(tk.END)
+        self.after(0, _upd)
+
+    # ---------- 后处理（简） ----------
+    def _build_post_page(self, parent):
+        frame = ttk.Frame(parent)
+        row = ttk.Frame(frame); row.pack(fill=tk.X, padx=8, pady=8)
+        ttk.Button(row, text="读取 OSZICAR 绘制（一次性）", command=self.plot_once_from_oszicar).pack(side=tk.LEFT)
+        ttk.Button(row, text="提取最终能量", command=self.extract_final_energy).pack(side=tk.LEFT, padx=8)
+        self.post_log = tk.Text(frame, height=16)
+        self.post_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        return frame
+
+    def plot_once_from_oszicar(self):
+        proj = Path(self.project_var.get()); osz = proj/"OSZICAR"
+        if not osz.exists():
+            messagebox.showwarning(APP_NAME, f"{osz} 不存在。"); return
+        steps, energies = [], []
+        with osz.open("r", encoding="utf-8", errors="ignore") as f:
+            i = 0
+            for line in f:
+                m = ENERGY_RX.search(line)
+                if m:
+                    val = m.group(1) or m.group(2)
+                    try:
+                        i += 1; energies.append(float(val)); steps.append(i)
+                    except Exception:
+                        pass
+        self.on_energy_update(steps, energies)
+        self.post_log.insert(tk.END, f"绘制完成，点数：{len(steps)}\n"); self.post_log.see(tk.END)
+
+    def extract_final_energy(self):
+        proj = Path(self.project_var.get()); osz = proj/"OSZICAR"
+        if not osz.exists(): messagebox.showwarning(APP_NAME, f"{osz} 不存在。"); return
+        last_e = None
+        for line in read_text(osz).splitlines():
+            m = ENERGY_RX.search(line)
+            if m:
+                try: last_e = float(m.group(1) or m.group(2))
+                except Exception: pass
+        if last_e is None:
+            messagebox.showwarning(APP_NAME, "未解析到能量。")
+        else:
+            self.post_log.insert(tk.END, f"最终能量（最后一步）：{last_e:.6f} eV\n"); self.post_log.see(tk.END)
+
+    # ---------- 建议引擎 & 应用 ----------
+    def refresh_suggestions(self):
+        proj = Path(self.project_var.get())
+        pos = self.poscar_text.get("1.0", tk.END) or read_text(proj/"POSCAR")
+        incar = self.incar_text.get("1.0", tk.END) or read_text(proj/"INCAR")
+        potcar = proj/"POTCAR"
+        elems, counts = parse_poscar(pos)
+        natoms = sum(counts) if counts else 0
+        metal = guess_metallic(elems)
+        need_spin = guess_spin(elems)
+        encut = extract_enmax_from_potcar(potcar)
+        encut_sugg = None
+        if encut: encut_sugg = int(math.ceil(encut*1.3/10.0)*10)
+        nx,ny,nz = suggest_kgrid_from_kspacing(pos, 0.22)
+
+        k_text = []
+        if natoms:
+            if natoms >= 100:
+                k_text.append("原子数≥100：建议 Gamma-only 或更稀疏网格以节省时间。")
+        k_text.append(f"基于 KSPACING≈0.22 Å⁻¹ 的粗略建议：{nx}×{ny}×{nz}（Gamma center={True}）")
+        self._set_text(self.k_sugg, "\n".join(k_text))
+
+        r_text = []
+        if encut_sugg:
+            r_text.append(f"POTCAR ENMAX 最大值≈{encut:.0f} eV → 建议 ENCUT≈{encut_sugg} eV")
+        else:
+            r_text.append("未检测到 POTCAR ENMAX：暂用 ENCUT=520 eV 作为通用起点。")
+        if metal:
+            r_text.append("元素包含金属：建议 ISMEAR=1 或 2，SIGMA≈0.2 eV（自洽/金属体系）")
+        else:
+            r_text.append("非金属/半导体：建议 ISMEAR=0，SIGMA≈0.05 eV（自洽）")
+        if need_spin:
+            r_text.append("含开壳层过渡金属：建议 ISPIN=2（考虑自旋极化）")
+        # 运行环境提示
+        envs = [f"mpirun={'OK' if which('mpirun') else '缺失'}", f"vasp_cmd={'OK' if which(self.vasp_cmd.get().strip()) else '缺失'}"]
+        if os.name == "nt": envs.append(f"wsl={'OK' if which('wsl') else '缺失'}")
+        r_text.append("环境检测："+", ".join(envs))
+        self._set_text(self.run_sugg, "\n".join(r_text))
+
+    def _set_text(self, widget: tk.Text, s: str):
+        try:
+            widget.config(state=tk.NORMAL); widget.delete("1.0", tk.END); widget.insert("1.0", s); widget.config(state=tk.DISABLED)
+        except Exception:
+            pass
+
+    # ---------- 项目/体检/退出 ----------
+    def choose_project(self):
+        d = filedialog.askdirectory(initialdir=self.project_var.get(), title="选择项目目录")
+        if d: self.project_var.set(d)
+
+    def create_project(self):
+        d = filedialog.askdirectory(initialdir=str(Path.home()), title="选择或创建项目父目录")
+        if not d: return
+        name = time.strftime("vasp_proj_%Y%m%d_%H%M%S"); p = Path(d)/name
+        p.mkdir(parents=True, exist_ok=True); self.project_var.set(str(p))
+        messagebox.showinfo(APP_NAME, f"已创建项目目录：{p}")
+
+    def quick_check(self):
+        proj = Path(self.project_var.get()); msgs = []
+        for f in ["INCAR","POSCAR","POTCAR","KPOINTS"]:
+            msgs.append(f"{f:7s} : {'✔' if (proj/f).exists() else '✗'}")
+        for cmd in ["mpirun", self.vasp_cmd.get().strip(), "sbatch", "wsl" if os.name == "nt" else None]:
+            if cmd: msgs.append(f"which {cmd:8s} -> {which(cmd) or '未找到'}")
+        potroot = Path(self.pot_dir_var.get()) if hasattr(self, 'pot_dir_var') else Path('~')
+        msgs.append(f"POT 库: {potroot} {'(存在)' if potroot.exists() else '(不存在)'}")
+        self.run_log.insert(tk.END, "\n".join(msgs)+"\n"); self.run_log.see(tk.END)
+
+    def on_close(self):
+        try:
+            self.stop_monitor()
+        except Exception:
+            pass
+        self.destroy()
+
+
+if __name__ == "__main__":
+    app = VaspGUI()
+    app.mainloop()
