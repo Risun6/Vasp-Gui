@@ -42,6 +42,7 @@ from pathlib import Path
 try:
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
+    from tkinter.scrolledtext import ScrolledText
 except Exception as e:
     print("[FATAL] Tkinter 未安装或不可用：", e)
     sys.exit(1)
@@ -679,9 +680,12 @@ class VaspGUI(tk.Tk):
     def _build_inputs_page(self, parent):
         frame = ttk.Frame(parent)
 
+        paned = ttk.PanedWindow(frame, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
         # 左边：INCAR 模板
-        left = ttk.Frame(frame)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        left = ttk.Frame(paned, padding=8)
+        paned.add(left, weight=1)
 
         ttk.Label(left, text="INCAR 模板与编辑").pack(anchor=tk.W)
         temp_bar = ttk.Frame(left)
@@ -696,7 +700,7 @@ class VaspGUI(tk.Tk):
             ttk.Radiobutton(temp_bar, text=txt, value=key, variable=self.incar_template, command=self.load_incar_template).pack(side=tk.LEFT)
         ttk.Button(temp_bar, text="加载模板到编辑器", command=self.load_incar_template).pack(side=tk.RIGHT)
 
-        self.incar_text = tk.Text(left, height=20)
+        self.incar_text = ScrolledText(left, height=20, undo=True, wrap="none")
         self.incar_text.pack(fill=tk.BOTH, expand=True)
         btns = ttk.Frame(left)
         btns.pack(fill=tk.X, pady=4)
@@ -704,11 +708,11 @@ class VaspGUI(tk.Tk):
         ttk.Button(btns, text="保存到项目", command=lambda: self.save_from_editor("INCAR", self.incar_text)).pack(side=tk.LEFT, padx=6)
 
         # 右边：POSCAR & KPOINTS 编辑
-        right = ttk.Frame(frame)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        right = ttk.Frame(paned, padding=8)
+        paned.add(right, weight=1)
 
         ttk.Label(right, text="POSCAR 编辑").pack(anchor=tk.W)
-        self.poscar_text = tk.Text(right, height=10)
+        self.poscar_text = ScrolledText(right, height=10, undo=True, wrap="none")
         self.poscar_text.pack(fill=tk.BOTH, expand=True)
         row = ttk.Frame(right)
         row.pack(fill=tk.X, pady=4)
@@ -719,7 +723,7 @@ class VaspGUI(tk.Tk):
         ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
         ttk.Label(right, text="KPOINTS 编辑（可在K 点生成页自动生成）").pack(anchor=tk.W)
-        self.kpoints_text = tk.Text(right, height=10)
+        self.kpoints_text = ScrolledText(right, height=10, undo=True, wrap="none")
         self.kpoints_text.pack(fill=tk.BOTH, expand=True)
         row2 = ttk.Frame(right)
         row2.pack(fill=tk.X, pady=4)
@@ -750,11 +754,24 @@ class VaspGUI(tk.Tk):
         self.incar_text.insert("1.0", presets.get(tpl, presets["relax"]))
 
     def open_into_editor(self, name: str, editor: tk.Text):
-        p = filedialog.askopenfilename(initialdir=self.project_dir, title=f"打开 {name}", filetypes=[(name, name), ("全部", "*")])
-        if not p:
-            return
+        proj = self.current_project_path()
+        candidate = proj / name
+        path = None
+        if candidate.exists():
+            path = candidate
+        else:
+            p = filedialog.askopenfilename(
+                initialdir=self.project_dir,
+                title=f"打开 {name}",
+                filetypes=[(name, name), ("全部", "*")],
+            )
+            if not p:
+                return
+            path = Path(p)
+        if path is None:
+            path = candidate
         try:
-            s = read_text(Path(p))
+            s = read_text(path)
             editor.delete("1.0", tk.END)
             editor.insert("1.0", s)
         except Exception as e:
@@ -796,7 +813,7 @@ class VaspGUI(tk.Tk):
         ttk.Label(row2, text="从 POSCAR 自动解析元素并生成 POTCAR：").pack(side=tk.LEFT)
         ttk.Button(row2, text="生成 POTCAR", command=self.do_build_potcar).pack(side=tk.LEFT, padx=8)
 
-        self.pot_msg = tk.Text(frame, height=18)
+        self.pot_msg = ScrolledText(frame, height=18, wrap="word")
         self.pot_msg.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         return frame
@@ -1013,7 +1030,7 @@ class VaspGUI(tk.Tk):
         sugg = ttk.Frame(status_box)
         sugg.pack(fill=tk.BOTH, expand=False, padx=8, pady=(0, 6))
         ttk.Label(sugg, text="运行建议：").pack(anchor=tk.W)
-        wf_suggest = tk.Text(sugg, height=4, wrap="word", state="disabled")
+        wf_suggest = ScrolledText(sugg, height=4, wrap="word", state="disabled")
         wf_suggest.pack(fill=tk.X, expand=True)
         self._register_suggestion_widget(wf_suggest)
 
@@ -1093,7 +1110,7 @@ class VaspGUI(tk.Tk):
 
         notes = ttk.LabelFrame(frame, text="流程备注 / 待办")
         notes.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
-        self.workflow_notes = tk.Text(notes, height=8)
+        self.workflow_notes = ScrolledText(notes, height=8, wrap="word")
         self.workflow_notes.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         self.workflow_notes.insert(
             tk.END,
@@ -1190,7 +1207,7 @@ class VaspGUI(tk.Tk):
         ttk.Label(row, text="当前状态：").pack(side=tk.LEFT)
         ttk.Label(row, textvariable=self.run_status_var).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text="刷新状态", command=self.refresh_run_status).pack(side=tk.RIGHT)
-        run_suggest = tk.Text(status, height=3, wrap="word", state="disabled")
+        run_suggest = ScrolledText(status, height=3, wrap="word", state="disabled")
         run_suggest.pack(fill=tk.X, padx=6, pady=(0, 6))
         self._register_suggestion_widget(run_suggest)
 
@@ -1243,7 +1260,7 @@ class VaspGUI(tk.Tk):
         ttk.Button(btns, text="启动/提交", command=self.start_run).pack(side=tk.LEFT, padx=8)
         ttk.Button(btns, text="停止本地进程", command=self.stop_local).pack(side=tk.LEFT)
 
-        self.run_log = tk.Text(frame, height=14)
+        self.run_log = ScrolledText(frame, height=14, wrap="word")
         self.run_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         return frame
@@ -1513,7 +1530,7 @@ nice -n 5 ionice -c2 -n4 \
         ttk.Label(row, text="当前状态：").pack(side=tk.LEFT)
         ttk.Label(row, textvariable=self.run_status_var).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text="刷新状态", command=self.refresh_run_status).pack(side=tk.RIGHT)
-        monitor_suggest = tk.Text(status_box, height=3, wrap="word", state="disabled")
+        monitor_suggest = ScrolledText(status_box, height=3, wrap="word", state="disabled")
         monitor_suggest.pack(fill=tk.X, padx=6, pady=(0, 6))
         self._register_suggestion_widget(monitor_suggest)
 
@@ -1545,12 +1562,12 @@ nice -n 5 ionice -c2 -n4 \
         self.eta_label.pack(side=tk.LEFT, padx=6)
         ttk.Label(eta_row, text="(基于最近 SCF 平均耗时与 OSZICAR 迭代统计)").pack(side=tk.LEFT, padx=6)
 
-        self.mon_info = tk.Text(frame, height=6)
+        self.mon_info = ScrolledText(frame, height=6, wrap="word")
         self.mon_info.pack(fill=tk.BOTH, expand=False, padx=8, pady=4)
 
         sys_frame = ttk.LabelFrame(frame, text="系统状态：CPU / 进程 / 文件增长")
         sys_frame.pack(fill=tk.BOTH, expand=False, padx=8, pady=6)
-        self.sys_info = tk.Text(sys_frame, height=10)
+        self.sys_info = ScrolledText(sys_frame, height=10, wrap="word")
         self.sys_info.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
         self.sys_info.insert(tk.END, "点击“开始监视”以获取实时系统信息。\n")
@@ -1715,7 +1732,7 @@ nice -n 5 ionice -c2 -n4 \
         ttk.Button(row, text="收敛曲线（OSZICAR）→ 图/CSV", command=self.export_convergence).pack(side=tk.LEFT)
         ttk.Button(row, text="总 DOS（DOSCAR）→ 图/CSV", command=self.export_dos_total).pack(side=tk.LEFT, padx=8)
         ttk.Button(row, text="能带（EIGENVAL）→ 图/CSV", command=self.export_bands).pack(side=tk.LEFT)
-        self.post_log = tk.Text(frame, height=18)
+        self.post_log = ScrolledText(frame, height=18, wrap="word")
         self.post_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         return frame
 
@@ -2031,19 +2048,69 @@ nice -n 5 ionice -c2 -n4 \
 
     def quick_check(self):
         proj = self.current_project_path()
-        msgs = []
-        for f in ["INCAR", "POSCAR", "POTCAR", "KPOINTS"]:
-            exists = (proj / f).exists()
-            msgs.append(f"{f:7s} : {'✔' if exists else '✗'}")
+        summary: list[str] = []
+        issues: list[str] = []
+
+        required = ["INCAR", "POSCAR", "POTCAR", "KPOINTS"]
+        for name in required:
+            path = proj / name
+            exists = path.exists()
+            mark = "✔" if exists else "✗"
+            summary.append(f"{name:7s} : {mark} {path if exists else ''}".rstrip())
+            if not exists:
+                issues.append(f"未检测到 {name}，请确认是否已保存到项目目录。")
+
+        poscar_text = ""
+        poscar_path = proj / "POSCAR"
+        if poscar_path.exists():
+            poscar_text = read_text(poscar_path)
+        else:
+            poscar_text = self.poscar_text.get("1.0", tk.END).strip()
+
+        elems = unique_elements_from_poscar(poscar_text) if poscar_text else []
+        if elems:
+            summary.append("POSCAR 元素: " + ", ".join(elems))
+        elif poscar_text:
+            issues.append("POSCAR 内容存在但未能解析元素，请检查第6/7行。")
+        else:
+            issues.append("POSCAR 内容为空。")
+
+        potcar_path = proj / "POTCAR"
+        if potcar_path.exists() and elems:
+            pot_text = read_text(potcar_path)
+            titels = [ln for ln in pot_text.splitlines() if ln.strip().startswith("TITEL")]
+            if len(titels) < len(elems):
+                issues.append("POTCAR 中的赝势数量少于 POSCAR 元素数量。")
+
+        incar_path = proj / "INCAR"
+        incar_text = read_text(incar_path) if incar_path.exists() else self.incar_text.get("1.0", tk.END)
+        for key in ("ENCUT", "EDIFF"):
+            if not re.search(rf"(?mi)^\s*{re.escape(key)}\s*=", incar_text):
+                issues.append(f"INCAR 未设置 {key}，请确认输入参数。")
+
         for cmd in ["mpirun", self.vasp_cmd.get().strip(), "sbatch", "wsl" if os.name == "nt" else None]:
-            if cmd:
-                msgs.append(f"which {cmd:8s} -> {which(cmd) or '未找到'}")
+            if not cmd:
+                continue
+            resolved = which(cmd)
+            summary.append(f"which {cmd:8s} -> {resolved or '未找到'}")
+            if resolved is None and cmd not in ("sbatch", "wsl"):
+                issues.append(f"未在 PATH 中找到 {cmd}，可能无法直接运行 VASP。")
+
         potroot = Path(self.pot_dir_var.get())
-        msgs.append(f"POT 库: {potroot} {'(存在)' if potroot.exists() else '(不存在)'}")
-        for msg in msgs:
-            self.append_run_log(msg)
+        summary.append(f"POT 库: {potroot} {'(存在)' if potroot.exists() else '(不存在)'}")
+        if not potroot.exists():
+            issues.append("赝势库根目录不存在，请重新设置 POTCAR 路径。")
+
+        log_msg = "\n".join(summary)
+        self.append_run_log(log_msg + "\n")
         self.refresh_project_overview()
         self.refresh_run_status()
+
+        if issues:
+            detail = "\n- " + "\n- ".join(issues)
+            messagebox.showwarning(APP_NAME, f"项目体检结果：\n{log_msg}\n\n需关注：{detail}")
+        else:
+            messagebox.showinfo(APP_NAME, f"项目体检完成：\n{log_msg}\n\n未发现明显问题，可继续下一步。")
 
     # === 并行推断辅助 ===
     def _read_file_text(self, p: Path) -> str:
