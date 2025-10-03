@@ -74,6 +74,21 @@ def read_text(p: Path) -> str:
         except Exception:
             return ""
 
+def read_tail(p: Path, max_bytes: int = 4096) -> str:
+    """读取文件末尾指定字节，失败时返回空串。"""
+    try:
+        with p.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read()
+    except Exception:
+        return ""
+    try:
+        return data.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
 def write_text(p: Path, s: str) -> None:
     p.write_text(s, encoding="utf-8")
 
@@ -487,6 +502,7 @@ class VaspGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_NAME} v{APP_VER}")
+        self.minsize(960, 640)
         self.geometry("1200x800")
         try:
             import ttkbootstrap as tb  # 可选美化
@@ -527,17 +543,20 @@ class VaspGUI(tk.Tk):
     # ------------------------- UI 构建 ----------------------------------
     def _build_ui(self):
         # 顶部工具栏
-        toolbar = ttk.Frame(self)
+        toolbar = ttk.Frame(self, padding=(8, 6))
         toolbar.pack(side=tk.TOP, fill=tk.X)
+        toolbar.grid_columnconfigure(1, weight=1)
 
-        ttk.Label(toolbar, text="项目目录:").pack(side=tk.LEFT, padx=6)
+        ttk.Label(toolbar, text="项目目录:").grid(row=0, column=0, sticky=tk.W)
         self.project_var = tk.StringVar(value=str(self.project_dir))
-        self.project_entry = ttk.Entry(toolbar, textvariable=self.project_var, width=80)
-        self.project_entry.pack(side=tk.LEFT, padx=4)
+        self.project_entry = ttk.Entry(toolbar, textvariable=self.project_var)
+        self.project_entry.grid(row=0, column=1, sticky="ew", padx=(6, 6))
         self.project_entry.bind("<Return>", self._on_project_entry_return)
-        ttk.Button(toolbar, text="选择…", command=self.choose_project).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="新建项目", command=self.create_project).pack(side=tk.LEFT, padx=4)
-        ttk.Button(toolbar, text="快速体检", command=self.quick_check).pack(side=tk.LEFT, padx=4)
+        self.project_entry.bind("<FocusOut>", self._on_project_entry_focus_out)
+        ttk.Button(toolbar, text="选择…", command=self.choose_project).grid(row=0, column=2, padx=(0, 4))
+        ttk.Button(toolbar, text="打开目录", command=self.open_project_folder).grid(row=0, column=3, padx=(0, 4))
+        ttk.Button(toolbar, text="新建项目", command=self.create_project).grid(row=0, column=4, padx=(0, 4))
+        ttk.Button(toolbar, text="快速体检", command=self.quick_check).grid(row=0, column=5, padx=(0, 0))
 
         # Notebook
         self.nb = ttk.Notebook(self)
@@ -616,10 +635,29 @@ class VaspGUI(tk.Tk):
 
             self._status_job = self.after(timeout_ms, reset)
 
+    def _apply_project_from_entry(self) -> bool:
+        raw = self.project_var.get().strip()
+        if not raw:
+            return False
+        try:
+            target = Path(raw).expanduser()
+        except Exception:
+            target = Path(raw)
+        try:
+            normalized = target.resolve()
+        except Exception:
+            normalized = target
+        if normalized == self.project_dir:
+            return False
+        self.set_project(target)
+        return True
+
     def _on_project_entry_return(self, _event):
-        self.set_project(Path(self.project_var.get()))
-        self.set_status(f"项目目录设置为 {self.project_var.get()}")
+        self._apply_project_from_entry()
         return "break"
+
+    def _on_project_entry_focus_out(self, _event):
+        self._apply_project_from_entry()
 
     # ------------------------- 页面：输入文件 -----------------------------
     def _build_inputs_page(self, parent):
@@ -872,6 +910,7 @@ class VaspGUI(tk.Tk):
             except Exception:
                 sel["val"] = None
             top.destroy()
+        lb.bind("<Double-Button-1>", lambda _event: ok())
         ttk.Button(top, text="使用选中", command=ok).pack(pady=6)
         top.transient(self); top.grab_set(); self.wait_window(top)
         return sel["val"]
@@ -1766,6 +1805,7 @@ srun {vcmd}
             status = "⚠️ 状态未知"
         suggestions = stats.get("suggestions") or []
         suggestions.extend(self._smart_missing_inputs())
+        suggestions.extend(self._smart_run_diagnostics())
         unique = []
         seen = set()
         for item in suggestions:
@@ -1792,6 +1832,35 @@ srun {vcmd}
                 hints.append(f"{name} 尚未准备，{action}")
         if not (proj / "KPOINTS").exists():
             hints.append("KPOINTS 缺失，可在“K 点生成”页一键生成。")
+        return hints
+
+    def _smart_run_diagnostics(self) -> list[str]:
+        """解析日志末尾的常见错误，给出更智能的提示。"""
+        proj = self.current_project_path()
+        hints: list[str] = []
+        log_path = proj / "vasp.out"
+        if log_path.exists():
+            tail = read_tail(log_path, max_bytes=8192)
+            tail_low = tail.lower()
+            patterns = [
+                ("very bad news", "检测到 VASP 输出中的“VERY BAD NEWS”错误，通常与 INCAR 设置或结构质量有关。"),
+                ("zbrent: fatal error", "检测到 ZBRENT 收敛错误，建议调节 IBRION/EDIFFG 或初始结构。"),
+                ("brmix: very serious problems", "BRMIX 收敛失败，考虑增大 ENCUT、调整混合参数或启用 IALGO=48。"),
+                ("segmentation fault", "输出包含“segmentation fault”，请检查并重启计算。"),
+                ("mpi_abort", "MPI_ABORT 提示计算异常终止，建议查看节点日志或减小并行规模。"),
+            ]
+            for key, msg in patterns:
+                if key in tail_low:
+                    hints.append(msg)
+            if "convergence has not been achieved" in tail_low:
+                hints.append("VASP 提示尚未收敛，可增加步数或放宽收敛准则。")
+            if "error" in tail_low and not hints:
+                hints.append("vasp.out 末尾包含 error 关键字，建议打开日志查看详细信息。")
+        osz = proj / "OSZICAR"
+        if osz.exists():
+            tail = read_tail(osz, max_bytes=4096)
+            if tail and "f=" not in tail.lower() and "e0=" not in tail.lower():
+                hints.append("OSZICAR 尚未产生能量信息，可能是计算尚未真正开始。")
         return hints
 
     def update_overview_with_file_stats(self, file_stats: list[dict]):
@@ -1887,6 +1956,22 @@ srun {vcmd}
             self.set_status(f"项目目录不存在：{resolved}", timeout_ms=10000)
 
     # ------------------------- 项目与体检 ----------------------------------
+    def open_project_folder(self):
+        proj = self.current_project_path()
+        if not proj.exists():
+            messagebox.showwarning(APP_NAME, f"目录 {proj} 尚不存在，无法打开。")
+            return
+        try:
+            if sys.platform.startswith("darwin"):
+                subprocess.Popen(["open", str(proj)])
+            elif os.name == "nt":
+                os.startfile(str(proj))  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", str(proj)])
+            self.set_status(f"已在文件管理器中打开：{proj}")
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"无法打开目录：{exc}")
+
     def choose_project(self):
         d = filedialog.askdirectory(initialdir=self.project_var.get(), title="选择项目目录")
         if d:
@@ -1917,6 +2002,11 @@ srun {vcmd}
                 msgs.append(f"which {cmd:8s} -> {which(cmd) or '未找到'}")
         potroot = Path(self.pot_dir_var.get())
         msgs.append(f"POT 库: {potroot} {'(存在)' if potroot.exists() else '(不存在)'}")
+        smart_hints = self._smart_missing_inputs() + self._smart_run_diagnostics()
+        if smart_hints:
+            msgs.append("")
+            msgs.append("智能提示：")
+            msgs.extend(f"  - {hint}" for hint in smart_hints)
         for msg in msgs:
             self.append_run_log(msg)
         self.refresh_project_overview()
