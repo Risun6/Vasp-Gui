@@ -1519,8 +1519,41 @@ class VaspGUI(tk.Tk):
     def _build_twistshift_page(self, parent):
         frame = ttk.Frame(parent)
 
-        # 左栏：输入与控制
-        left = ttk.Frame(frame, padding=8); left.pack(side=tk.LEFT, fill=tk.Y)
+        # 左栏：输入与控制（带滚动条）
+        left_container = ttk.Frame(frame)
+        left_container.pack(side=tk.LEFT, fill=tk.Y)
+        left_canvas = tk.Canvas(left_container, borderwidth=0, highlightthickness=0, width=420)
+        left_scroll = ttk.Scrollbar(left_container, orient=tk.VERTICAL, command=left_canvas.yview)
+        left_canvas.configure(yscrollcommand=left_scroll.set)
+        left_canvas.pack(side=tk.LEFT, fill=tk.Y, expand=False)
+        left_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        left = ttk.Frame(left_canvas, padding=8)
+        left_window = left_canvas.create_window((0, 0), window=left, anchor="nw")
+
+        def _sync_scrollregion(event):
+            left_canvas.configure(scrollregion=left_canvas.bbox("all"))
+
+        def _match_width(event):
+            left_canvas.itemconfigure(left_window, width=event.width)
+
+        left.bind("<Configure>", _sync_scrollregion)
+        left_canvas.bind("<Configure>", _match_width)
+
+        def _on_mousewheel(event):
+            delta = 0
+            if event.delta:
+                delta = -int(event.delta / 120)
+            elif event.num in (4, 5):
+                delta = -1 if event.num == 4 else 1
+            if delta:
+                left_canvas.yview_scroll(delta, "units")
+                return "break"
+
+        for widget in (left_canvas, left):
+            widget.bind("<MouseWheel>", _on_mousewheel)
+            widget.bind("<Button-4>", _on_mousewheel)
+            widget.bind("<Button-5>", _on_mousewheel)
         ttk.Label(left, text="二维材料扭转/滑移 | 生成批量 POSCAR 与扫参任务").pack(anchor=tk.W, pady=(0,6))
 
         # 路径选择
@@ -1548,7 +1581,6 @@ class VaspGUI(tk.Tk):
 
             预览/生成时会将上层加到下层之上，层间距由“真空”与你后续设置共同决定。
 
-            这里有没有不清楚的？
         """).strip()
         ttk.Label(left, text=info1, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(4, 8))
 
@@ -1580,7 +1612,6 @@ class VaspGUI(tk.Tk):
 
             小贴士：莫尔超胞原子数 ~ 1/θ²（弧度），θ 很小时会“爆表”。面板下方“任务上限”就是用来兜底的。
 
-            这里有没有不清楚的？
         """).strip()
         ttk.Label(left, text=info2, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(4, 8))
 
@@ -1613,7 +1644,6 @@ class VaspGUI(tk.Tk):
             任务数中的角度个数：
             Nθ = floor((止 − 起)/步) + 1。
 
-            需要我给一行示例 θ 列表的计算方式吗？
         """).strip()
         ttk.Label(left, text=info3, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
 
@@ -1640,7 +1670,6 @@ class VaspGUI(tk.Tk):
 
             对六角晶格，(uₓ,uᵧ) 的对称等价点会被自动去重（若启用“等价裁剪”，否则就全保留以便做摩擦路径）。
 
-            这里需要我展示一个 5×5 网格具体的 (uₓ,uᵧ) 列表吗？
         """).strip()
         ttk.Label(left, text=info4, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
 
@@ -1667,7 +1696,7 @@ class VaspGUI(tk.Tk):
 
             预计任务数：N_tot = Nθ × nₓ × nᵧ。超限时会让你缩小参数或增大上限。
 
-            是否需要我根据你当前输入现场算一下 N_tot？
+            可按该公式自行评估 N_tot 以确认任务规模。
         """).strip()
         ttk.Label(left, text=info5, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
 
@@ -1702,7 +1731,6 @@ class VaspGUI(tk.Tk):
             在每个任务目录抓取 OSZICAR/OUTCAR/EIGENVAL/DOSCAR，汇总为一张表：theta_deg, ux, uy, natoms, strain%, Etot_eV, dE_meV_per_atom, gap_PBE_eV, Efermi, conv_steps, status。
             这一步只做解析与统计；若你启用“自动运行”，它还能附带标记已完成/失败任务。
 
-            这里有没有哪个按钮的行为还不清楚？
         """).strip()
         ttk.Label(left, text=info6, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
 
@@ -1726,7 +1754,7 @@ class VaspGUI(tk.Tk):
 
             vdW：IVDW=12（D3(BJ)）或用 rVV10，二者择一保持一致性。
 
-            要不要我把这些默认值写成你的 GUI 里的“推荐预设”，一键填充？
+            以上默认值可视项目需要作为起点并在后续调整。
         """).strip()
         ttk.Label(left, text=info7, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(8, 8))
 
@@ -1741,7 +1769,6 @@ class VaspGUI(tk.Tk):
 
             解析带隙：PBE 会低估；想更可信，请对代表点加做 HSE 或 scGW 小样本标定，在 CSV 后处理里做“多保真校正”。
 
-            这些注意点是否清楚？需要我补一页“命名规范 + 目录结构”的截图说明吗？
         """).strip()
         ttk.Label(left, text=info8, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
 
@@ -2085,7 +2112,6 @@ class VaspGUI(tk.Tk):
             return
 
         # 任务组合
-
         if single or not twist_enabled:
             thetas = [theta_a]
         else:
