@@ -4216,8 +4216,10 @@ class VaspGUI(tk.Tk):
         ttk.Label(row2, text="扫参目录:").pack(side=tk.LEFT)
         ttk.Entry(row2, textvariable=self.tw_dir, width=64).pack(side=tk.LEFT, padx=4)
         ttk.Button(row2, text="选择目录…", command=self._tw_choose_dir).pack(side=tk.LEFT)
-        ttk.Button(row2, text="载入目录", command=lambda: self._tw_load_dir(self.tw_dir.get())).pack(side=tk.LEFT, padx=6)
-        ttk.Button(row2, text="写入演示数据并载入", command=self._tw_write_and_load_demo).pack(side=tk.LEFT, padx=6)
+
+        ttk.Button(row2, text="载入目录", command=lambda: self._tw_load_dir(self.tw_dir.get())).pack(
+            side=tk.LEFT, padx=6
+        )
 
         # 第三行：筛选与操作
         row3 = ttk.Frame(frame)
@@ -4274,18 +4276,6 @@ class VaspGUI(tk.Tk):
         if d:
             self.tw_dir.set(d)
             self._tw_load_dir(d)
-
-    # --- 写演示数据并载入 ---
-    def _tw_write_and_load_demo(self):
-        d = self.current_project_path() / "twist_sweep"
-        try:
-            csv_path = self._tw_write_demo_results(d)
-            self._tw_append_log(f"演示结果已写入 {csv_path}")
-        except Exception as e:
-            messagebox.showerror(APP_NAME, f"写入演示数据失败：{e}")
-            return
-        self.tw_dir.set(str(d))
-        self._tw_load_dir(d)
 
     def _tw_write_demo_results(self, out_dir: Path) -> Path:
         """把内置 DEMO_TWIST_RESULTS 写到 results.csv"""
@@ -4350,10 +4340,15 @@ class VaspGUI(tk.Tk):
 
         self.tw_results = rows
         thetas = sorted({round(r["theta"], 6) for r in rows})
-        chosen = self._tw_pick_nearest_theta(float(self.tw_theta.get()), thetas)
+        try:
+            current_theta = float(self.tw_theta.get())
+        except (tk.TclError, TypeError, ValueError):
+            current_theta = 0.0
+            self.tw_theta.set(current_theta)
+        chosen = self._tw_pick_nearest_theta(current_theta, thetas)
         self.tw_theta.set(chosen)
         self._tw_refilter_and_redraw()
-        self.tw_info.config(text=f"载入 {len(rows)} 条；θ切片 {chosen:.2f}°")
+        self.tw_info.config(text=f"Loaded {len(rows)} records · theta slice {chosen:.2f}°")
 
     def _tw_row_from_dict(self, d: dict) -> dict:
         if not isinstance(d, dict):
@@ -4386,7 +4381,12 @@ class VaspGUI(tk.Tk):
     def _tw_refilter_and_redraw(self):
         if not getattr(self, "tw_results", None):
             return
-        theta = round(float(self.tw_theta.get()), 6)
+        try:
+            theta_val = float(self.tw_theta.get())
+        except (tk.TclError, TypeError, ValueError):
+            theta_val = 0.0
+            self.tw_theta.set(theta_val)
+        theta = round(theta_val, 6)
         thetas = sorted({round(r["theta"], 6) for r in self.tw_results})
         if theta not in thetas:
             theta = self._tw_pick_nearest_theta(theta, thetas)
@@ -4419,7 +4419,7 @@ class VaspGUI(tk.Tk):
             return
         self.tw_ax.clear()
         if not rows:
-            self.tw_ax.set_title("无数据")
+            self.tw_ax.set_title("No data available")
             self.tw_canvas.draw_idle()
             return
         xs = [r["ux"] for r in rows]
@@ -4428,14 +4428,19 @@ class VaspGUI(tk.Tk):
         sc = self.tw_ax.scatter(xs, ys, c=cs)
         self.tw_ax.set_xlabel("ux")
         self.tw_ax.set_ylabel("uy")
-        self.tw_ax.set_title(f"带隙 heatmap（θ={self.tw_theta.get():.2f}°）")
+        self.tw_ax.set_title(f"Band gap heatmap (theta={self.tw_theta.get():.2f} deg)")
         if self.tw_cbar is not None:
             try:
-                self.tw_cbar.remove()
+                self.tw_cbar.update_normal(sc)
+                self.tw_cbar.set_label("gap (eV)")
             except Exception:
-                pass
-            self.tw_cbar = None
-        self.tw_cbar = self.tw_fig.colorbar(sc, ax=self.tw_ax, label="gap (eV)")
+                try:
+                    self.tw_cbar.remove()
+                except Exception:
+                    pass
+                self.tw_cbar = self.tw_fig.colorbar(sc, ax=self.tw_ax, label="gap (eV)")
+        else:
+            self.tw_cbar = self.tw_fig.colorbar(sc, ax=self.tw_ax, label="gap (eV)")
         apply_style(self.tw_ax, _normalize_style(self.figure_style_var.get()))
         self.tw_fig.tight_layout()
         self.tw_canvas.draw_idle()
