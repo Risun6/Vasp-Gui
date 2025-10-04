@@ -2211,6 +2211,8 @@ class VaspGUI(tk.Tk):
 
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
         ttk.Button(left, text="解析 sweep 结果 → CSV", command=self._tw_collect_results).pack(anchor=tk.W)
+        ttk.Button(left, text="绘制 gap 热图（用当前 θ）", command=self._tw_plot_gap_heatmap_btn).pack(anchor=tk.W, pady=(4, 0))
+        ttk.Button(left, text="绘制 gap–θ 曲线（min/mean/max）", command=self._tw_plot_gap_vs_theta_btn).pack(anchor=tk.W, pady=(4, 8))
 
         self._tw_add_section_heading(left, "推荐默认值", help_defaults, title="计算与物理的默认值", pady=(8, 4))
         self._tw_add_section_heading(left, "常见注意事项", help_notes, title="常见注意事项", pady=(0, 8))
@@ -2816,6 +2818,201 @@ class VaspGUI(tk.Tk):
         except Exception:
             return (None, None)
     # === CODEX END: collect sweep results ===
+
+    # === POST: twist/slide maps & curves =========================================
+    def _tw_load_results_table(self, root: Optional[Path] = None) -> List[Dict[str, Any]]:
+        """加载 twist_sweep/results.csv；若不存在先调用 _tw_collect_results() 生成。"""
+        root = root or (self.current_project_path() / "twist_sweep")
+        csv_path = root / "results.csv"
+        if not csv_path.exists():
+            try:
+                self._tw_collect_results()
+            except Exception as e:
+                messagebox.showerror(APP_NAME, f"缺少 results.csv 且自动收集失败：{e}")
+                return []
+        rows: List[Dict[str, Any]] = []
+        try:
+            import csv
+
+            with csv_path.open("r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for rec in reader:
+                    try:
+                        rows.append(
+                            {
+                                "theta": float(rec.get("theta") or "nan"),
+                                "ux": float(rec.get("ux") or "nan"),
+                                "uy": float(rec.get("uy") or "nan"),
+                                "gap": float(rec.get("gap_eV") or "nan"),
+                                "E": float(rec.get("totalE_eV") or "nan"),
+                                "path": rec.get("path", ""),
+                                "note": rec.get("note", ""),
+                            }
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"读取 {csv_path} 失败：{e}")
+            return []
+        rows = [
+            r
+            for r in rows
+            if (not math.isnan(r["theta"]))
+            and (not math.isnan(r["ux"]))
+            and (not math.isnan(r["uy"]))
+        ]
+        return rows
+
+    def _tw_plot_gap_heatmap_btn(self):
+        """按钮：用当前 θ（输入框 tw_theta_a）画 gap(u_x,u_y) 热图。"""
+
+        try:
+            theta = float(self.tw_theta_a.get())
+        except Exception:
+            messagebox.showwarning(APP_NAME, "当前 θ 无效。")
+            return
+        self._tw_plot_gap_heatmap(theta)
+
+    def _tw_plot_gap_heatmap(self, theta: float):
+        """固定 θ，画 gap 在 (ux,uy) 网格上的热图。"""
+
+        if not HAS_NUMPY:
+            messagebox.showerror(APP_NAME, "需要 numpy 才能绘制热图。")
+            return
+        import numpy as np
+
+        rows = [
+            r
+            for r in self._tw_load_results_table()
+            if abs((r["theta"] or 0.0) - theta) < 1e-6
+        ]
+        if not rows:
+            messagebox.showwarning(APP_NAME, f"未在 results.csv 中找到 θ={theta} 的数据。")
+            return
+
+        ux_vals = sorted({round(r["ux"], 6) for r in rows})
+        uy_vals = sorted({round(r["uy"], 6) for r in rows})
+        nx, ny = len(ux_vals), len(uy_vals)
+        grid = np.full((ny, nx), np.nan, dtype=float)
+        ux_index = {v: j for j, v in enumerate(ux_vals)}
+        uy_index = {v: i for i, v in enumerate(uy_vals)}
+
+        for r in rows:
+            g = r.get("gap", float("nan"))
+            if g is None or math.isnan(g):
+                continue
+            j = ux_index.get(round(r["ux"], 6))
+            i = uy_index.get(round(r["uy"], 6))
+            if i is not None and j is not None:
+                grid[i, j] = g
+
+        top = tk.Toplevel(self)
+        top.title(f"gap 热图 @ θ={theta:.2f}°")
+        fig = Figure(figsize=(6.2, 5.2), dpi=110)
+        ax = fig.add_subplot(111)
+        im = ax.imshow(
+            grid,
+            origin="lower",
+            extent=[min(ux_vals), max(ux_vals), min(uy_vals), max(uy_vals)],
+            aspect="equal",
+        )
+        cbar = fig.colorbar(im, ax=ax)
+        cbar.set_label("Band gap (eV)")
+        ax.set_xlabel("u_x")
+        ax.set_ylabel("u_y")
+        ax.set_title(f"Band gap heatmap @ θ={theta:.2f}°  (N={int(np.isfinite(grid).sum())})")
+        apply_style(ax, self.figure_style_var.get() or "AFM")
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=top)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        def _save():
+            outdir = self.current_project_path() / "reports"
+            outdir.mkdir(parents=True, exist_ok=True)
+            png_path = outdir / f"gap_heatmap_theta_{theta:.2f}.png"
+            csv_path = outdir / f"gap_heatmap_theta_{theta:.2f}.csv"
+            try:
+                fig.savefig(png_path, dpi=300)
+                with csv_path.open("w", encoding="utf-8") as f:
+                    f.write("uy,ux,gap_eV\n")
+                    for i, uy in enumerate(uy_vals):
+                        for j, ux in enumerate(ux_vals):
+                            val = grid[i, j]
+                            if math.isnan(val):
+                                continue
+                            f.write(f"{uy:.6f},{ux:.6f},{val:.6f}\n")
+                messagebox.showinfo(APP_NAME, f"已导出\n{png_path}\n{csv_path}")
+            except Exception as e:
+                messagebox.showerror(APP_NAME, f"导出失败：{e}")
+
+        ttk.Button(top, text="导出 PNG/CSV", command=_save).pack(pady=6)
+
+    def _tw_plot_gap_vs_theta_btn(self):
+        """按钮：汇总所有 θ 的 min/mean/max gap，画曲线 + 阴影带；并导出 CSV。"""
+
+        self._tw_plot_gap_vs_theta()
+
+    def _tw_plot_gap_vs_theta(self):
+        if not HAS_NUMPY:
+            messagebox.showerror(APP_NAME, "需要 numpy 才能绘制曲线。")
+            return
+        import numpy as np
+
+        rows = self._tw_load_results_table()
+        if not rows:
+            return
+        by_theta: Dict[float, List[float]] = {}
+        for r in rows:
+            g = r.get("gap", float("nan"))
+            if g is None or math.isnan(g):
+                continue
+            th = round(r.get("theta", float("nan")), 6)
+            if math.isnan(th):
+                continue
+            by_theta.setdefault(th, []).append(float(g))
+        thetas = sorted(by_theta.keys())
+        if not thetas:
+            messagebox.showwarning(APP_NAME, "结果中没有有效的带隙。")
+            return
+        g_min = np.array([np.min(by_theta[t]) for t in thetas], dtype=float)
+        g_max = np.array([np.max(by_theta[t]) for t in thetas], dtype=float)
+        g_mean = np.array([np.mean(by_theta[t]) for t in thetas], dtype=float)
+
+        top = tk.Toplevel(self)
+        top.title("gap–θ 汇总（min/mean/max）")
+        fig = Figure(figsize=(6.4, 4.6), dpi=110)
+        ax = fig.add_subplot(111)
+        ax.plot(thetas, g_mean, label="mean gap")
+        ax.fill_between(thetas, g_min, g_max, alpha=0.25, label="range [min, max]")
+        ax.set_xlabel("Twist angle θ (deg)")
+        ax.set_ylabel("Band gap (eV)")
+        ax.set_title("Band gap vs. twist angle\n(阴影带 = 滑移导致的变化范围)")
+        ax.legend()
+        apply_style(ax, self.figure_style_var.get() or "AFM")
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=top)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        def _save():
+            outdir = self.current_project_path() / "reports"
+            outdir.mkdir(parents=True, exist_ok=True)
+            csv_path = outdir / "gap_vs_theta_min_mean_max.csv"
+            png_path = outdir / "gap_vs_theta_min_mean_max.png"
+            try:
+                with csv_path.open("w", encoding="utf-8") as f:
+                    f.write("theta_deg,gap_min_eV,gap_mean_eV,gap_max_eV,range_eV\n")
+                    for t, mn, me, mx in zip(thetas, g_min, g_mean, g_max):
+                        f.write(f"{t:.6f},{mn:.6f},{me:.6f},{mx:.6f},{(mx - mn):.6f}\n")
+                fig.savefig(png_path, dpi=300)
+                messagebox.showinfo(APP_NAME, f"已导出\n{png_path}\n{csv_path}")
+            except Exception as e:
+                messagebox.showerror(APP_NAME, f"导出失败：{e}")
+
+        ttk.Button(top, text="导出 PNG/CSV", command=_save).pack(pady=6)
+
+    # === END POST ================================================================
 
     # ------------------------- 页面：流程助手 ------------------------------
     def _build_workflow_page(self, parent):
