@@ -489,7 +489,6 @@ DEMO_PROJECT_FILES = {
 }
 
 
-
 # ----------------------------- 工具函数区 ----------------------------------
 
 def which(cmd: str) -> str | None:
@@ -1034,6 +1033,7 @@ def proc_bands(workdir: Path, opts: Dict[str, Any]) -> PostResult:
         raise RuntimeError("未能在 vasprun.xml/EIGENVAL 中解析到能带数据，请确认已完成能带计算。")
     occs = _clone_2d_table(data.get("occupancies"))
     coords = _extract_kcoords(data.get("kpoints"))
+
     if not coords and isinstance(demo_payload, dict):
         coords = _extract_kcoords(demo_payload.get("kpoints"))
     if not coords:
@@ -1041,6 +1041,7 @@ def proc_bands(workdir: Path, opts: Dict[str, Any]) -> PostResult:
         coords = _extract_kcoords(kp_file)
     bands, occs, coords = _align_band_lengths(raw_bands, occs, coords)
     coords, bands, occs, trimmed = _trim_periodic_path(coords, bands, occs)
+
 
     fermi = fermi_hint
     if fermi is None:
@@ -1052,6 +1053,7 @@ def proc_bands(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     gap, nature, vbm, cbm = _estimate_gap_from_bands(bands, occs or [], fermi)
 
     rel_bands = [[e - fermi for e in row] for row in bands]
+
     positions = distance_hint or _compute_kpath_positions(coords)
     if not positions:
         positions = list(range(len(rel_bands)))
@@ -1208,6 +1210,9 @@ def proc_pdos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
             "PDOS 由 vasprun.xml 投影得到；如需更细分的投影，请在 INCAR 设置 LORBIT=11/12 并确保写出投影数据。",
         ]
 
+    if not curves:
+        raise RuntimeError("未在 vasprun.xml 中找到投影 DOS，请确认 INCAR 设置 LORBIT=11/12 并保留投影数据。")
+
     fig = Figure(figsize=(5.4, 3.3))
     ax = fig.add_subplot(111)
     ax.plot(energies, total, lw=1.6, label="total")
@@ -1334,6 +1339,7 @@ def proc_bands_labeled(workdir: Path, opts: Dict[str, Any]) -> PostResult:
         notes = ["x 轴依据高对称路径距离，刻度为自动识别的高对称点。"]
         return PostResult(metrics=metrics, figs={"bands_labeled": fig_path}, tables={"bands_labeled": csv_path}, notes=notes)
 
+
     distance_hint: list[float] = []
     if isinstance(demo_payload, dict):
         dist_val = demo_payload.get("distances")
@@ -1383,6 +1389,7 @@ def proc_bands_labeled(workdir: Path, opts: Dict[str, Any]) -> PostResult:
             recip = None
     if recip is None:
         recip = _fallback_reciprocal_from_poscar(workdir / "POSCAR")
+
 
     distances = distance_hint or _compute_kpath_positions(coords, recip)
     if not distances:
@@ -1721,6 +1728,7 @@ def _parse_locpot_planar_z(locpot: Path) -> Optional[tuple[list[float], list[flo
 
 
 def proc_planar_potential(workdir: Path, opts: Dict[str, Any]) -> PostResult:
+
     style = _normalize_style(opts.get("style"))
     report_dir, figs_dir, tables_dir = _ensure_report_dirs(workdir, opts)
     demo_payload = opts.get("demo_payload") if isinstance(opts.get("demo_payload"), dict) else None
@@ -1733,6 +1741,7 @@ def proc_planar_potential(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     else:
         if not HAS_NUMPY:
             raise RuntimeError("需要 numpy 才能解析平面平均势，请安装 numpy。")
+
 
         locpot = workdir / "LOCPOT"
         if not locpot.exists():
