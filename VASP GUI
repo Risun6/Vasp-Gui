@@ -433,6 +433,26 @@ DEMO_BAND_DISTANCES = [0.0, 0.52, 1.04, 1.63, 2.34, 3.05]
 DEMO_PLANAR_Z = [round(0.4 * i, 6) for i in range(60)]
 DEMO_PLANAR_VALUES = [0.25 * math.sin(0.35 * i) + 0.06 * math.cos(0.7 * i) for i in range(len(DEMO_PLANAR_Z))]
 
+_demo_twist_thetas = [0.0, 5.0, 9.0]
+_demo_twist_grid = [(0.0, 0.0), (0.33, 0.0), (0.66, 0.0), (0.0, 0.5), (0.33, 0.5), (0.66, 0.5)]
+DEMO_TWIST_RESULTS: list[dict[str, Any]] = []
+for _theta in _demo_twist_thetas:
+    for _ux, _uy in _demo_twist_grid:
+        _gap = 1.55 + 0.25 * math.cos(math.pi * _ux) + 0.18 * math.cos(math.pi * _uy) - 0.03 * (_theta / 10.0)
+        _gap = max(0.35, _gap)
+        _totalE = -505.0 + 0.18 * _theta + 0.32 * _ux + 0.28 * _uy
+        DEMO_TWIST_RESULTS.append(
+            {
+                "theta": float(_theta),
+                "ux": float(_ux),
+                "uy": float(_uy),
+                "gap": float(round(_gap, 4)),
+                "E": float(round(_totalE, 4)),
+                "path": f"theta_{_theta:.2f}_ux_{_ux:.2f}_uy_{_uy:.2f}",
+                "note": "demo",
+            }
+        )
+
 DEMO_POSTPROCS: dict[str, dict[str, Any]] = {
     "dos": {
         "energies": DEMO_DOS_ENERGIES,
@@ -2018,10 +2038,12 @@ class PostprocWorker(threading.Thread):
         try:
             result = proc.runner(workdir, self.opts)
         except FileNotFoundError as exc:
-            app.after(0, lambda: app._on_postproc_error(self.key, str(exc)))
+            err_msg = str(exc)
+            app.after(0, lambda err_msg=err_msg: app._on_postproc_error(self.key, err_msg))
             return
         except Exception as exc:
-            app.after(0, lambda: app._on_postproc_error(self.key, f"后处理异常：{exc}"))
+            err_msg = f"后处理异常：{exc}"
+            app.after(0, lambda err_msg=err_msg: app._on_postproc_error(self.key, err_msg))
             return
         app.after(0, lambda: app._on_postproc_success(self.key, result, workdir, self.opts))
 
@@ -2218,6 +2240,18 @@ class VaspGUI(tk.Tk):
         self.demo_project_dir = demo_dir
         self.demo_mode_var.set(True)
         self.set_project(demo_dir)
+        try:
+            twist_dir = demo_dir / "twist_sweep"
+            self._tw_write_demo_results(twist_dir)
+        except Exception:
+            pass
+        try:
+            demo_poscar = demo_dir / "POSCAR"
+            if demo_poscar.exists():
+                self.tw_top_path.set(str(demo_poscar))
+                self.tw_bot_path.set(str(demo_poscar))
+        except Exception:
+            pass
         self.apply_run_status("🧪 演示模式", ["已加载内置示例数据，可直接体验全部后处理功能。"])
 
     def _deactivate_demo_mode(self):
@@ -3720,6 +3754,12 @@ class VaspGUI(tk.Tk):
         """遍历 twist_sweep/* 子目录，收集 gap / total energy / 备注，导出 CSV。"""
         root = self.current_project_path() / "twist_sweep"
         if not root.exists():
+            if self.demo_mode:
+                root.mkdir(parents=True, exist_ok=True)
+                csv_path = self._tw_write_demo_results(root)
+                messagebox.showinfo(APP_NAME, f"演示模式：已生成示例 results.csv → {csv_path}")
+                self._tw_append_log("演示模式：已生成示例 twist_sweep/results.csv。")
+                return
             messagebox.showwarning(APP_NAME, "未找到 twist_sweep 目录。")
             self._tw_append_log("未找到 twist_sweep 目录，无法汇总结果。")
             return
@@ -3833,6 +3873,12 @@ class VaspGUI(tk.Tk):
         root = root or (self.current_project_path() / "twist_sweep")
         csv_path = root / "results.csv"
         if not csv_path.exists():
+            if self.demo_mode:
+                try:
+                    self._tw_write_demo_results(root)
+                except Exception as exc:
+                    messagebox.showerror(APP_NAME, f"生成演示数据失败：{exc}")
+                    return []
             try:
                 self._tw_collect_results()
             except Exception as e:
@@ -3870,6 +3916,18 @@ class VaspGUI(tk.Tk):
             and (not math.isnan(r["uy"]))
         ]
         return rows
+
+    def _tw_write_demo_results(self, root: Path) -> Path:
+        """写入演示模式用的示例 twist_sweep/results.csv。"""
+        root.mkdir(parents=True, exist_ok=True)
+        csv_path = root / "results.csv"
+        with csv_path.open("w", encoding="utf-8") as fh:
+            fh.write("path,theta,ux,uy,gap_eV,totalE_eV,note\n")
+            for row in DEMO_TWIST_RESULTS:
+                fh.write(
+                    f"{row['path']},{row['theta']:.6f},{row['ux']:.6f},{row['uy']:.6f},{row['gap']:.6f},{row['E']:.6f},{row['note']}\n"
+                )
+        return csv_path
 
     def _tw_plot_gap_heatmap_btn(self):
         """按钮：用当前 θ（输入框 tw_theta_a）画 gap(u_x,u_y) 热图。"""
