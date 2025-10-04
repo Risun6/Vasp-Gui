@@ -34,6 +34,7 @@ import sys
 import re
 import time
 import json
+import textwrap
 import shutil
 import math
 import threading
@@ -75,6 +76,12 @@ try:
     HAS_NUMPY = True
 except Exception:
     HAS_NUMPY = False
+
+try:
+    from pymatgen.analysis.interfaces.zsl import ZSLGenerator  # type: ignore
+    HAS_ZSL = True
+except Exception:
+    HAS_ZSL = False
 # === CODEX END: imports for twist/shift page ===
 
 try:
@@ -1512,8 +1519,41 @@ class VaspGUI(tk.Tk):
     def _build_twistshift_page(self, parent):
         frame = ttk.Frame(parent)
 
-        # 左栏：输入与控制
-        left = ttk.Frame(frame, padding=8); left.pack(side=tk.LEFT, fill=tk.Y)
+        # 左栏：输入与控制（带滚动条）
+        left_container = ttk.Frame(frame)
+        left_container.pack(side=tk.LEFT, fill=tk.Y)
+        left_canvas = tk.Canvas(left_container, borderwidth=0, highlightthickness=0, width=420)
+        left_scroll = ttk.Scrollbar(left_container, orient=tk.VERTICAL, command=left_canvas.yview)
+        left_canvas.configure(yscrollcommand=left_scroll.set)
+        left_canvas.pack(side=tk.LEFT, fill=tk.Y, expand=False)
+        left_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        left = ttk.Frame(left_canvas, padding=8)
+        left_window = left_canvas.create_window((0, 0), window=left, anchor="nw")
+
+        def _sync_scrollregion(event):
+            left_canvas.configure(scrollregion=left_canvas.bbox("all"))
+
+        def _match_width(event):
+            left_canvas.itemconfigure(left_window, width=event.width)
+
+        left.bind("<Configure>", _sync_scrollregion)
+        left_canvas.bind("<Configure>", _match_width)
+
+        def _on_mousewheel(event):
+            delta = 0
+            if event.delta:
+                delta = -int(event.delta / 120)
+            elif event.num in (4, 5):
+                delta = -1 if event.num == 4 else 1
+            if delta:
+                left_canvas.yview_scroll(delta, "units")
+                return "break"
+
+        for widget in (left_canvas, left):
+            widget.bind("<MouseWheel>", _on_mousewheel)
+            widget.bind("<Button-4>", _on_mousewheel)
+            widget.bind("<Button-5>", _on_mousewheel)
         ttk.Label(left, text="二维材料扭转/滑移 | 生成批量 POSCAR 与扫参任务").pack(anchor=tk.W, pady=(0,6))
 
         # 路径选择
@@ -1530,16 +1570,38 @@ class VaspGUI(tk.Tk):
         ttk.Entry(row, textvariable=self.tw_bot_path, width=44).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text="选择…", command=lambda: self._tw_pick_poscar(self.tw_bot_path)).pack(side=tk.LEFT)
 
+        info1 = textwrap.dedent("""
+            1) 上/下层 POSCAR
+
+            选择底层 (B) 与上层 (T) 的 POSCAR。程序假定 c 轴接近层法向，必要时会自动把法向对齐 z 轴。上层按刚体处理参与旋转与滑移，最终叠加在底层之上，层间距由真空参数控制。
+        """).strip()
+        ttk.Label(left, text=info1, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(4, 8))
+
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
         # 基本几何参数
         self.tw_vacuum = tk.DoubleVar(value=20.0)     # 目标真空 (Å)
         self.tw_allow_strain = tk.DoubleVar(value=0.8)  # 允许等效小应变（%）
         self.tw_gamma_atom_threshold = tk.IntVar(value=500)  # 超大超胞→Gamma-only
+        self.tw_enable_twist = tk.BooleanVar(value=True)
+        self.tw_enable_slide = tk.BooleanVar(value=True)
 
         row = ttk.Frame(left); row.pack(fill=tk.X, pady=2)
         ttk.Label(row, text="真空(Å):").pack(side=tk.LEFT); ttk.Entry(row, textvariable=self.tw_vacuum, width=7).pack(side=tk.LEFT, padx=4)
         ttk.Label(row, text="容许应变(%)").pack(side=tk.LEFT, padx=(8,0)); ttk.Entry(row, textvariable=self.tw_allow_strain, width=7).pack(side=tk.LEFT, padx=4)
+
+        info2 = textwrap.dedent("""
+            2) 真空 (Å) 与 容许应变 (%)
+
+            真空控制 c 方向晶格长度（层间距离加真空层），二维体系通常取 15–20 Å，并配合 LDIPOL=.TRUE., IDIPOL=3。容许应变 ε 允许面内各向同性拉伸或压缩以构造近共格超胞，内部搜索满足 |Mᵦ·Aᵦ − R(θ)·Mₜ·Aₜ| / |·| ≤ ε 的整数矩阵对；常用 0.5–1.0%。莫尔超胞原子数随 1/θ² 增长，可通过任务上限控制规模。
+        """).strip()
+        ttk.Label(left, text=info2, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(4, 8))
+
+        dim_frame = ttk.LabelFrame(left, text="扫描维度")
+        dim_frame.pack(fill=tk.X, pady=4)
+        ttk.Checkbutton(dim_frame, text="启用扭转角扫描", variable=self.tw_enable_twist).pack(anchor=tk.W, padx=6, pady=2)
+        ttk.Checkbutton(dim_frame, text="启用滑移网格扫描", variable=self.tw_enable_slide).pack(anchor=tk.W, padx=6, pady=2)
+        ttk.Label(dim_frame, text="可按需只做扭转或只做滑移，两者都开时则全量组合。", wraplength=340, justify=tk.LEFT, foreground="#555").pack(anchor=tk.W, padx=6, pady=(0, 4))
 
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
@@ -1554,6 +1616,13 @@ class VaspGUI(tk.Tk):
         ttk.Label(r, text="步").pack(side=tk.LEFT); ttk.Entry(r, textvariable=self.tw_theta_step, width=7).pack(side=tk.LEFT, padx=4)
         ttk.Label(left, text="注：六角晶格通常只需 0–60° 区间。", foreground="#666").pack(anchor=tk.W, pady=(0,4))
 
+        info3 = textwrap.dedent("""
+            3) 扭转角 θ（度）
+
+            起、止与步长按闭区间生成角度序列，若步长不整除区间则截断到不超过止点的最后一个角度。六角或三角晶格在 0–60° 范围内即可覆盖独立堆垛，异质双层通常也采用该区间。角度数量计算公式为 Nθ = floor((止 − 起)/步) + 1。
+        """).strip()
+        ttk.Label(left, text=info3, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
+
         # 滑移扫描（分数坐标）
         ttk.Label(left, text="滑移 (分数坐标 u_x,u_y)：").pack(anchor=tk.W)
         self.tw_ux_steps = tk.IntVar(value=5)
@@ -1562,6 +1631,13 @@ class VaspGUI(tk.Tk):
         ttk.Label(r, text="u_x 步数").pack(side=tk.LEFT); ttk.Spinbox(r, from_=1, to=32, textvariable=self.tw_ux_steps, width=6).pack(side=tk.LEFT, padx=4)
         ttk.Label(r, text="u_y 步数").pack(side=tk.LEFT, padx=(8,0)); ttk.Spinbox(r, from_=1, to=32, textvariable=self.tw_uy_steps, width=6).pack(side=tk.LEFT, padx=4)
         ttk.Label(left, text="网格覆盖 [0,1)×[0,1)，自动等间隔。", foreground="#666").pack(anchor=tk.W)
+
+        info4 = textwrap.dedent("""
+            4) 滑移 (分数坐标 uₓ,uᵧ)
+
+            上层平移向量定义为 t = uₓ·a₁ + uᵧ·a₂，其中 a₁、a₂ 为底层面内基矢。网格在 [0,1)×[0,1) 内均匀采样，u=1 与 u=0 等价。uₓ 步数 = nₓ、uᵧ 步数 = nᵧ 将生成 nₓ×nᵧ 个滑移组合；六角格体系可按对称性自动去重。
+        """).strip()
+        ttk.Label(left, text=info4, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
 
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
@@ -1575,14 +1651,42 @@ class VaspGUI(tk.Tk):
         ttk.Label(r, text="任务上限").pack(side=tk.LEFT, padx=(8,0)); ttk.Entry(r, textvariable=self.tw_max_tasks, width=7).pack(side=tk.LEFT, padx=4)
         ttk.Checkbutton(left, text="生成后自动运行（试验性）", variable=self.tw_autorun).pack(anchor=tk.W, pady=(2,4))
 
+        info5 = textwrap.dedent("""
+            5) KSPACING 与 任务上限
+
+            KSPACING 控制每个任务的 k 网密度，优先写入 INCAR；若已提供 KPOINTS，则按指定网格执行。常用取值：小原胞或金属 0.18–0.22，半导体 0.22–0.30，超大莫尔超胞可先以 Γ-only 或 KSPACING≈0.35 预筛。任务上限用于约束 sweep 规模，总任务数可按 N_tot = Nθ × nₓ × nᵧ 估算。
+        """).strip()
+        ttk.Label(left, text=info5, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
+
         # 操作按钮
         btns = ttk.Frame(left); btns.pack(fill=tk.X, pady=8)
         ttk.Button(btns, text="预览当前(θ,u)几何", command=self._tw_preview_once).pack(side=tk.LEFT)
         ttk.Button(btns, text="生成单例 POSCAR", command=lambda: self._tw_generate(single=True)).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="批量遍历并生成", command=lambda: self._tw_generate(single=False)).pack(side=tk.LEFT)
 
+        info6 = textwrap.dedent("""
+            6) 选项与按钮
+
+            “生成后自动运行”会在批量生成任务的同时写入脚本并按当前运行模式触发，默认保持关闭以便先核对结构。“预览当前(θ,u)几何”即时构造当前组合便于检查。“生成单例 POSCAR”仅输出当前参数的单个目录。“批量遍历并生成”根据角度与滑移网格写出全部任务、脚本与 meta.json。“解析 sweep 结果 → CSV”汇总能量、带隙和收敛信息供后续筛选。
+        """).strip()
+        ttk.Label(left, text=info6, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
+
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
         ttk.Button(left, text="解析 sweep 结果 → CSV", command=self._tw_collect_results).pack(anchor=tk.W)
+
+        info7 = textwrap.dedent("""
+            7) 计算与物理的默认值
+
+            建议起点：真空 20 Å 并启用 LDIPOL=.TRUE., IDIPOL=3；容许应变 0.5–0.8%，在极小角度时可放宽至 1.0%。角度扫描可先覆盖 0–10°、步长 2°，再对重点角度加密。滑移网格常用 5×5 或 7×7，势垒或摩擦研究可加密至 15×15。KSPACING 约 0.22，超大胞先用 Γ-only 预筛再细化。SCF/DOS 步推荐 ISMEAR=0, SIGMA=0.05；Relax 或金属步可切换 ISMEAR=1, SIGMA=0.2。vdW 建议统一采用 IVDW=12 或 rVV10。
+        """).strip()
+        ttk.Label(left, text=info7, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(8, 8))
+
+        info8 = textwrap.dedent("""
+            8) 常见注意事项
+
+            小角度会显著增加原子数，可结合任务上限、Γ-only 预筛及更高容许应变限制规模。滑移始终使用底层基矢的分数坐标，预览界面显示的 t = ux·a1 + uy·a2 可用于校验。滑移网格采用 [0,1) 区间避免端点重合，角度扫描需确保步长与终点一致。PBE 带隙偏低，关键构型应追加 HSE 或 scGW 以建立多保真修正。
+        """).strip()
+        ttk.Label(left, text=info8, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
 
         # 右栏：俯视预览
         right = ttk.Frame(frame, padding=8); right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
@@ -1648,6 +1752,103 @@ class VaspGUI(tk.Tk):
         self.ax_tw.set_title(f"θ={tdeg:.3f}°, u=({ux:.3f},{uy:.3f}), atoms={len(st)}")
         self.canvas_tw.draw_idle()
 
+    def _tw_find_match(self, A_top_rot, A_bot, allow_strain: float, search_limit: int):
+        """返回最优匹配 dict(n1,m1,n2,m2,s,resid,area,atoms)。"""
+        import numpy as np
+
+        best: Optional[Dict[str, float]] = None
+        # 优先使用 ZSL（若可用），失败则自动回退
+        if HAS_ZSL:
+            try:
+                zsl = ZSLGenerator(
+                    max_area_ratio=(1.0 + allow_strain),
+                    max_misfit=allow_strain,
+                    max_angle_diff=allow_strain * 10.0,
+                )
+
+                def to3(mat):
+                    return np.array(
+                        [
+                            [mat[0, 0], mat[0, 1], 0.0],
+                            [mat[1, 0], mat[1, 1], 0.0],
+                            [0.0, 0.0, 1.0],
+                        ],
+                        dtype=float,
+                    )
+
+                matches = zsl.get_zsl_matches(to3(A_top_rot), to3(A_bot), max_search=search_limit)
+                for m in matches:
+                    S1 = np.array(m.get("matrix_1"), dtype=float)[:2, :2]
+                    S2 = np.array(m.get("matrix_2"), dtype=float)[:2, :2]
+                    # 当前构建流程只支持对角超胞，若出现非对角项则跳过
+                    if not np.allclose(S1, np.diag(np.diag(S1))) or not np.allclose(
+                        S2, np.diag(np.diag(S2))
+                    ):
+                        continue
+                    S1 = np.diag(np.diag(S1)).astype(int)
+                    S2 = np.diag(np.diag(S2)).astype(int)
+                    T = A_top_rot @ S1
+                    B = A_bot @ S2
+                    denom = float(np.trace(T.T @ T))
+                    if denom <= 0:
+                        continue
+                    s_star = float(np.trace(T.T @ B) / denom)
+                    resid = np.linalg.norm(B - s_star * T, ord="fro") / max(
+                        1.0, np.linalg.norm(B, ord="fro")
+                    )
+                    area = abs(float(np.linalg.det(B)))
+                    cand = dict(
+                        n1=int(S1[0, 0]),
+                        m1=int(S1[1, 1]),
+                        n2=int(S2[0, 0]),
+                        m2=int(S2[1, 1]),
+                        s=s_star,
+                        resid=resid,
+                        area=area,
+                        atoms=-1,
+                    )
+                    if best is None or (resid, area) < (best["resid"], best["area"]):
+                        best = cand
+                if best is not None:
+                    return best
+            except Exception:
+                pass
+
+        # 回退到对角穷举
+        best = None
+        for n1 in range(1, search_limit + 1):
+            for m1 in range(1, search_limit + 1):
+                T = A_top_rot @ np.array([[n1, 0], [0, m1]], dtype=int)
+                denom = float(np.trace(T.T @ T))
+                if denom <= 0:
+                    continue
+                for n2 in range(1, search_limit + 1):
+                    for m2 in range(1, search_limit + 1):
+                        B = A_bot @ np.array([[n2, 0], [0, m2]], dtype=int)
+                        s_star = float(np.trace(T.T @ B) / denom)
+                        if not (1.0 - allow_strain <= s_star <= 1.0 + allow_strain):
+                            continue
+                        resid = np.linalg.norm(B - s_star * T, ord="fro") / max(
+                            1.0, np.linalg.norm(B, ord="fro")
+                        )
+                        area = abs(float(np.linalg.det(B)))
+                        cand = dict(
+                            n1=n1,
+                            m1=m1,
+                            n2=n2,
+                            m2=m2,
+                            s=s_star,
+                            resid=resid,
+                            area=area,
+                            atoms=-1,
+                        )
+                        if best is None or (resid, area) < (best["resid"], best["area"]):
+                            best = cand
+        return best
+
+    def _estimate_atoms(self, st_top, st_bot, best):
+        return len(st_top) * (best["n1"] * best["m1"]) + len(st_bot) * (best["n2"] * best["m2"])
+
     def _tw_build_structure(self, top_path: Path, bot_path: Path,
                             theta_deg: float, ux: float, uy: float,
                             vacuum: float, allow_strain: float,
@@ -1677,35 +1878,18 @@ class VaspGUI(tk.Tk):
                        [np.sin(th),  np.cos(th)]], dtype=float)
         A_top_rot = Rz @ A_top  # (2,2)
 
-        # 穷举对角超胞 diag(n,m)（简单稳健），允许上层等比例微应变 s ∈ [1-ε,1+ε]
-        def diag(n, m):
-            return np.array([[n,0],[0,m]], dtype=int)
-
-        best = None
-        for n1 in range(1, search_limit+1):
-            for m1 in range(1, search_limit+1):
-                T = A_top_rot @ diag(n1, m1)  # 上层超胞 in-plane
-                for n2 in range(1, search_limit+1):
-                    for m2 in range(1, search_limit+1):
-                        B = A_bot @ diag(n2, m2)  # 下层超胞 in-plane
-                        # 允许 top 做等比例 s 以靠近 B
-                        # s* = argmin ||B - s*T||_F
-                        s_star = float(np.trace(T.T @ B) / np.trace(T.T @ T))
-                        if not (1.0 - allow_strain <= s_star <= 1.0 + allow_strain):
-                            continue
-                        resid = np.linalg.norm(B - s_star*T, ord="fro") / max(1.0, np.linalg.norm(B, ord="fro"))
-                        area = abs(np.linalg.det(B))
-                        atom_est = len(st_top) * (n1*m1) + len(st_bot) * (n2*m2)
-                        key = (resid, area, atom_est)
-                        cand = dict(n1=n1, m1=m1, n2=n2, m2=m2, s=s_star, resid=resid, area=area, atoms=atom_est)
-                        if best is None or key < (best["resid"], best["area"], best["atoms"]):
-                            best = cand
+        best = self._tw_find_match(A_top_rot, A_bot, allow_strain, search_limit)
 
         if best is None:
             raise RuntimeError("在给定容许应变与搜索限内未找到可接受的对角超胞匹配。")
-        # 过大则提示用户
-        if best["atoms"] > 2000:
-            raise RuntimeError(f"匹配到的超胞过大（≈{best['atoms']} 原子），请放宽步长或减小 search_limit。")
+
+        atom_est = self._estimate_atoms(st_top, st_bot, best)
+        best["atoms"] = atom_est
+        gamma_limit = int(self.tw_gamma_atom_threshold.get()) if hasattr(self, "tw_gamma_atom_threshold") else 500
+        if atom_est > gamma_limit * 8:
+            raise RuntimeError(
+                f"预计原子数≈{atom_est}，过大；请调大步长或缩小角度/网格。"
+            )
 
         # 构造下层超胞
         S_bot = np.eye(3, dtype=int)
@@ -1776,6 +1960,47 @@ class VaspGUI(tk.Tk):
     # === CODEX END: twist/shift geometry core ===
 
     # === CODEX BEGIN: generate twist/shift tasks ===
+    def _tw_canonical_registry(self, ux: float, uy: float, lattice2x2):
+        """规约 (ux, uy) 到具有代表性的等价点以减少重复。"""
+        try:
+            import numpy as _np
+            import math as _math
+        except Exception:
+            return (float(ux % 1.0), float(uy % 1.0))
+
+        vec_a = _np.asarray(lattice2x2)[:, 0]
+        vec_b = _np.asarray(lattice2x2)[:, 1]
+        if vec_a.shape[0] != 2 or vec_b.shape[0] != 2:
+            return (float(ux % 1.0), float(uy % 1.0))
+
+        a_len = _np.linalg.norm(vec_a)
+        b_len = _np.linalg.norm(vec_b)
+        if a_len == 0 or b_len == 0:
+            return (float(ux % 1.0), float(uy % 1.0))
+
+        cosang = _np.clip(_np.dot(vec_a, vec_b) / (a_len * b_len), -1.0, 1.0)
+        ang = _math.degrees(_math.acos(cosang))
+
+        ux_mod = float(ux % 1.0)
+        uy_mod = float(uy % 1.0)
+
+        def _rotate_candidates(order):
+            cands = []
+            for k in range(order):
+                th = 2 * _math.pi * k / order
+                rot = _np.array([[_math.cos(th), -_math.sin(th)], [_math.sin(th), _math.cos(th)]])
+                u = (rot @ _np.array([ux_mod, uy_mod])) % 1.0
+                cands.append((float(u[0]), float(u[1])))
+            return min(cands)
+
+        if abs(a_len - b_len) / max(a_len, b_len) < 0.02:
+            if abs(ang - 60.0) < 2.0:
+                return _rotate_candidates(6)
+            if abs(ang - 90.0) < 2.0:
+                return _rotate_candidates(4)
+
+        return (ux_mod, uy_mod)
+
     def _tw_generate(self, single: bool):
         """生成单例或批量遍历任务目录与 POSCAR/INCAR。"""
         try:
@@ -1792,16 +2017,53 @@ class VaspGUI(tk.Tk):
             messagebox.showerror(APP_NAME, f"参数错误：{e}")
             return
 
+        twist_enabled = bool(self.tw_enable_twist.get()) if hasattr(self, "tw_enable_twist") else True
+        slide_enabled = bool(self.tw_enable_slide.get()) if hasattr(self, "tw_enable_slide") else True
+        if slide_enabled:
+            slide_enabled = slide_enabled and ux_steps > 0 and uy_steps > 0
+
         top_p = Path(self.tw_top_path.get()); bot_p = Path(self.tw_bot_path.get())
         if not top_p.exists() or not bot_p.exists():
             messagebox.showwarning(APP_NAME, "请先选择上/下层 POSCAR")
             return
 
         # 任务组合
-        thetas = [theta_a] if single else self._tw_linspace(theta_a, theta_b, step=theta_step)
-        uxs = [0.0] if single else [i/ux_steps for i in range(ux_steps)]
-        uys = [0.0] if single else [j/uy_steps for j in range(uy_steps)]
-        combos = [(th, ux, uy) for th in thetas for ux in uxs for uy in uys]
+        if single or not twist_enabled:
+            thetas = [theta_a]
+        else:
+            thetas = self._tw_linspace(theta_a, theta_b, step=theta_step)
+
+        if single or not slide_enabled:
+            uxs = [0.0]
+            uys = [0.0]
+        else:
+            uxs = [i / ux_steps for i in range(ux_steps)]
+            uys = [j / uy_steps for j in range(uy_steps)]
+
+        lattice2x2 = None
+        if (not single) and slide_enabled and HAS_PYMATGEN and HAS_NUMPY:
+            try:
+                from pymatgen.core import Structure as _Structure
+
+                st_bot_sample = _Structure.from_file(str(bot_p))
+                lattice2x2 = np.array(st_bot_sample.lattice.matrix[:2, :2])
+            except Exception:
+                lattice2x2 = None
+
+        combos = []
+        seen = set()
+        for th in thetas:
+            for ux in uxs:
+                for uy in uys:
+                    if slide_enabled and lattice2x2 is not None:
+                        cu = self._tw_canonical_registry(ux, uy, lattice2x2)
+                    else:
+                        cu = (float(ux % 1.0), float(uy % 1.0))
+                    key = (round(th, 6), round(cu[0], 6), round(cu[1], 6))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    combos.append((th, float(cu[0]), float(cu[1])))
 
         if len(combos) > max_tasks:
             messagebox.showwarning(APP_NAME, f"任务数 {len(combos)} > 上限 {max_tasks}，请降低分辨率或步长")
@@ -2542,14 +2804,14 @@ nice -n 5 ionice -c2 -n4 \
         frame = ttk.Frame(parent)
 
         status_box = ttk.LabelFrame(frame, text="运行状态概览")
-        status_box.pack(fill=tk.X, padx=8, pady=6)
+        status_box.pack(fill=tk.X, padx=8, pady=10)
         row = ttk.Frame(status_box)
-        row.pack(fill=tk.X, padx=6, pady=4)
+        row.pack(fill=tk.X, padx=6, pady=8)
         ttk.Label(row, text="当前状态：").pack(side=tk.LEFT)
         ttk.Label(row, textvariable=self.run_status_var).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text="刷新状态", command=self.refresh_run_status).pack(side=tk.RIGHT)
         monitor_suggest = ScrolledText(status_box, height=3, wrap="word", state="disabled")
-        monitor_suggest.pack(fill=tk.X, padx=6, pady=(0, 6))
+        monitor_suggest.pack(fill=tk.X, padx=6, pady=(2, 8))
         self._register_suggestion_widget(monitor_suggest)
 
         top = ttk.Frame(frame)
@@ -3537,6 +3799,22 @@ class FirstTimeWizard(tk.Toplevel):
         ]:
             ttk.Radiobutton(frame, text=text, value=value, variable=self.workflow).pack(anchor=tk.W, pady=2)
         ttk.Label(frame, text="流程将决定生成的脚本与建议。", foreground="#555555").pack(anchor=tk.W, pady=(6, 0))
+        ttk.Label(
+            frame,
+            text=(
+                "Relax → SCF → DOS（默认）\n"
+                "用于“有应力/对齐方式不确定”的结构：先几何优化，再精细自洽，最后基于该电荷做 DOS。\n"
+                "可靠稳健，适合多数 2D 扭转/滑移扫描。\n\n"
+                "Relax → SCF → Bands\n"
+                "目标是能带路径：先 Relax，再 SCF 得到准确电荷，最后用 ICHARG=11 的 band run 走高对称线。\n"
+                "适合在 DOS/带隙初筛后，对少量代表构型出图。\n\n"
+                "SCF → DOS（无 Relax）\n"
+                "当几何已可信或做快速预筛时可直接 SCF，随后投 DOS。速度快，但若未 Relax 可能影响能量和带隙。"
+            ),
+            wraplength=660,
+            justify=tk.LEFT,
+            foreground="#444444",
+        ).pack(anchor=tk.W, pady=(8, 0))
         return frame
 
     def _build_precision_page(self) -> ttk.Frame:
@@ -3551,6 +3829,16 @@ class FirstTimeWizard(tk.Toplevel):
         ttk.Label(row, text="ENCUT (eV):").pack(side=tk.LEFT)
         self.encut_entry = ttk.Entry(row, textvariable=self.encut_value, width=8)
         self.encut_entry.pack(side=tk.LEFT, padx=4)
+        ttk.Label(
+            encut_box,
+            text=(
+                "自动（推荐）：ENCUT ≈ 1.3 × 元素最大 ENMAX，适合混合元素或批量扫描。\n"
+                "手动：仅在做收敛测试或沿用既有基准时使用；常见半导体 450–550 eV，含 O/N/F 时 520–600 eV。"
+            ),
+            wraplength=640,
+            justify=tk.LEFT,
+            foreground="#444444",
+        ).pack(anchor=tk.W, pady=(4, 0))
 
         k_box = ttk.LabelFrame(frame, text="K 网格")
         k_box.pack(fill=tk.X, pady=4)
@@ -3566,6 +3854,17 @@ class FirstTimeWizard(tk.Toplevel):
         for label, var in zip(["Nx", "Ny", "Nz"], self.kgrid):
             ttk.Label(grid_row, text=label).pack(side=tk.LEFT, padx=(0, 2))
             ttk.Spinbox(grid_row, from_=1, to=24, textvariable=var, width=4).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(
+            k_box,
+            text=(
+                "KSPACING（推荐）：以倒空间点间距控制密度，随超胞自动缩放。\n"
+                "金属/小原胞 0.18–0.22，半导体 0.22–0.30，大莫尔超胞可改为 Γ-only 并放宽到 ~0.35。\n"
+                "Monkhorst-Pack：当你明确需要 Nx×Ny×Nz 网格时使用；2D 薄膜通常 Nz=1，金属可考虑取消 Γ 中心。"
+            ),
+            wraplength=640,
+            justify=tk.LEFT,
+            foreground="#444444",
+        ).pack(anchor=tk.W, pady=(4, 0))
         if not HAS_SEEKPATH:
             ttk.Label(k_box, text="未检测到 seekpath，建议优先使用 KSPACING。", foreground="#aa5500").pack(anchor=tk.W, pady=(4, 0))
         return frame
