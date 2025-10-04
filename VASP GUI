@@ -383,112 +383,308 @@ Gamma
 """
 
 
-DEMO_DOS_ENERGIES = [round(-6.0 + 0.12 * i, 6) for i in range(101)]
-_demo_step = DEMO_DOS_ENERGIES[1] - DEMO_DOS_ENERGIES[0] if len(DEMO_DOS_ENERGIES) > 1 else 0.12
-DEMO_DOS_TOTAL: list[float] = []
-DEMO_DOS_INTEGRATED: list[float] = []
-DEMO_PDOS_CURVES: dict[str, list[float]] = {"Si-s": [], "Si-p": [], "Si-d": []}
-for e in DEMO_DOS_ENERGIES:
-    valence = math.exp(-((e + 1.45) / 0.55) ** 2)
-    conduction = math.exp(-((e - 1.65) / 0.60) ** 2)
-    mid = math.exp(-(e / 0.32) ** 2)
-    s_val = 0.75 * valence
-    p_val = 1.25 * valence + 0.35 * conduction
-    d_val = 0.6 * conduction
-    total = s_val + p_val + d_val + 0.02 * mid
-    DEMO_PDOS_CURVES["Si-s"].append(s_val)
-    DEMO_PDOS_CURVES["Si-p"].append(p_val)
-    DEMO_PDOS_CURVES["Si-d"].append(d_val)
-    DEMO_DOS_TOTAL.append(total)
-    DEMO_DOS_INTEGRATED.append((DEMO_DOS_INTEGRATED[-1] if DEMO_DOS_INTEGRATED else 0.0) + total * _demo_step)
+# === DEMO DATA (improved realistic set) ======================================
+# 口径：PBE-like Si (diamond)；间接带隙 ~0.62 eV (VBM@Γ, CBM@X)
 
-DEMO_PDOS_TOTAL = [
-    DEMO_PDOS_CURVES["Si-s"][i]
-    + DEMO_PDOS_CURVES["Si-p"][i]
-    + DEMO_PDOS_CURVES["Si-d"][i]
-    + 0.02 * math.exp(-(DEMO_DOS_ENERGIES[i] / 0.32) ** 2)
-    for i in range(len(DEMO_DOS_ENERGIES))
-]
+def _linspace(a: float, b: float, n: int) -> list[float]:
+    if n <= 1:
+        return [a]
+    step = (b - a) / (n - 1)
+    return [a + i * step for i in range(n)]
 
-DEMO_BAND_KPOINTS = [
-    [0.0, 0.0, 0.0],
-    [0.5, 0.0, 0.0],
-    [1.0, 0.0, 0.0],
-    [1.0, 0.5, 0.0],
-    [1.0, 1.0, 0.0],
-    [0.0, 0.0, 0.0],
-]
-DEMO_BAND_LABELS = ["Γ", "", "X", "", "M", "Γ"]
-DEMO_BAND_VALUES = [
-    [-2.40, -0.65, 0.95, 2.70],
-    [-2.32, -0.52, 0.90, 2.62],
-    [-2.20, -0.40, 0.88, 2.55],
-    [-2.18, -0.28, 0.96, 2.60],
-    [-2.26, -0.48, 1.05, 2.72],
-    [-2.40, -0.65, 1.12, 2.88],
-]
-DEMO_BAND_OCCS = [[1.0, 1.0, 0.0, 0.0] for _ in DEMO_BAND_VALUES]
-DEMO_BAND_DISTANCES = [0.0, 0.52, 1.04, 1.63, 2.34, 3.05]
+def _lerp_vec(a: list[float], b: list[float], t: float) -> list[float]:
+    return [a[i] + (b[i] - a[i]) * t for i in range(3)]
 
-DEMO_PLANAR_Z = [round(0.4 * i, 6) for i in range(60)]
-DEMO_PLANAR_VALUES = [0.25 * math.sin(0.35 * i) + 0.06 * math.cos(0.7 * i) for i in range(len(DEMO_PLANAR_Z))]
+def _cumtrapz(y: list[float], x: list[float]) -> list[float]:
+    # 简单梯形积分，不依赖 numpy
+    out = [0.0]
+    for i in range(1, len(x)):
+        dx = x[i] - x[i-1]
+        out.append(out[-1] + 0.5 * (y[i] + y[i-1]) * dx)
+    return out
 
-DEMO_POSTPROCS: dict[str, dict[str, Any]] = {
-    "dos": {
-        "energies": DEMO_DOS_ENERGIES,
-        "dos": DEMO_DOS_TOTAL,
-        "integrated": DEMO_DOS_INTEGRATED,
-        "fermi": 0.0,
-    },
-    "pdos": {
-        "energies": DEMO_DOS_ENERGIES,
-        "total": DEMO_PDOS_TOTAL,
-        "curves": DEMO_PDOS_CURVES,
-        "fermi": 0.0,
-        "gap": 1.35,
-    },
-    "bands": {
-        "bands": DEMO_BAND_VALUES,
-        "occupancies": DEMO_BAND_OCCS,
-        "kpoints": DEMO_BAND_KPOINTS,
-        "fermi": 0.0,
-        "distances": DEMO_BAND_DISTANCES,
-    },
-    "bands_lbl": {
-        "bands": DEMO_BAND_VALUES,
-        "occupancies": DEMO_BAND_OCCS,
-        "kpoints": DEMO_BAND_KPOINTS,
-        "labels": DEMO_BAND_LABELS,
-        "fermi": 0.0,
-        "distances": DEMO_BAND_DISTANCES,
-    },
-    "emass": {
-        "bands": DEMO_BAND_VALUES,
-        "occupancies": DEMO_BAND_OCCS,
-        "distances": DEMO_BAND_DISTANCES,
-        "fermi": 0.0,
-        "me_star": 0.28,
-        "mh_star": 0.46,
-    },
-    "pot_z": {
-        "z": DEMO_PLANAR_Z,
-        "values": DEMO_PLANAR_VALUES,
-    },
+def _smoothstep(x: float, k: float = 6.0) -> float:
+    # logistic-based smooth step: 0~1 过渡，用于柔化带边
+    # s(x)=1/(1+exp(-k*x))
+    import math
+    return 1.0 / (1.0 + math.exp(-k * x))
+
+def _build_demo_si():
+    import math
+
+    # ---------- DOS / PDOS ----------
+    E_MIN, E_MAX, DE = -12.0, 8.0, 0.02
+    energies = []
+    e = E_MIN
+    while e <= E_MAX + 1e-12:
+        energies.append(round(e, 6))
+        e += DE
+    EF = 0.0
+    Eg = 0.62  # PBE-like Si 间接带隙近似值（演示）
+
+    # 价带以 p 为主，深能级掺点 s；导带弱 d
+    dos_s, dos_p, dos_d = [], [], []
+    for E in energies:
+        # 抑制带隙内 DOS（光滑衰减）
+        gate_v = 1.0 - _smoothstep(E - (-1e-3), k=55.0)   # E<0 强，E>0 抑制
+        gate_c = _smoothstep(E - Eg, k=55.0)              # E<Eg 抑制，E>Eg 放大
+
+        # 简单的多峰近似（不追求材料级拟合，只追求形态合理）
+        valence_p = 1.8 * math.exp(-((E + 3.5) / 1.8) ** 2)                   + 1.2 * math.exp(-((E + 7.5) / 1.3) ** 2)
+        valence_s = 0.9 * math.exp(-((E + 6.5) / 1.0) ** 2)
+
+        # 导带从 Eg 起，逐渐抬升
+        conduction_p = 1.0 * math.exp(-((E - (Eg + 1.2)) / 1.4) ** 2)
+        conduction_d = 0.35 * math.exp(-((E - (Eg + 2.6)) / 1.2) ** 2)
+
+        s = gate_v * (0.35 * valence_s) + gate_c * (0.25 * conduction_p)
+        p = gate_v * (1.00 * valence_p) + gate_c * (0.85 * conduction_p)
+        d = gate_c * conduction_d
+
+        # 防止极小负值/NaN
+        dos_s.append(max(0.0, s))
+        dos_p.append(max(0.0, p))
+        dos_d.append(max(0.0, d))
+
+    pdos_curves = {"Si-s": dos_s, "Si-p": dos_p, "Si-d": dos_d}
+    total_dos = [dos_s[i] + dos_p[i] + dos_d[i] for i in range(len(energies))]
+    integrated = _cumtrapz(total_dos, energies)
+
+    # --------- bands (Γ–X–W–K–Γ–L) ----------
+    # fcc 常用高对称路径（分数坐标，近似即可）
+    # Γ(0,0,0) → X(0,1/2,1/2) → W(1/4,1/2,3/4) → K(3/8,3/4,3/8) → Γ → L(1/2,1/2,1/2)
+    nodes = [
+        ("Γ", [0.0,   0.0,  0.0]),
+        ("X", [0.0,   0.5,  0.5]),
+        ("W", [0.25,  0.5,  0.75]),
+        ("K", [0.375, 0.75, 0.375]),
+        ("Γ", [0.0,   0.0,  0.0]),
+        ("L", [0.5,   0.5,  0.5]),
+    ]
+    pts_per_seg = 9  # 每段插 9 点（含端点），全路径约 41 点，渲染顺滑
+    kpoints = []
+    labels = []
+    # 生成分段直线插值路径；端点不重复
+    for idx in range(len(nodes) - 1):
+        name_a, ka = nodes[idx]
+        name_b, kb = nodes[idx + 1]
+        for i in range(pts_per_seg):
+            t = i / (pts_per_seg - 1)
+            if idx > 0 and i == 0:
+                # 跳过重复端点
+                continue
+            kpoints.append(_lerp_vec(ka, kb, t))
+            lbl = name_a if i == 0 else (name_b if i == (pts_per_seg - 1) else "")
+            labels.append(lbl)
+
+    nk = len(kpoints)
+    distances = [0.0]
+    for i in range(1, nk):
+        # 用等步长的“虚拟距离”即可，不依赖晶格
+        distances.append(distances[-1] + 1.0)
+
+    # 构造 6 条带：3 条价带（VB1~VB3），3 条导带（CB1~CB3）
+    # 形状：VB1 最高在 Γ（0 eV），到 X 降至 ~-0.45 eV；CB1 最低在 X（Eg）
+    def _seg_u(i0: int, i1: int, i: int) -> float:
+        # 返回 i 在段 [i0,i1] 上的线性 0..1
+        if i1 == i0:
+            return 0.0
+        return (i - i0) / float(i1 - i0)
+
+    # 找到各段索引范围
+    idxs = []
+    start_idx = 0
+    for name, _ in nodes[1:]:
+        # 找 label == name 的位置作为段末
+        end_idx = max(j for j, lbl in enumerate(labels) if lbl == name)
+        idxs.append((start_idx, end_idx))
+        start_idx = end_idx
+
+    # 能量生成：按段定义线性/轻微余弦变化，保证 CB1(X)≈Eg、VB1(Γ)=0
+    def _bands_along_path():
+        # 初始化二维表：nk 行 × 6 带
+        B = [[0.0] * 6 for _ in range(nk)]
+
+        # 目标锚点（单位 eV）
+        E_Gamma_VBM = 0.0
+        E_X_VBM     = -0.45
+        E_W_VBM     = -0.35
+        E_K_VBM     = -0.40
+        E_L_VBM     = -0.15
+
+        E_Gamma_CBM = 3.2
+        E_X_CBM     = Eg
+        E_W_CBM     = 1.4
+        E_K_CBM     = 1.6
+        E_L_CBM     = 2.0
+
+        anchors_v = [E_Gamma_VBM, E_X_VBM, E_W_VBM, E_K_VBM, E_Gamma_VBM, E_L_VBM]
+        anchors_c = [E_Gamma_CBM, E_X_CBM, E_W_CBM, E_K_CBM, E_Gamma_CBM, E_L_CBM]
+
+        # 逐段插值
+        for s, (i0, i1) in enumerate(idxs):
+            Ev0, Ev1 = anchors_v[s], anchors_v[s+1]
+            Ec0, Ec1 = anchors_c[s], anchors_c[s+1]
+            for i in range(i0, i1 + 1):
+                u = _seg_u(i0, i1, i)
+                # 轻微余弦，避免过于生硬
+                w = 0.5 - 0.5 * math.cos(math.pi * u)
+                Ev = Ev0 + (Ev1 - Ev0) * w
+                Ec = Ec0 + (Ec1 - Ec0) * w
+
+                # 六条带：VB1 最高，其余下移；CB1 最低，其余上移
+                B[i][0] = Ev                       # VB1
+                B[i][1] = Ev - 0.80                # VB2
+                B[i][2] = Ev - 1.60                # VB3
+                B[i][3] = Ec                       # CB1
+                B[i][4] = Ec + 0.80                # CB2
+                B[i][5] = Ec + 1.60                # CB3
+        return B
+
+    band_values = _bands_along_path()
+    band_occs = []
+    for i in range(nk):
+        row = []
+        for e_val in band_values[i]:
+            row.append(1.0 if e_val < EF else 0.0)
+        band_occs.append(row)
+
+    # ---------- 平面平均势（z） ----------
+    # 设一维 slab，z∈[0, 24] Å，两层原子平面在 z≈6 Å 与 18 Å，势能凹谷 + 轻微表面偶极
+    z = _linspace(0.0, 24.0, 180)
+    pot = []
+    for zi in z:
+        # 两个“层内势阱” + 真空中的缓慢起伏 + 表面偶极台阶
+        v = -0.18 * math.exp(-((zi - 6.0) / 0.8) ** 2)             -0.18 * math.exp(-((zi - 18.0) / 0.8) ** 2)             + 0.02 * math.sin(2.0 * math.pi * zi / 24.0)             + (0.06 if zi > 12.0 else 0.0)
+        pot.append(v)
+    # 归一到 V(0)=0 的相对势
+    pot0 = pot[0]
+    pot_rel = [v - pot0 for v in pot]
+
+    # ---------- 2D 扭转/滑移扫参（演示） ----------
+    thetas = [0.0, 2.0, 4.0, 6.0, 8.0]  # 小角更常见，数量适中
+    ux_list = [0.00, 0.25, 0.50, 0.75]
+    uy_list = [0.00, 0.33, 0.66]
+    twist_results = []
+    for th in thetas:
+        for ux in ux_list:
+            for uy in uy_list:
+                # 以基准半导体层合为例：小角加强层间耦合，带隙微降；滑移引入周期性调制
+                gap = 1.90 - 0.05 * (th / 8.0)                       + 0.12 * math.cos(math.pi * ux)                       + 0.10 * math.cos(math.pi * uy)
+                gap = max(0.45, gap)  # 不让它太小
+                Etot = -500.0 + 0.08 * th + 0.20 * ux + 0.18 * uy
+                twist_results.append({
+                    "theta": float(th),
+                    "ux": float(ux),
+                    "uy": float(uy),
+                    "gap": float(round(gap, 4)),
+                    "E": float(round(Etot, 4)),
+                    "path": f"theta_{th:.2f}_ux_{ux:.2f}_uy_{uy:.2f}",
+                    "note": "demo",
+                })
+
+    # ---------- 汇总成原有全局变量 ----------
+    demo = {}
+
+    demo["DEMO_DOS_ENERGIES"]   = energies
+    demo["DEMO_DOS_TOTAL"]      = total_dos
+    demo["DEMO_DOS_INTEGRATED"] = integrated
+    demo["DEMO_PDOS_CURVES"]    = pdos_curves
+    demo["DEMO_PDOS_TOTAL"]     = [dos_s[i] + dos_p[i] + dos_d[i] for i in range(len(energies))]
+
+    demo["DEMO_BAND_KPOINTS"]   = kpoints
+    demo["DEMO_BAND_LABELS"]    = labels
+    demo["DEMO_BAND_VALUES"]    = band_values          # 形状：nk × 6
+    demo["DEMO_BAND_OCCS"]      = band_occs            # 形状：nk × 6
+    demo["DEMO_BAND_DISTANCES"] = distances
+
+    demo["DEMO_PLANAR_Z"]       = z
+    demo["DEMO_PLANAR_VALUES"]  = pot_rel
+
+    demo["DEMO_TWIST_RESULTS"]  = twist_results
+
+    # demo 项目文件（KPOINTS 含路径标签；其余与原逻辑兼容）
+    kpoints_linemode = """Si band path (fcc)
+18
+Line-mode
+Reciprocal
+0.0000 0.0000 0.0000 ! Γ
+0.0000 0.0625 0.0625 !
+0.0000 0.1250 0.1250 !
+0.0000 0.1875 0.1875 !
+0.0000 0.2500 0.2500 !
+0.0000 0.3125 0.3125 !
+0.0000 0.3750 0.3750 !
+0.0000 0.4375 0.4375 !
+0.0000 0.5000 0.5000 ! X
+0.1250 0.5000 0.6250 ! W
+0.1875 0.6250 0.5000 !
+0.2812 0.6875 0.4375 !
+0.3750 0.7500 0.3750 ! K
+0.2812 0.5000 0.2812 !
+0.1875 0.2500 0.1875 !
+0.0938 0.1250 0.0938 !
+0.0000 0.0000 0.0000 ! Γ
+0.5000 0.5000 0.5000 ! L
+"""
+
+    demo["DEMO_PROJECT_FILES"] = {
+        "INCAR": EXAMPLE_SI_INCAR + "\n# 演示模式示例输入（改良版数据）\n",
+        "POSCAR": EXAMPLE_SI_POSCAR,
+        "KPOINTS": kpoints_linemode,
+        "README.txt": (
+            "演示模式项目（改良数据）\n"
+            "========================\n"
+            "包含更贴近 Si(PBE-like) 的 DOS/PDOS、间接带隙能带（Γ→X 为主）、\n"
+            "以及平面平均势与二维扭转/滑移扫参的示例结果。用于验证 GUI 流程与出图。\n"
+            "无需真实 VASP 输出。"
+        ),
+        "vasprun.xml": "<!-- demo placeholder: 数据由内置样本提供 -->\n",
+        "EIGENVAL": "# demo placeholder\n",
+        "DOSCAR": "# demo placeholder\n",
+        "OUTCAR": "# demo placeholder\nE-fermi : 5.4000\n",
+        "LOCPOT": "# demo placeholder\n",
+    }
+
+    # 方便下方直接赋值
+    return demo
+
+# 生成并绑定到原有全局名
+_demo = _build_demo_si()
+DEMO_DOS_ENERGIES   = _demo["DEMO_DOS_ENERGIES"]
+DEMO_DOS_TOTAL      = _demo["DEMO_DOS_TOTAL"]
+DEMO_DOS_INTEGRATED = _demo["DEMO_DOS_INTEGRATED"]
+DEMO_PDOS_CURVES    = _demo["DEMO_PDOS_CURVES"]
+DEMO_PDOS_TOTAL     = _demo["DEMO_PDOS_TOTAL"]
+
+DEMO_BAND_KPOINTS   = _demo["DEMO_BAND_KPOINTS"]
+DEMO_BAND_LABELS    = _demo["DEMO_BAND_LABELS"]
+DEMO_BAND_VALUES    = _demo["DEMO_BAND_VALUES"]
+DEMO_BAND_OCCS      = _demo["DEMO_BAND_OCCS"]
+DEMO_BAND_DISTANCES = _demo["DEMO_BAND_DISTANCES"]
+
+DEMO_PLANAR_Z       = _demo["DEMO_PLANAR_Z"]
+DEMO_PLANAR_VALUES  = _demo["DEMO_PLANAR_VALUES"]
+
+DEMO_TWIST_RESULTS  = _demo["DEMO_TWIST_RESULTS"]
+DEMO_POSTPROCS = {
+    "dos":   {"energies": DEMO_DOS_ENERGIES, "dos": DEMO_DOS_TOTAL,
+              "integrated": DEMO_DOS_INTEGRATED, "fermi": 0.0},
+    "pdos":  {"energies": DEMO_DOS_ENERGIES, "total": DEMO_PDOS_TOTAL,
+              "curves": DEMO_PDOS_CURVES, "fermi": 0.0, "gap": 0.62},
+    "bands": {"bands": DEMO_BAND_VALUES, "occupancies": DEMO_BAND_OCCS,
+              "kpoints": DEMO_BAND_KPOINTS, "fermi": 0.0,
+              "distances": DEMO_BAND_DISTANCES},
+    "bands_lbl": {"bands": DEMO_BAND_VALUES, "occupancies": DEMO_BAND_OCCS,
+                  "kpoints": DEMO_BAND_KPOINTS, "labels": DEMO_BAND_LABELS,
+                  "fermi": 0.0, "distances": DEMO_BAND_DISTANCES},
+    "emass": {"bands": DEMO_BAND_VALUES, "occupancies": DEMO_BAND_OCCS,
+              "distances": DEMO_BAND_DISTANCES, "fermi": 0.0,
+              "me_star": 0.26, "mh_star": 0.49},  # 典型 Si 有效质量近似
+    "pot_z": {"z": DEMO_PLANAR_Z, "values": DEMO_PLANAR_VALUES},
 }
-
-DEMO_PROJECT_FILES = {
-    "INCAR": EXAMPLE_SI_INCAR + "\n# 演示模式示例输入\n",
-    "POSCAR": EXAMPLE_SI_POSCAR,
-    "KPOINTS": """Si demo band path\n6\nLine-mode\nReciprocal\n0.0 0.0 0.0 ! Γ\n0.5 0.0 0.0 !\n1.0 0.0 0.0 ! X\n1.0 0.5 0.0 !\n1.0 1.0 0.0 ! M\n0.0 0.0 0.0 ! Γ\n""",
-    "README.txt": """演示模式项目\n================\n本目录由 VASP GUI 演示模式自动生成，包含内置的示例输入文件与\n占位的计算结果文件。运行后处理时将使用程序内置的数据生成图表，\n无需实际的 VASP 输出。""",
-    "vasprun.xml": "<!-- demo placeholder: 数据由内置样本提供 -->\n",
-    "EIGENVAL": "# demo placeholder\n",
-    "DOSCAR": "# demo placeholder\n",
-    "OUTCAR": "# demo placeholder\nE-fermi : 5.4000\n",
-    "LOCPOT": "# demo placeholder\n",
-}
-
-
+DEMO_PROJECT_FILES = _demo["DEMO_PROJECT_FILES"]
+# === END DEMO DATA (improved realistic set) ==================================
 # ----------------------------- 工具函数区 ----------------------------------
 
 def which(cmd: str) -> str | None:
@@ -2018,10 +2214,12 @@ class PostprocWorker(threading.Thread):
         try:
             result = proc.runner(workdir, self.opts)
         except FileNotFoundError as exc:
-            app.after(0, lambda: app._on_postproc_error(self.key, str(exc)))
+            err_msg = str(exc)
+            app.after(0, app._on_postproc_error, self.key, err_msg)
             return
         except Exception as exc:
-            app.after(0, lambda: app._on_postproc_error(self.key, f"后处理异常：{exc}"))
+            err_msg = f"后处理异常：{exc}"
+            app.after(0, app._on_postproc_error, self.key, err_msg)
             return
         app.after(0, lambda: app._on_postproc_success(self.key, result, workdir, self.opts))
 
@@ -2218,6 +2416,18 @@ class VaspGUI(tk.Tk):
         self.demo_project_dir = demo_dir
         self.demo_mode_var.set(True)
         self.set_project(demo_dir)
+        try:
+            twist_dir = demo_dir / "twist_sweep"
+            self._tw_write_demo_results(twist_dir)
+        except Exception:
+            pass
+        try:
+            demo_poscar = demo_dir / "POSCAR"
+            if demo_poscar.exists():
+                self.tw_top_path.set(str(demo_poscar))
+                self.tw_bot_path.set(str(demo_poscar))
+        except Exception:
+            pass
         self.apply_run_status("🧪 演示模式", ["已加载内置示例数据，可直接体验全部后处理功能。"])
 
     def _deactivate_demo_mode(self):
@@ -3720,6 +3930,12 @@ class VaspGUI(tk.Tk):
         """遍历 twist_sweep/* 子目录，收集 gap / total energy / 备注，导出 CSV。"""
         root = self.current_project_path() / "twist_sweep"
         if not root.exists():
+            if self.demo_mode:
+                root.mkdir(parents=True, exist_ok=True)
+                csv_path = self._tw_write_demo_results(root)
+                messagebox.showinfo(APP_NAME, f"演示模式：已生成示例 results.csv → {csv_path}")
+                self._tw_append_log("演示模式：已生成示例 twist_sweep/results.csv。")
+                return
             messagebox.showwarning(APP_NAME, "未找到 twist_sweep 目录。")
             self._tw_append_log("未找到 twist_sweep 目录，无法汇总结果。")
             return
@@ -3833,6 +4049,12 @@ class VaspGUI(tk.Tk):
         root = root or (self.current_project_path() / "twist_sweep")
         csv_path = root / "results.csv"
         if not csv_path.exists():
+            if self.demo_mode:
+                try:
+                    self._tw_write_demo_results(root)
+                except Exception as exc:
+                    messagebox.showerror(APP_NAME, f"生成演示数据失败：{exc}")
+                    return []
             try:
                 self._tw_collect_results()
             except Exception as e:
@@ -3870,6 +4092,140 @@ class VaspGUI(tk.Tk):
             and (not math.isnan(r["uy"]))
         ]
         return rows
+
+    # === Add to class VaspGUI: 2D twist/shift demo writer =======================
+
+    def _tw_build_demo_results(self) -> list[dict]:
+        """
+        生成一套“MoS2-like 双层”演示数据：
+        - 角度 θ ∈ {0, 2, 4, 6, 8} deg（小角更常见）
+        - 滑移 (ux, uy) 在 [0,1)×[0,1) 上取 4×3 网格
+        - gap_eV：随小角略降、随滑移呈余弦调制；下限设为 0.85 eV（不金属化）
+        - E_eV：总能轻微变化（展示能量/稳定性排序用）
+        """
+        import math
+        thetas = [0.0, 2.0, 4.0, 6.0, 8.0]
+        ux_list = [0.00, 0.25, 0.50, 0.75]
+        uy_list = [0.00, 0.33, 0.66]
+
+        # MoS2 双层的“演示口径”：基线带隙 ~1.55 eV，扭转与堆垛（滑移）稍微调制
+        Eg0 = 1.55
+        results = []
+        for th in thetas:
+            for ux in ux_list:
+                for uy in uy_list:
+                    # 余弦调制模拟不同堆垛（AA'/AB 近似）、小角减隙
+                    gap = (
+                        Eg0
+                        - 0.10 * (th / 8.0)                         # 扭转小角略降
+                        + 0.12 * math.cos(math.pi * ux)             # 沿 a1 的调制
+                        + 0.10 * math.cos(math.pi * uy)             # 沿 a2 的调制
+                    )
+                    gap = max(0.85, gap)  # 不让它假性金属化，UI 更稳定
+
+                    # 总能随角度与滑移的轻微起伏，用来演示“最稳堆垛”
+                    Etot = -500.0 + 0.08 * th + 0.20 * ux + 0.18 * uy
+
+                    results.append({
+                        "theta": round(float(th), 6),
+                        "ux": round(float(ux), 6),
+                        "uy": round(float(uy), 6),
+                        "gap": round(float(gap), 6),
+                        "E": round(float(Etot), 6),
+                        "path": f"theta_{th:04.1f}_ux_{ux:04.2f}_uy_{uy:04.2f}",
+                        "note": "2D-demo-mos2",
+                    })
+        return results
+
+    def _tw_write_demo_results(self, out_dir):
+        """
+        在 out_dir 下写出：
+          - summary.csv （theta_deg, ux, uy, E_eV, gap_eV, path, note）
+          - meta.json   （角度/网格与口径信息）
+          - runs/<path>/result.json（每个工况一个小目录，便于你现有解析器遍历）
+        若全局已有 DEMO_TWIST_RESULTS 就复用；否则调用 _tw_build_demo_results() 生成。
+        """
+        import json, csv
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        runs_dir = out_dir / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+
+        # 复用已有全局数据（如果你之前定义了 DEMO_TWIST_RESULTS）
+        results: list[dict] = []
+        try:
+            results = [dict(r) for r in DEMO_TWIST_RESULTS]  # type: ignore # noqa
+        except Exception:
+            results = self._tw_build_demo_results()
+
+        # 写 summary.csv
+        csv_path = out_dir / "summary.csv"
+        with csv_path.open("w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["theta_deg", "ux", "uy", "E_eV", "gap_eV", "path", "note"])
+            for r in results:
+                w.writerow([r["theta"], r["ux"], r["uy"], r["E"], r["gap"], r["path"], r.get("note", "")])
+
+        # 写 meta.json（给 UI / 解析器一个“任务地图”）
+        thetas = sorted({float(r["theta"]) for r in results})
+        ux_vals = sorted({float(r["ux"]) for r in results})
+        uy_vals = sorted({float(r["uy"]) for r in results})
+        meta = {
+            "system": "bilayer MoS2 (demo-like)",
+            "comment": "演示用：小角轻微减隙；滑移余弦调制；总能微小起伏。非材料拟合。",
+            "angles_deg": thetas,
+            "ux_grid": ux_vals,
+            "uy_grid": uy_vals,
+            "fields": ["theta", "ux", "uy", "E", "gap", "path", "note"],
+            "units": {"E": "eV", "gap": "eV", "theta": "deg"},
+            "count": len(results),
+        }
+        (out_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # 为每个工况建一个小目录并写 result.json（方便“逐工况查看/重算”）
+        for r in results:
+            d = runs_dir / r["path"]
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "result.json").write_text(json.dumps(r, ensure_ascii=False, indent=2), encoding="utf-8")
+            # 轻量占位：给你现有脚本/按钮一个落点（不包含 VASP 可执行）
+            if not (d / "INCAR").exists():
+                (d / "INCAR").write_text(
+                    "# demo placeholder for INCAR (2D sweep)\n# 建议真实计算时开启：LDIPOL = .TRUE., IDIPOL = 3\n",
+                    encoding="utf-8",
+                )
+            if not (d / "KPOINTS").exists():
+                (d / "KPOINTS").write_text(
+                    "Automatic mesh\n0\nGamma\n1 1 1\n0 0 0\n",
+                    encoding="utf-8",
+                )
+            if not (d / "POSCAR").exists():
+                # 极简 2H-MoS2 单层占位（只为 UI 预览/拷贝路径；不用于科学计算）
+                (d / "POSCAR").write_text(
+                    "MoS2 monolayer (demo-only)\n1.0\n"
+                    "3.180000 0.000000 0.000000\n"
+                    "-1.590000 2.754000 0.000000\n"
+                    "0.000000 0.000000 20.000000\n"
+                    "Mo S\n"
+                    "1 2\n"
+                    "Direct\n"
+                    "0.333333 0.666667 0.500000\n"
+                    "0.333333 0.666667 0.580000\n"
+                    "0.333333 0.666667 0.420000\n",
+                    encoding="utf-8",
+                )
+
+        # 友好提示（在“监视/后处理”页能看到）
+        self.apply_run_status(
+            "🧪 二维材料演示就绪",
+            [
+                f"已生成 {len(results)} 个 (θ,ux,uy) 工况于 {out_dir}/",
+                "可直接“解析 sweep 结果 → CSV/热图”，或点开单个工况目录浏览占位文件。",
+            ],
+        )
+        return csv_path
+
+    # === END: 2D twist/shift demo writer =======================================
+
 
     def _tw_plot_gap_heatmap_btn(self):
         """按钮：用当前 θ（输入框 tw_theta_a）画 gap(u_x,u_y) 热图。"""
