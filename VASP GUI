@@ -69,6 +69,14 @@ try:
 except Exception:
     HAS_PYMATGEN = False
 
+# === CODEX BEGIN: imports for twist/shift page ===
+try:
+    import numpy as np  # 数值与线性代数
+    HAS_NUMPY = True
+except Exception:
+    HAS_NUMPY = False
+# === CODEX END: imports for twist/shift page ===
+
 try:
     import seekpath  # type: ignore  # noqa: F401
     HAS_SEEKPATH = True
@@ -808,6 +816,11 @@ class VaspGUI(tk.Tk):
         self.nb.add(self.page_monitor, text="监视")
         self.nb.add(self.page_post, text="后处理")
 
+        # === CODEX BEGIN: add twist/shift tab ===
+        self.page_twist = self._build_twistshift_page(self.nb)
+        self.nb.add(self.page_twist, text="二维材料·滑移/扭转")
+        # === CODEX END: add twist/shift tab ===
+
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ------------------------- 页面：输入文件 -----------------------------
@@ -1494,6 +1507,507 @@ class VaspGUI(tk.Tk):
         frame = ttk.Frame(parent)
         self._populate_kpoints_section(frame)
         return frame
+
+    # === CODEX BEGIN: twist/shift page UI ===
+    def _build_twistshift_page(self, parent):
+        frame = ttk.Frame(parent)
+
+        # 左栏：输入与控制
+        left = ttk.Frame(frame, padding=8); left.pack(side=tk.LEFT, fill=tk.Y)
+        ttk.Label(left, text="二维材料扭转/滑移 | 生成批量 POSCAR 与扫参任务").pack(anchor=tk.W, pady=(0,6))
+
+        # 路径选择
+        self.tw_top_path = tk.StringVar()
+        self.tw_bot_path = tk.StringVar()
+
+        row = ttk.Frame(left); row.pack(fill=tk.X, pady=2)
+        ttk.Label(row, text="上层 POSCAR:").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.tw_top_path, width=44).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text="选择…", command=lambda: self._tw_pick_poscar(self.tw_top_path)).pack(side=tk.LEFT)
+
+        row = ttk.Frame(left); row.pack(fill=tk.X, pady=2)
+        ttk.Label(row, text="下层 POSCAR:").pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.tw_bot_path, width=44).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text="选择…", command=lambda: self._tw_pick_poscar(self.tw_bot_path)).pack(side=tk.LEFT)
+
+        ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+
+        # 基本几何参数
+        self.tw_vacuum = tk.DoubleVar(value=20.0)     # 目标真空 (Å)
+        self.tw_allow_strain = tk.DoubleVar(value=0.8)  # 允许等效小应变（%）
+        self.tw_gamma_atom_threshold = tk.IntVar(value=500)  # 超大超胞→Gamma-only
+
+        row = ttk.Frame(left); row.pack(fill=tk.X, pady=2)
+        ttk.Label(row, text="真空(Å):").pack(side=tk.LEFT); ttk.Entry(row, textvariable=self.tw_vacuum, width=7).pack(side=tk.LEFT, padx=4)
+        ttk.Label(row, text="容许应变(%)").pack(side=tk.LEFT, padx=(8,0)); ttk.Entry(row, textvariable=self.tw_allow_strain, width=7).pack(side=tk.LEFT, padx=4)
+
+        ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+
+        # 扭转角扫描
+        ttk.Label(left, text="扭转角 θ (度)：").pack(anchor=tk.W)
+        self.tw_theta_a = tk.DoubleVar(value=0.0)
+        self.tw_theta_b = tk.DoubleVar(value=10.0)
+        self.tw_theta_step = tk.DoubleVar(value=2.0)
+        r=ttk.Frame(left); r.pack(fill=tk.X, pady=2)
+        ttk.Label(r, text="起").pack(side=tk.LEFT); ttk.Entry(r, textvariable=self.tw_theta_a, width=7).pack(side=tk.LEFT, padx=4)
+        ttk.Label(r, text="止").pack(side=tk.LEFT); ttk.Entry(r, textvariable=self.tw_theta_b, width=7).pack(side=tk.LEFT, padx=4)
+        ttk.Label(r, text="步").pack(side=tk.LEFT); ttk.Entry(r, textvariable=self.tw_theta_step, width=7).pack(side=tk.LEFT, padx=4)
+        ttk.Label(left, text="注：六角晶格通常只需 0–60° 区间。", foreground="#666").pack(anchor=tk.W, pady=(0,4))
+
+        # 滑移扫描（分数坐标）
+        ttk.Label(left, text="滑移 (分数坐标 u_x,u_y)：").pack(anchor=tk.W)
+        self.tw_ux_steps = tk.IntVar(value=5)
+        self.tw_uy_steps = tk.IntVar(value=5)
+        r=ttk.Frame(left); r.pack(fill=tk.X, pady=2)
+        ttk.Label(r, text="u_x 步数").pack(side=tk.LEFT); ttk.Spinbox(r, from_=1, to=32, textvariable=self.tw_ux_steps, width=6).pack(side=tk.LEFT, padx=4)
+        ttk.Label(r, text="u_y 步数").pack(side=tk.LEFT, padx=(8,0)); ttk.Spinbox(r, from_=1, to=32, textvariable=self.tw_uy_steps, width=6).pack(side=tk.LEFT, padx=4)
+        ttk.Label(left, text="网格覆盖 [0,1)×[0,1)，自动等间隔。", foreground="#666").pack(anchor=tk.W)
+
+        ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+
+        # 计算与并行策略
+        self.tw_kspacing = tk.DoubleVar(value=0.22)
+        self.tw_max_tasks = tk.IntVar(value=200)
+        self.tw_autorun = tk.BooleanVar(value=False)  # 可选：生成后立刻运行（默认关）
+
+        r=ttk.Frame(left); r.pack(fill=tk.X, pady=2)
+        ttk.Label(r, text="KSPACING").pack(side=tk.LEFT); ttk.Entry(r, textvariable=self.tw_kspacing, width=7).pack(side=tk.LEFT, padx=4)
+        ttk.Label(r, text="任务上限").pack(side=tk.LEFT, padx=(8,0)); ttk.Entry(r, textvariable=self.tw_max_tasks, width=7).pack(side=tk.LEFT, padx=4)
+        ttk.Checkbutton(left, text="生成后自动运行（试验性）", variable=self.tw_autorun).pack(anchor=tk.W, pady=(2,4))
+
+        # 操作按钮
+        btns = ttk.Frame(left); btns.pack(fill=tk.X, pady=8)
+        ttk.Button(btns, text="预览当前(θ,u)几何", command=self._tw_preview_once).pack(side=tk.LEFT)
+        ttk.Button(btns, text="生成单例 POSCAR", command=lambda: self._tw_generate(single=True)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="批量遍历并生成", command=lambda: self._tw_generate(single=False)).pack(side=tk.LEFT)
+
+        ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+        ttk.Button(left, text="解析 sweep 结果 → CSV", command=self._tw_collect_results).pack(anchor=tk.W)
+
+        # 右栏：俯视预览
+        right = ttk.Frame(frame, padding=8); right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        self.fig_tw = Figure(figsize=(6.0,4.5), dpi=100)
+        self.ax_tw = self.fig_tw.add_subplot(111)
+        self.ax_tw.set_title("Top view preview")
+        self.ax_tw.set_xlabel("x (Å)"); self.ax_tw.set_ylabel("y (Å)")
+        self.canvas_tw = FigureCanvasTkAgg(self.fig_tw, master=right)
+        self.canvas_tw.draw(); self.canvas_tw.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        return frame
+    # === CODEX END: twist/shift page UI ===
+
+    # === CODEX BEGIN: twist/shift geometry core ===
+    def _tw_pick_poscar(self, var):
+        p = filedialog.askopenfilename(title="选择 POSCAR", filetypes=[("POSCAR","POSCAR*"),("All","*")])
+        if p: var.set(p)
+
+    def _tw_preview_once(self):
+        """使用当前 θ = theta_a、u=(0,0) 快速构造一次并俯视预览。"""
+        try:
+            st, meta = self._tw_build_structure(
+                Path(self.tw_top_path.get()), Path(self.tw_bot_path.get()),
+                theta_deg=float(self.tw_theta_a.get()), ux=0.0, uy=0.0,
+                vacuum=float(self.tw_vacuum.get()),
+                allow_strain=float(self.tw_allow_strain.get())/100.0,
+                search_limit=8
+            )
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"预览失败：{e}")
+            return
+        self._tw_draw_topview(st, meta)
+
+    def _tw_draw_topview(self, st, meta):
+        """简单俯视：投影到 x-y，按层分色。"""
+        try:
+            from pymatgen.core import Structure  # noqa: F401
+        except Exception:
+            messagebox.showerror(APP_NAME, "未安装 pymatgen，无法预览结构。")
+            return
+        self.ax_tw.clear()
+        # 取原子与层标签（site.properties.get("layer")）
+        xs0, ys0, xs1, ys1 = [], [], [], []
+        for site in st.sites:
+            x,y,z = site.coords
+            if site.properties.get("layer","bot") == "top":
+                xs1.append(x); ys1.append(y)
+            else:
+                xs0.append(x); ys0.append(y)
+        self.ax_tw.scatter(xs0, ys0, s=14, alpha=0.8, label="bottom")
+        self.ax_tw.scatter(xs1, ys1, s=14, alpha=0.6, label="top")
+        # 画边框（新晶格）
+        M = st.lattice.matrix
+        import numpy as _np
+        a = _np.array(M[0]); b = _np.array(M[1])
+        poly = _np.array([[0,0],[a[0],a[1]],[a[0]+b[0],a[1]+b[1]],[b[0],b[1]],[0,0]])
+        self.ax_tw.plot(poly[:,0], poly[:,1], linestyle="--", linewidth=1.0)
+        self.ax_tw.set_aspect("equal", adjustable="datalim")
+        self.ax_tw.grid(True, linestyle=":", linewidth=0.6)
+        self.ax_tw.legend()
+        tdeg = meta.get("theta_deg")
+        ux,uy = meta.get("ux"), meta.get("uy")
+        self.ax_tw.set_title(f"θ={tdeg:.3f}°, u=({ux:.3f},{uy:.3f}), atoms={len(st)}")
+        self.canvas_tw.draw_idle()
+
+    def _tw_build_structure(self, top_path: Path, bot_path: Path,
+                            theta_deg: float, ux: float, uy: float,
+                            vacuum: float, allow_strain: float,
+                            search_limit: int = 8):
+        """
+        构造扭转(θ) + 滑移(u_x,u_y) 的双层结构，并尽量用对角超胞近似共格。
+        返回 (Structure, meta)；如果找不到低应变解，抛出异常。
+        """
+        if not HAS_PYMATGEN or not HAS_NUMPY:
+            raise RuntimeError("需要 pymatgen + numpy")
+        from pymatgen.core import Structure, Lattice
+        import numpy as np
+
+        if not top_path.exists() or not bot_path.exists():
+            raise FileNotFoundError("POSCAR 路径不存在")
+
+        st_top = Structure.from_file(str(top_path))
+        st_bot = Structure.from_file(str(bot_path))
+
+        # 取 in-plane 基矢（假定 z 为法向；若用户 POSCAR 不是这样，应先在外部对齐）
+        A_bot = np.array(st_bot.lattice.matrix[:2, :2])  # (2,2)
+        A_top = np.array(st_top.lattice.matrix[:2, :2])  # (2,2)
+
+        # 绕 z 旋转上层 in-plane 基矢
+        th = np.deg2rad(theta_deg)
+        Rz = np.array([[np.cos(th), -np.sin(th)],
+                       [np.sin(th),  np.cos(th)]], dtype=float)
+        A_top_rot = Rz @ A_top  # (2,2)
+
+        # 穷举对角超胞 diag(n,m)（简单稳健），允许上层等比例微应变 s ∈ [1-ε,1+ε]
+        def diag(n, m):
+            return np.array([[n,0],[0,m]], dtype=int)
+
+        best = None
+        for n1 in range(1, search_limit+1):
+            for m1 in range(1, search_limit+1):
+                T = A_top_rot @ diag(n1, m1)  # 上层超胞 in-plane
+                for n2 in range(1, search_limit+1):
+                    for m2 in range(1, search_limit+1):
+                        B = A_bot @ diag(n2, m2)  # 下层超胞 in-plane
+                        # 允许 top 做等比例 s 以靠近 B
+                        # s* = argmin ||B - s*T||_F
+                        s_star = float(np.trace(T.T @ B) / np.trace(T.T @ T))
+                        if not (1.0 - allow_strain <= s_star <= 1.0 + allow_strain):
+                            continue
+                        resid = np.linalg.norm(B - s_star*T, ord="fro") / max(1.0, np.linalg.norm(B, ord="fro"))
+                        area = abs(np.linalg.det(B))
+                        atom_est = len(st_top) * (n1*m1) + len(st_bot) * (n2*m2)
+                        key = (resid, area, atom_est)
+                        cand = dict(n1=n1, m1=m1, n2=n2, m2=m2, s=s_star, resid=resid, area=area, atoms=atom_est)
+                        if best is None or key < (best["resid"], best["area"], best["atoms"]):
+                            best = cand
+
+        if best is None:
+            raise RuntimeError("在给定容许应变与搜索限内未找到可接受的对角超胞匹配。")
+        # 过大则提示用户
+        if best["atoms"] > 2000:
+            raise RuntimeError(f"匹配到的超胞过大（≈{best['atoms']} 原子），请放宽步长或减小 search_limit。")
+
+        # 构造下层超胞
+        S_bot = np.eye(3, dtype=int)
+        S_bot[0,0] = best["n2"]; S_bot[1,1] = best["m2"]
+        bot_sc = st_bot.copy()
+        bot_sc.make_supercell(S_bot)
+
+        # 构造上层超胞 + 旋转 + 等比例变形
+        S_top = np.eye(3, dtype=int)
+        S_top[0,0] = best["n1"]; S_top[1,1] = best["m1"]
+        top_sc = st_top.copy()
+        top_sc.make_supercell(S_top)
+
+        # 先设一个临时晶格做笛卡尔变换
+        # 上层：旋转 + in-plane 等比例 s
+        s = float(best["s"])
+        # 取上层原笛卡尔 → 应用 Rz 与 s
+        t_cart = np.array([site.coords for site in top_sc.sites])  # (Nt,3)
+        t_cart[:,:2] = (Rz @ t_cart[:,:2].T).T * s
+
+        # 最终公共 in-plane 晶格使用 B（下层超胞矩阵 B）
+        B = A_bot @ np.array([[best["n2"],0],[0,best["m2"]]], dtype=int)
+        # 组 3×3 晶格矩阵：c 轴重置为目标真空
+        c_len = float(vacuum)
+        L_final = np.array([[B[0,0], B[0,1], 0.0],
+                            [B[1,0], B[1,1], 0.0],
+                            [0.0,    0.0,    c_len]], dtype=float)
+
+        # 把上下层点坐标映射到最终晶格分数坐标
+        def cart_to_frac(L, r):
+            return np.linalg.solve(L.T, r.T).T  # (N,3)
+
+        b_cart = np.array([site.coords for site in bot_sc.sites])
+        # 先把下层坐标重映射到以 B 为 in-plane 的晶格（原 in-plane 已经是 A_bot*n2,m2；z 保持）
+        # bot_sc 现有晶格：
+        # 先把它的 frac → cart（已是 cart），我们只需要映射到 L_final 的 frac：
+        b_frac_final = cart_to_frac(L_final, b_cart)
+        t_frac_final = cart_to_frac(L_final, t_cart)
+
+        # 施加滑移（分数坐标，沿 a1,a2）
+        t_frac_final[:,0] = (t_frac_final[:,0] + ux) % 1.0
+        t_frac_final[:,1] = (t_frac_final[:,1] + uy) % 1.0
+
+        # 分层放置在 z（0.4 与 0.6）
+        b_frac_final[:,2] = 0.40
+        t_frac_final[:,2] = 0.60
+
+        # 合并为一个 Structure
+        species = []
+        frac = []
+        props = []
+        for site, f in zip(bot_sc.sites, b_frac_final):
+            species.append(site.species)
+            frac.append(f.tolist())
+            props.append({"layer":"bot"})
+        for site, f in zip(top_sc.sites, t_frac_final):
+            species.append(site.species)
+            frac.append(f.tolist())
+            props.append({"layer":"top"})
+
+        st_final = Structure(Lattice(L_final), species, frac, site_properties=props)
+
+        meta = dict(theta_deg=float(theta_deg), ux=float(ux), uy=float(uy),
+                    atoms=len(st_final), n1=best["n1"], m1=best["m1"],
+                    n2=best["n2"], m2=best["m2"], strain_scale=s,
+                    resid=best["resid"])
+        return st_final, meta
+    # === CODEX END: twist/shift geometry core ===
+
+    # === CODEX BEGIN: generate twist/shift tasks ===
+    def _tw_generate(self, single: bool):
+        """生成单例或批量遍历任务目录与 POSCAR/INCAR。"""
+        try:
+            theta_a = float(self.tw_theta_a.get())
+            theta_b = float(self.tw_theta_b.get())
+            theta_step = float(self.tw_theta_step.get())
+            vacuum = float(self.tw_vacuum.get())
+            allow_strain = float(self.tw_allow_strain.get())/100.0
+            kspacing = float(self.tw_kspacing.get())
+            ux_steps = int(self.tw_ux_steps.get())
+            uy_steps = int(self.tw_uy_steps.get())
+            max_tasks = int(self.tw_max_tasks.get())
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"参数错误：{e}")
+            return
+
+        top_p = Path(self.tw_top_path.get()); bot_p = Path(self.tw_bot_path.get())
+        if not top_p.exists() or not bot_p.exists():
+            messagebox.showwarning(APP_NAME, "请先选择上/下层 POSCAR")
+            return
+
+        # 任务组合
+        thetas = [theta_a] if single else self._tw_linspace(theta_a, theta_b, step=theta_step)
+        uxs = [0.0] if single else [i/ux_steps for i in range(ux_steps)]
+        uys = [0.0] if single else [j/uy_steps for j in range(uy_steps)]
+        combos = [(th, ux, uy) for th in thetas for ux in uxs for uy in uys]
+
+        if len(combos) > max_tasks:
+            messagebox.showwarning(APP_NAME, f"任务数 {len(combos)} > 上限 {max_tasks}，请降低分辨率或步长")
+            return
+
+        proj = self.current_project_path()
+        root = proj / "twist_sweep"
+        root.mkdir(parents=True, exist_ok=True)
+
+        made = 0; skipped = 0
+        for th, ux, uy in combos:
+            name = f"theta_{th:+06.2f}_ux_{ux:0.3f}_uy_{uy:0.3f}".replace("+","")
+            w = root / name
+            w.mkdir(parents=True, exist_ok=True)
+            try:
+                st, meta = self._tw_build_structure(top_p, bot_p, th, ux, uy, vacuum, allow_strain, search_limit=8)
+            except Exception as e:
+                # 写个失败标记
+                write_text(w / "FAILED.txt", f"{e}\n")
+                skipped += 1
+                continue
+            # 写 POSCAR
+            try:
+                st.to(fmt="poscar", filename=str(w / "POSCAR"))
+            except Exception as e:
+                write_text(w / "FAILED.txt", f"写 POSCAR 失败: {e}\n")
+                skipped += 1
+                continue
+
+            # 准备 INCAR：从项目拷贝或用当前编辑器，补丁 2D 设置 + ISYM=0 + KSPACING
+            incar_src = proj / "INCAR"
+            if incar_src.exists():
+                incar_text = read_text(incar_src)
+            else:
+                incar_text = self.incar_text.get("1.0", tk.END)
+
+            patch = {
+                "ISYM": "0",
+                "KSPACING": f"{kspacing}",
+                "LWAVE": ".FALSE.",
+                "LCHARG": ".TRUE.",
+            }
+            # 2D 建议：去极化/偶极修正
+            more2d = {"LDIPOL": ".TRUE.", "IDIPOL": "3"}
+            patch.update(more2d)
+
+            incar_new = self._update_incar_text(incar_text, patch)
+            write_text(w / "INCAR", incar_new)
+
+            # KPOINTS：建议不写（让 KSPACING 生效）。若用户执意存在 KPOINTS，可忽略或提示
+            # POTCAR：若项目下已有则复制
+            pot = proj / "POTCAR"
+            if pot.exists():
+                try:
+                    shutil.copyfile(pot, w / "POTCAR")
+                except Exception:
+                    pass
+
+            # 记录元数据
+            meta_path = w / "meta.json"
+            meta2 = dict(meta); meta2.update(dict(path=str(w)))
+            (w / "meta.json").write_text(json.dumps(meta2, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            made += 1
+
+            # 可选：自动运行（实验性，依赖你的 run_local.sh 逻辑）
+            if self.tw_autorun.get():
+                # 简化：在该子目录下直接调用项目的 run_local.sh（需要 vasp 命令可用）
+                try:
+                    # 复制 run 脚本
+                    for script in ("run_local.sh","run_slurm.sh"):
+                        if (proj / script).exists():
+                            shutil.copyfile(proj / script, w / script)
+                            os.chmod(w / script, 0o755)
+                    # 后台起本地
+                    if (w / "run_local.sh").exists():
+                        subprocess.Popen(["bash","-lc", f"cd '{w}' && ./run_local.sh"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                except Exception:
+                    pass
+
+        messagebox.showinfo(APP_NAME, f"生成完成：成功 {made}，跳过 {skipped}（详见各子目录）。输出根目录：{root}")
+        # 刷新概览
+        self.refresh_project_overview()
+
+    def _tw_linspace(self, a: float, b: float, step: float) -> list:
+        if step <= 0: return [a]
+        out = []
+        x = a
+        if b >= a:
+            while x <= b + 1e-9:
+                out.append(round(x, 10)); x += step
+        else:
+            while x >= b - 1e-9:
+                out.append(round(x, 10)); x -= step
+        # 防止小数误差重复
+        return sorted(list(dict.fromkeys(out)))
+    # === CODEX END: generate twist/shift tasks ===
+
+    # === CODEX BEGIN: collect sweep results ===
+    def _tw_collect_results(self):
+        """遍历 twist_sweep/* 子目录，收集 gap / total energy / 备注，导出 CSV。"""
+        root = self.current_project_path() / "twist_sweep"
+        if not root.exists():
+            messagebox.showwarning(APP_NAME, "未找到 twist_sweep 目录。")
+            return
+        rows = []
+        for sub in sorted(root.iterdir()):
+            if not sub.is_dir(): continue
+            theta = ux = uy = None
+            try:
+                # 从目录名回读参数
+                m = re.search(r"theta_([0-9.]+)_ux_([0-9.]+)_uy_([0-9.]+)", sub.name)
+                if m:
+                    theta = float(m.group(1))
+                    ux = float(m.group(2))
+                    uy = float(m.group(3))
+            except Exception:
+                pass
+
+            note = ""
+            failf = sub / "FAILED.txt"
+            if failf.exists():
+                note = ("FAILED: " + read_text(failf).strip().splitlines()[0][:120])
+
+            gap_eV = None
+            totalE = None
+            # 1) vasprun.xml
+            vxml = sub / "vasprun.xml"
+            if vxml.exists():
+                try:
+                    from pymatgen.io.vasp.outputs import Vasprun
+                    v = Vasprun(str(vxml), parse_eigen=True, parse_projected_eigen=False)
+                    bg = v.get_band_structure().get_band_gap()
+                    gap_eV = float(bg.get("energy")) if bg else None
+                    # 尝试总能
+                    totalE = float(v.final_energy) if v.final_energy is not None else None
+                except Exception as e:
+                    if not note: note = f"vasprun parse err: {e}"
+            # 2) EIGENVAL 兜底
+            if gap_eV is None:
+                gap_est, _ = self._tw_gap_from_eigenval(sub / "EIGENVAL", sub / "OUTCAR")
+                if gap_est is not None: gap_eV = gap_est
+            # 3) TOTEN 兜底
+            if totalE is None:
+                try:
+                    outcar = read_text(sub / "OUTCAR")
+                    mt = re.search(r"free\s+energy\s+TOTEN\s*=\s*([-\d.Ee+]+)", outcar, flags=re.I)
+                    if mt: totalE = float(mt.group(1))
+                except Exception:
+                    pass
+
+            rows.append(dict(path=sub.name, theta=theta, ux=ux, uy=uy, gap_eV=gap_eV, totalE=totalE, note=note))
+
+        # 写 CSV
+        csv_path = root / "results.csv"
+        with csv_path.open("w", encoding="utf-8") as f:
+            f.write("path,theta,ux,uy,gap_eV,totalE_eV,note\n")
+            for r in rows:
+                def _fmt(v):
+                    if v is None: return ""
+                    if isinstance(v, float): return f"{v:.6f}"
+                    return str(v)
+                f.write(",".join([r["path"], _fmt(r["theta"]), _fmt(r["ux"]), _fmt(r["uy"]), _fmt(r["gap_eV"]), _fmt(r["totalE"]), (r["note"] or "").replace(",",";")]) + "\n")
+
+        messagebox.showinfo(APP_NAME, f"已导出汇总：{csv_path}")
+
+    def _tw_gap_from_eigenval(self, eig_path: Path, outcar_path: Path):
+        """非常规兜底：从 EIGENVAL + OUTCAR(E_F) 粗略估算带隙。返回 (gap, is_direct?)；失败返回 (None,None)。"""
+        try:
+            if not eig_path.exists(): return (None, None)
+            ef = None
+            try:
+                txt = read_text(outcar_path)
+                m = re.search(r"(?mi)E-fermi\s*:\s*([-\d.Ee+]+)", txt)
+                if m: ef = float(m.group(1))
+            except Exception:
+                pass
+            lines = read_text(eig_path).splitlines()
+            # 第6行包含 NKPTS, NBANDS
+            nk, nb = map(int, lines[5].split()[:2])
+            i = 6
+            energies = []
+            occs = []
+            for _ in range(nk):
+                # 跳 k 行前的空行
+                while i < len(lines) and not lines[i].strip():
+                    i += 1
+                i += 1  # 跳 kx ky kz w
+                ks = []
+                os = []
+                for b in range(nb):
+                    parts = lines[i].split()
+                    e = float(parts[1])
+                    o = float(parts[2]) if len(parts) > 2 else 0.0
+                    ks.append(e); os.append(o); i += 1
+                energies.append(ks); occs.append(os)
+            # 估计 VBM/CBM（以占据 0.5 为界，若有 EF 则先减 EF）
+            if ef is not None:
+                energies = [[e-ef for e in ks] for ks in energies]
+            vbm = max(max(e for e,o in zip(ks,os) if o > 0.5) for ks,os in zip(energies,occs))
+            cbm = min(min(e for e,o in zip(ks,os) if o < 0.5) for ks,os in zip(energies,occs))
+            gap = max(0.0, cbm - vbm)
+            return (gap, None)
+        except Exception:
+            return (None, None)
+    # === CODEX END: collect sweep results ===
 
     # ------------------------- 页面：流程助手 ------------------------------
     def _build_workflow_page(self, parent):
