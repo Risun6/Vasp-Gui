@@ -42,6 +42,7 @@ import subprocess
 import hashlib
 import datetime as _dt
 import pickle
+import tempfile
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Literal, Callable
@@ -381,6 +382,111 @@ Gamma
 0 0 0
 """
 
+
+DEMO_DOS_ENERGIES = [round(-6.0 + 0.12 * i, 6) for i in range(101)]
+_demo_step = DEMO_DOS_ENERGIES[1] - DEMO_DOS_ENERGIES[0] if len(DEMO_DOS_ENERGIES) > 1 else 0.12
+DEMO_DOS_TOTAL: list[float] = []
+DEMO_DOS_INTEGRATED: list[float] = []
+DEMO_PDOS_CURVES: dict[str, list[float]] = {"Si-s": [], "Si-p": [], "Si-d": []}
+for e in DEMO_DOS_ENERGIES:
+    valence = math.exp(-((e + 1.45) / 0.55) ** 2)
+    conduction = math.exp(-((e - 1.65) / 0.60) ** 2)
+    mid = math.exp(-(e / 0.32) ** 2)
+    s_val = 0.75 * valence
+    p_val = 1.25 * valence + 0.35 * conduction
+    d_val = 0.6 * conduction
+    total = s_val + p_val + d_val + 0.02 * mid
+    DEMO_PDOS_CURVES["Si-s"].append(s_val)
+    DEMO_PDOS_CURVES["Si-p"].append(p_val)
+    DEMO_PDOS_CURVES["Si-d"].append(d_val)
+    DEMO_DOS_TOTAL.append(total)
+    DEMO_DOS_INTEGRATED.append((DEMO_DOS_INTEGRATED[-1] if DEMO_DOS_INTEGRATED else 0.0) + total * _demo_step)
+
+DEMO_PDOS_TOTAL = [
+    DEMO_PDOS_CURVES["Si-s"][i]
+    + DEMO_PDOS_CURVES["Si-p"][i]
+    + DEMO_PDOS_CURVES["Si-d"][i]
+    + 0.02 * math.exp(-(DEMO_DOS_ENERGIES[i] / 0.32) ** 2)
+    for i in range(len(DEMO_DOS_ENERGIES))
+]
+
+DEMO_BAND_KPOINTS = [
+    [0.0, 0.0, 0.0],
+    [0.5, 0.0, 0.0],
+    [1.0, 0.0, 0.0],
+    [1.0, 0.5, 0.0],
+    [1.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0],
+]
+DEMO_BAND_LABELS = ["Γ", "", "X", "", "M", "Γ"]
+DEMO_BAND_VALUES = [
+    [-2.40, -0.65, 0.95, 2.70],
+    [-2.32, -0.52, 0.90, 2.62],
+    [-2.20, -0.40, 0.88, 2.55],
+    [-2.18, -0.28, 0.96, 2.60],
+    [-2.26, -0.48, 1.05, 2.72],
+    [-2.40, -0.65, 1.12, 2.88],
+]
+DEMO_BAND_OCCS = [[1.0, 1.0, 0.0, 0.0] for _ in DEMO_BAND_VALUES]
+DEMO_BAND_DISTANCES = [0.0, 0.52, 1.04, 1.63, 2.34, 3.05]
+
+DEMO_PLANAR_Z = [round(0.4 * i, 6) for i in range(60)]
+DEMO_PLANAR_VALUES = [0.25 * math.sin(0.35 * i) + 0.06 * math.cos(0.7 * i) for i in range(len(DEMO_PLANAR_Z))]
+
+DEMO_POSTPROCS: dict[str, dict[str, Any]] = {
+    "dos": {
+        "energies": DEMO_DOS_ENERGIES,
+        "dos": DEMO_DOS_TOTAL,
+        "integrated": DEMO_DOS_INTEGRATED,
+        "fermi": 0.0,
+    },
+    "pdos": {
+        "energies": DEMO_DOS_ENERGIES,
+        "total": DEMO_PDOS_TOTAL,
+        "curves": DEMO_PDOS_CURVES,
+        "fermi": 0.0,
+        "gap": 1.35,
+    },
+    "bands": {
+        "bands": DEMO_BAND_VALUES,
+        "occupancies": DEMO_BAND_OCCS,
+        "kpoints": DEMO_BAND_KPOINTS,
+        "fermi": 0.0,
+        "distances": DEMO_BAND_DISTANCES,
+    },
+    "bands_lbl": {
+        "bands": DEMO_BAND_VALUES,
+        "occupancies": DEMO_BAND_OCCS,
+        "kpoints": DEMO_BAND_KPOINTS,
+        "labels": DEMO_BAND_LABELS,
+        "fermi": 0.0,
+        "distances": DEMO_BAND_DISTANCES,
+    },
+    "emass": {
+        "bands": DEMO_BAND_VALUES,
+        "occupancies": DEMO_BAND_OCCS,
+        "distances": DEMO_BAND_DISTANCES,
+        "fermi": 0.0,
+        "me_star": 0.28,
+        "mh_star": 0.46,
+    },
+    "pot_z": {
+        "z": DEMO_PLANAR_Z,
+        "values": DEMO_PLANAR_VALUES,
+    },
+}
+
+DEMO_PROJECT_FILES = {
+    "INCAR": EXAMPLE_SI_INCAR + "\n# 演示模式示例输入\n",
+    "POSCAR": EXAMPLE_SI_POSCAR,
+    "KPOINTS": """Si demo band path\n6\nLine-mode\nReciprocal\n0.0 0.0 0.0 ! Γ\n0.5 0.0 0.0 !\n1.0 0.0 0.0 ! X\n1.0 0.5 0.0 !\n1.0 1.0 0.0 ! M\n0.0 0.0 0.0 ! Γ\n""",
+    "README.txt": """演示模式项目\n================\n本目录由 VASP GUI 演示模式自动生成，包含内置的示例输入文件与\n占位的计算结果文件。运行后处理时将使用程序内置的数据生成图表，\n无需实际的 VASP 输出。""",
+    "vasprun.xml": "<!-- demo placeholder: 数据由内置样本提供 -->\n",
+    "EIGENVAL": "# demo placeholder\n",
+    "DOSCAR": "# demo placeholder\n",
+    "OUTCAR": "# demo placeholder\nE-fermi : 5.4000\n",
+    "LOCPOT": "# demo placeholder\n",
+}
 
 
 # ----------------------------- 工具函数区 ----------------------------------
@@ -742,20 +848,24 @@ def _estimate_gap_from_dos(energies: list[float], dos: list[float], threshold: f
 def proc_dos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     style = _normalize_style(opts.get("style"))
     threshold = float(opts.get("metal_threshold", 0.02))
-    cache_key = "dos_total"
-    files = [workdir / "vasprun.xml", workdir / "DOSCAR", workdir / "OUTCAR"]
+    demo_payload = opts.get("demo_payload")
+    if demo_payload:
+        data = demo_payload
+    else:
+        cache_key = "dos_total"
+        files = [workdir / "vasprun.xml", workdir / "DOSCAR", workdir / "OUTCAR"]
 
-    def _builder():
-        data = _parse_dos_vasprun(workdir)
-        if data is None:
-            data = _parse_dos_doscar(workdir)
-        if data is None:
-            raise FileNotFoundError("缺少 DOS 数据文件 (vasprun.xml/DOSCAR)")
-        return data
+        def _builder():
+            data = _parse_dos_vasprun(workdir)
+            if data is None:
+                data = _parse_dos_doscar(workdir)
+            if data is None:
+                raise FileNotFoundError("缺少 DOS 数据文件 (vasprun.xml/DOSCAR)")
+            return data
 
-    data = _load_cached(workdir, cache_key, files, _builder)
-    if data is None:
-        raise RuntimeError("无法解析 DOS 数据。")
+        data = _load_cached(workdir, cache_key, files, _builder)
+        if data is None:
+            raise RuntimeError("无法解析 DOS 数据。")
 
     energies = data.get("energies", [])
     dos = data.get("dos", [])
@@ -884,34 +994,58 @@ def _estimate_gap_from_bands(bands: list[list[float]], occs: list[list[float]], 
 def proc_bands(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     style = _normalize_style(opts.get("style"))
     threshold = float(opts.get("metal_threshold", 0.02))
-    cache_key = "bands"
-    files = [workdir / "vasprun.xml", workdir / "EIGENVAL", workdir / "OUTCAR"]
-
-    def _builder():
-        data = _parse_dos_vasprun(workdir)
-        if data and data.get("energies"):
-            # vasprun already parsed for dos; but band requires dedicated parse
-            pass
-        bands_data = _parse_eigenval(workdir)
-        if bands_data is None:
-            raise FileNotFoundError("缺少能带数据 (vasprun.xml/EIGENVAL)")
-        return bands_data
-
-    data = _load_cached(workdir, cache_key, files, _builder)
+    demo_payload = opts.get("demo_payload") if isinstance(opts.get("demo_payload"), dict) else None
+    data: dict[str, Any] | None = None
+    fermi_hint: float | None = None
+    distance_hint: list[float] = []
+    if isinstance(demo_payload, dict):
+        data = demo_payload
+        try:
+            fermi_hint = float(demo_payload.get("fermi"))
+        except Exception:
+            fermi_hint = None
+        dist_val = demo_payload.get("distances")
+        if isinstance(dist_val, (list, tuple)):
+            try:
+                distance_hint = [float(x) for x in dist_val]
+            except Exception:
+                distance_hint = []
     if data is None:
-        raise RuntimeError("无法解析能带数据。")
+        cache_key = "bands"
+        files = [workdir / "vasprun.xml", workdir / "EIGENVAL", workdir / "OUTCAR"]
+
+        def _builder():
+            data = _parse_dos_vasprun(workdir)
+            if data and data.get("energies"):
+                # vasprun already parsed for dos; but band requires dedicated parse
+                pass
+            bands_data = _parse_eigenval(workdir)
+            if bands_data is None:
+                raise FileNotFoundError("缺少能带数据 (vasprun.xml/EIGENVAL)")
+            return bands_data
+
+        data = _load_cached(workdir, cache_key, files, _builder)
+        if data is None:
+            raise RuntimeError("无法解析能带数据。")
+
     raw_bands = _clone_2d_table(data.get("bands"))
     if not raw_bands:
         raise RuntimeError("未能在 vasprun.xml/EIGENVAL 中解析到能带数据，请确认已完成能带计算。")
     occs = _clone_2d_table(data.get("occupancies"))
     coords = _extract_kcoords(data.get("kpoints"))
+
+    if not coords and isinstance(demo_payload, dict):
+        coords = _extract_kcoords(demo_payload.get("kpoints"))
     if not coords:
         kp_file, _ = _read_kpoints_linemode(workdir / "KPOINTS")
         coords = _extract_kcoords(kp_file)
     bands, occs, coords = _align_band_lengths(raw_bands, occs, coords)
     coords, bands, occs, trimmed = _trim_periodic_path(coords, bands, occs)
 
-    fermi = _parse_fermi_from_outcar(workdir)
+
+    fermi = fermi_hint
+    if fermi is None:
+        fermi = _parse_fermi_from_outcar(workdir)
     if fermi is None and bands:
         flat = [e for energies in bands for e in energies]
         fermi = sum(flat) / len(flat)
@@ -919,7 +1053,8 @@ def proc_bands(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     gap, nature, vbm, cbm = _estimate_gap_from_bands(bands, occs or [], fermi)
 
     rel_bands = [[e - fermi for e in row] for row in bands]
-    positions = _compute_kpath_positions(coords)
+
+    positions = distance_hint or _compute_kpath_positions(coords)
     if not positions:
         positions = list(range(len(rel_bands)))
     if len(positions) != len(rel_bands):
@@ -1010,48 +1145,70 @@ def proc_pdos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
 
     report_dir, figs_dir, tables_dir = _ensure_report_dirs(workdir, opts)
 
-    if not HAS_PYMATGEN:
-        raise RuntimeError("需要 pymatgen 才能生成 PDOS，请安装 pymatgen。")
+    demo_payload = opts.get("demo_payload") if isinstance(opts.get("demo_payload"), dict) else None
 
-    from pymatgen.io.vasp.outputs import Vasprun  # type: ignore
-
-    vxml = workdir / "vasprun.xml"
-    if not vxml.exists():
-        raise FileNotFoundError("未找到 vasprun.xml，无法生成投影态密度。")
-
-    vasprun = Vasprun(str(vxml), parse_dos=True, parse_projected_dos=True)
-    cdos = vasprun.complete_dos
-    efermi = float(cdos.efermi)
-    energies = [float(e) - efermi for e in cdos.energies]
-
-    curves: dict[str, list[float]] = {}
-    total = [float(x) for x in cdos.densities["total"]]
-
-    if group == "element":
-        for el, edos in cdos.get_element_dos().items():
-            name = str(el)
-            if want_elems and name not in want_elems:
-                continue
-            curves[name] = [float(x) for x in edos.densities["total"]]
-    elif group == "orbital":
-        for spd, odos in cdos.get_spd_dos().items():
-            key = str(spd).lower()
-            if want_orbs and key not in want_orbs:
-                continue
-            curves[key] = [float(x) for x in odos.densities["total"]]
-    elif group == "site":
-        structure = cdos.structure
-        for idx, site in enumerate(structure.sites[:8]):
-            sd = cdos.get_site_dos(site)
-            curves[f"site{idx+1}-{site.specie}"] = [float(x) for x in sd.densities["total"]]
+    if demo_payload:
+        energies = [float(e) for e in demo_payload.get("energies", [])]
+        total = [float(v) for v in demo_payload.get("total", [])]
+        raw_curves = demo_payload.get("curves") or {}
+        curves = {str(k): [float(x) for x in v] for k, v in raw_curves.items()}
+        try:
+            efermi = float(demo_payload.get("fermi", 0.0))
+        except Exception:
+            efermi = 0.0
+        gap_val = float(demo_payload.get("gap", 0.0))
+        notes = ["演示模式示例 PDOS：数据来源于内置样本。"]
     else:
-        raise ValueError("PDOS 分组仅支持 element/orbital/site。")
+        if not HAS_PYMATGEN:
+            raise RuntimeError("需要 pymatgen 才能生成 PDOS，请安装 pymatgen。")
 
-    try:
-        gap_info = vasprun.get_band_structure().get_band_gap()
-        gap_val = float(gap_info.get("energy", 0.0)) if gap_info else 0.0
-    except Exception:
-        gap_val = 0.0
+        from pymatgen.io.vasp.outputs import Vasprun  # type: ignore
+
+        vxml = workdir / "vasprun.xml"
+        if not vxml.exists():
+            raise FileNotFoundError("未找到 vasprun.xml，无法生成投影态密度。")
+
+        vasprun = Vasprun(str(vxml), parse_dos=True, parse_projected_dos=True)
+        cdos = vasprun.complete_dos
+        efermi = float(cdos.efermi)
+        energies = [float(e) - efermi for e in cdos.energies]
+
+        curves: dict[str, list[float]] = {}
+        total = [float(x) for x in cdos.densities["total"]]
+
+        if group == "element":
+            wanted = {str(el) for el in want_elems} if want_elems else None
+            for el, edos in cdos.get_element_dos().items():
+                name = str(el)
+                if wanted and name not in wanted:
+                    continue
+                curves[name] = [float(x) for x in edos.densities["total"]]
+        elif group == "orbital":
+            for spd, odos in cdos.get_spd_dos().items():
+                key = str(spd).lower()
+                if want_orbs and key not in want_orbs:
+                    continue
+                curves[key] = [float(x) for x in odos.densities["total"]]
+        elif group == "site":
+            structure = cdos.structure
+            for idx, site in enumerate(structure.sites[:8]):
+                sd = cdos.get_site_dos(site)
+                curves[f"site{idx+1}-{site.specie}"] = [float(x) for x in sd.densities["total"]]
+        else:
+            raise ValueError("PDOS 分组仅支持 element/orbital/site。")
+
+        try:
+            gap_info = vasprun.get_band_structure().get_band_gap()
+            gap_val = float(gap_info.get("energy", 0.0)) if gap_info else 0.0
+        except Exception:
+            gap_val = 0.0
+
+        if not curves:
+            raise RuntimeError("未在 vasprun.xml 中找到投影 DOS，请确认 INCAR 设置 LORBIT=11/12 并保留投影数据。")
+
+        notes = [
+            "PDOS 由 vasprun.xml 投影得到；如需更细分的投影，请在 INCAR 设置 LORBIT=11/12 并确保写出投影数据。",
+        ]
 
     if not curves:
         raise RuntimeError("未在 vasprun.xml 中找到投影 DOS，请确认 INCAR 设置 LORBIT=11/12 并保留投影数据。")
@@ -1083,11 +1240,7 @@ def proc_pdos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
                 row.append(f"{val:.6f}")
             fh.write(",".join(row) + "\n")
 
-    notes = [
-        "PDOS 由 vasprun.xml 投影得到；如需更细分的投影，请在 INCAR 设置 LORBIT=11/12 并确保写出投影数据。",
-    ]
-
-    metrics = {"E_F": efermi, "gap": float(gap_val)}
+    metrics = {"E_F": float(efermi), "gap": float(gap_val)}
     return PostResult(metrics=metrics, figs={"pdos": fig_path}, tables={"pdos": csv_path}, notes=notes)
 
 
@@ -1123,9 +1276,15 @@ def proc_bands_labeled(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     style = _normalize_style(opts.get("style"))
     report_dir, figs_dir, tables_dir = _ensure_report_dirs(workdir, opts)
 
-    kpts, labels = _read_kpoints_linemode(workdir / "KPOINTS")
+    demo_payload = opts.get("demo_payload") if isinstance(opts.get("demo_payload"), dict) else None
+    if demo_payload:
+        kpts = _extract_kcoords(demo_payload.get("kpoints"))
+        raw_labels = demo_payload.get("labels")
+        labels = [str(lbl) for lbl in raw_labels] if isinstance(raw_labels, (list, tuple)) else []
+    else:
+        kpts, labels = _read_kpoints_linemode(workdir / "KPOINTS")
 
-    if HAS_PYMATGEN and (workdir / "vasprun.xml").exists():
+    if demo_payload is None and HAS_PYMATGEN and (workdir / "vasprun.xml").exists():
         from pymatgen.io.vasp.outputs import BSVasprun  # type: ignore
 
         bsrun = BSVasprun(str(workdir / "vasprun.xml"), parse_projected_eigen=False)
@@ -1180,9 +1339,22 @@ def proc_bands_labeled(workdir: Path, opts: Dict[str, Any]) -> PostResult:
         notes = ["x 轴依据高对称路径距离，刻度为自动识别的高对称点。"]
         return PostResult(metrics=metrics, figs={"bands_labeled": fig_path}, tables={"bands_labeled": csv_path}, notes=notes)
 
-    data = _parse_eigenval(workdir)
-    if data is None:
-        raise FileNotFoundError("缺少能带数据 (vasprun.xml 或 EIGENVAL)，请先完成能带计算。")
+
+    distance_hint: list[float] = []
+    if isinstance(demo_payload, dict):
+        dist_val = demo_payload.get("distances")
+        if isinstance(dist_val, (list, tuple)):
+            try:
+                distance_hint = [float(x) for x in dist_val]
+            except Exception:
+                distance_hint = []
+
+    if demo_payload:
+        data = demo_payload
+    else:
+        data = _parse_eigenval(workdir)
+        if data is None:
+            raise FileNotFoundError("缺少能带数据 (vasprun.xml 或 EIGENVAL)，请先完成能带计算。")
 
     raw_bands = _clone_2d_table(data.get("bands"))
     if not raw_bands:
@@ -1194,7 +1366,14 @@ def proc_bands_labeled(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     if labels:
         labels = labels[: len(coords) if coords else len(bands)]
 
-    fermi = _parse_fermi_from_outcar(workdir)
+    fermi = None
+    if isinstance(demo_payload, dict):
+        try:
+            fermi = float(demo_payload.get("fermi"))
+        except Exception:
+            fermi = None
+    if fermi is None:
+        fermi = _parse_fermi_from_outcar(workdir)
     if fermi is None:
         flat = [e for row in bands for e in row]
         fermi = sum(flat) / len(flat) if flat else 0.0
@@ -1211,7 +1390,8 @@ def proc_bands_labeled(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     if recip is None:
         recip = _fallback_reciprocal_from_poscar(workdir / "POSCAR")
 
-    distances = _compute_kpath_positions(coords, recip)
+
+    distances = distance_hint or _compute_kpath_positions(coords, recip)
     if not distances:
         distances = list(range(len(bands)))
     if len(distances) != len(bands):
@@ -1293,14 +1473,79 @@ register_postproc(PostProc(name="bands_lbl", needs=["vasprun.xml|EIGENVAL"], run
 
 
 def proc_effective_mass(workdir: Path, opts: Dict[str, Any]) -> PostResult:
+    style = _normalize_style(opts.get("style"))
+    window = max(int(opts.get("window_k", 4)), 2)
+    report_dir, figs_dir, tables_dir = _ensure_report_dirs(workdir, opts)
+    demo_payload = opts.get("demo_payload") if isinstance(opts.get("demo_payload"), dict) else None
+
+    if demo_payload:
+        bands = demo_payload.get("bands") or []
+        occs = demo_payload.get("occupancies") or []
+        try:
+            fermi = float(demo_payload.get("fermi", 0.0))
+        except Exception:
+            fermi = 0.0
+        rel = [[float(e) - fermi for e in row] for row in bands]
+        distances = demo_payload.get("distances") or []
+        if distances:
+            try:
+                distances = [float(x) for x in distances]
+            except Exception:
+                distances = []
+        if not distances and rel and rel[0]:
+            distances = list(range(len(rel[0])))
+        if not rel or not distances:
+            raise RuntimeError("演示数据缺少能带或路径信息，无法估算有效质量。")
+
+        nb = len(rel)
+        nk = len(rel[0])
+        v_idx = (0, 0)
+        c_idx = (0, 0)
+        vbm_E = -1e9
+        cbm_E = 1e9
+        for b in range(nb):
+            for k in range(nk):
+                energy = rel[b][k]
+                occupied = occs[b][k] if b < len(occs) and k < len(occs[b]) else (1.0 if energy < 0 else 0.0)
+                if occupied > 0.5 and energy > vbm_E:
+                    vbm_E = energy
+                    v_idx = (b, k)
+                if occupied < 0.5 and energy < cbm_E:
+                    cbm_E = energy
+                    c_idx = (b, k)
+
+        me_star = float(demo_payload.get("me_star", 0.0))
+        mh_star = float(demo_payload.get("mh_star", 0.0))
+
+        fig = Figure(figsize=(5.2, 3.4))
+        ax = fig.add_subplot(111)
+        for row in rel:
+            ax.plot(distances, row, lw=0.7, alpha=0.6)
+        if distances:
+            ax.scatter([distances[v_idx[1]]], [rel[v_idx[0]][v_idx[1]]], s=28, label=f"VBM m*_h≈{mh_star:.2f} m_e")
+            ax.scatter([distances[c_idx[1]]], [rel[c_idx[0]][c_idx[1]]], s=28, label=f"CBM m*_e≈{me_star:.2f} m_e")
+        ax.axhline(0.0, lw=1.0, ls="--")
+        ax.set_ylabel("E - E$_F$ (eV)")
+        apply_style(ax, style)
+        ax.legend(fontsize=9, frameon=False)
+        fig.tight_layout()
+        fig_path = figs_dir / "effective_mass.png"
+        fig.savefig(fig_path, dpi=POST_FIG_DPI)
+
+        csv_path = tables_dir / "effective_mass.csv"
+        with csv_path.open("w", encoding="utf-8") as fh:
+            fh.write("edge,band_index,k_index,m*/m_e\n")
+            fh.write(f"VBM,{v_idx[0]},{v_idx[1]},{mh_star:.6f}\n")
+            fh.write(f"CBM,{c_idx[0]},{c_idx[1]},{me_star:.6f}\n")
+
+        notes = ["演示模式示例有效质量，数值基于内置数据。"]
+        metrics = {"mh*": float(mh_star), "me*": float(me_star)}
+        return PostResult(metrics=metrics, figs={"effective_mass": fig_path}, tables={"effective_mass": csv_path}, notes=notes)
+
     if not HAS_NUMPY:
         raise RuntimeError("需要 numpy 才能估算有效质量，请安装 numpy。")
 
     import numpy as _np
-
-    style = _normalize_style(opts.get("style"))
-    window = max(int(opts.get("window_k", 4)), 2)
-    report_dir, figs_dir, tables_dir = _ensure_report_dirs(workdir, opts)
 
     if HAS_PYMATGEN and (workdir / "vasprun.xml").exists():
         from pymatgen.io.vasp.outputs import BSVasprun  # type: ignore
@@ -1483,22 +1728,31 @@ def _parse_locpot_planar_z(locpot: Path) -> Optional[tuple[list[float], list[flo
 
 
 def proc_planar_potential(workdir: Path, opts: Dict[str, Any]) -> PostResult:
-    if not HAS_NUMPY:
-        raise RuntimeError("需要 numpy 才能解析平面平均势，请安装 numpy。")
 
     style = _normalize_style(opts.get("style"))
     report_dir, figs_dir, tables_dir = _ensure_report_dirs(workdir, opts)
-    locpot = workdir / "LOCPOT"
-    if not locpot.exists():
-        raise FileNotFoundError("未找到 LOCPOT，请在计算中输出局域势。")
+    demo_payload = opts.get("demo_payload") if isinstance(opts.get("demo_payload"), dict) else None
 
-    data = _parse_locpot_planar_z(locpot)
-    if not data:
-        raise RuntimeError("解析 LOCPOT 失败或数据不完整，请确认计算输出了 LOCPOT/CHGCAR 并保持文件完整。")
-    z, values = data
+    if demo_payload:
+        z = [float(v) for v in demo_payload.get("z", [])]
+        values = [float(v) for v in demo_payload.get("values", [])]
+        if not z or not values:
+            raise RuntimeError("演示数据缺少平面势信息，无法绘制。")
+    else:
+        if not HAS_NUMPY:
+            raise RuntimeError("需要 numpy 才能解析平面平均势，请安装 numpy。")
 
-    if not values:
-        raise RuntimeError("LOCPOT 中未获得平面平均势数据，请检查 LOCPOT 是否写全。")
+
+        locpot = workdir / "LOCPOT"
+        if not locpot.exists():
+            raise FileNotFoundError("未找到 LOCPOT，请在计算中输出局域势。")
+
+        data = _parse_locpot_planar_z(locpot)
+        if not data:
+            raise RuntimeError("解析 LOCPOT 失败或数据不完整，请确认计算输出了 LOCPOT/CHGCAR 并保持文件完整。")
+        z, values = data
+        if not values:
+            raise RuntimeError("LOCPOT 中未获得平面平均势数据，请检查 LOCPOT 是否写全。")
 
     baseline = values[0]
     rel = [v - baseline for v in values]
@@ -1520,9 +1774,12 @@ def proc_planar_potential(workdir: Path, opts: Dict[str, Any]) -> PostResult:
             fh.write(f"{zi:.6f},{val:.6f}\n")
 
     metrics = {"V_peak": float(max(rel, default=0.0)), "V_min": float(min(rel, default=0.0))}
-    notes = [
-        "平面平均势反映沿 z 的势垒分布，可结合滑动平均进一步分析界面偶极。",
-    ]
+    if demo_payload:
+        notes = ["演示模式示例平面平均势，展示界面势垒轮廓。"]
+    else:
+        notes = [
+            "平面平均势反映沿 z 的势垒分布，可结合滑动平均进一步分析界面偶极。",
+        ]
     return PostResult(metrics=metrics, figs={"planar_potential": fig_path}, tables={"planar_potential": csv_path}, notes=notes)
 
 
@@ -1868,6 +2125,9 @@ class VaspGUI(tk.Tk):
         self.run_status_var = tk.StringVar(value="⚪ 未检测")
         self.figure_style_var = tk.StringVar(value="AFM")
         self.emit_report_var = tk.BooleanVar(value=True)
+        self.demo_mode = False
+        self.demo_project_dir: Path | None = None
+        self._pre_demo_project: Path | None = None
         self.run_suggestion_widgets: list[tk.Text] = []
         self.post_results: dict[str, PostResult] = {}
         self.post_latest_reports: dict[str, Path] = {}
@@ -1908,6 +2168,8 @@ class VaspGUI(tk.Tk):
         ttk.Button(toolbar, text="新建项目", command=self.create_project).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="首次向导", command=self.launch_first_time_wizard).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="创建示例项目", command=self.on_create_example_project).pack(side=tk.LEFT, padx=4)
+        self.demo_mode_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(toolbar, text="演示模式", variable=self.demo_mode_var, command=self.toggle_demo_mode).pack(side=tk.LEFT, padx=6)
 
         # Notebook
         self.nb = ttk.Notebook(self)
@@ -1935,6 +2197,62 @@ class VaspGUI(tk.Tk):
         # === CODEX END: add twist/shift tab ===
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def toggle_demo_mode(self):
+        if self.demo_mode_var.get():
+            self._activate_demo_mode()
+        else:
+            self._deactivate_demo_mode()
+
+    def _activate_demo_mode(self):
+        if self.demo_mode:
+            return
+        self._pre_demo_project = self.current_project_path()
+        try:
+            demo_dir = self._prepare_demo_project()
+        except Exception as exc:
+            self.demo_mode_var.set(False)
+            messagebox.showerror(APP_NAME, f"演示模式初始化失败：{exc}")
+            return
+        self.demo_mode = True
+        self.demo_project_dir = demo_dir
+        self.demo_mode_var.set(True)
+        self.set_project(demo_dir)
+        self.apply_run_status("🧪 演示模式", ["已加载内置示例数据，可直接体验全部后处理功能。"])
+
+    def _deactivate_demo_mode(self):
+        if not self.demo_mode:
+            return
+        prev = self._pre_demo_project or Path.cwd()
+        self.demo_mode = False
+        self.demo_mode_var.set(False)
+        self._pre_demo_project = None
+        try:
+            self.set_project(prev)
+        finally:
+            self._cleanup_demo_project()
+        self.refresh_run_status()
+
+    def _prepare_demo_project(self) -> Path:
+        self._cleanup_demo_project()
+        demo_root = Path(tempfile.mkdtemp(prefix="vasp_gui_demo_"))
+        self._ensure_project_scaffold(demo_root)
+        for name, content in DEMO_PROJECT_FILES.items():
+            try:
+                write_text(demo_root / name, content)
+            except Exception:
+                pass
+        (demo_root / "reports").mkdir(parents=True, exist_ok=True)
+        return demo_root
+
+    def _cleanup_demo_project(self):
+        demo_dir = self.demo_project_dir
+        if demo_dir and demo_dir.exists():
+            try:
+                shutil.rmtree(demo_dir)
+            except Exception:
+                pass
+        self.demo_project_dir = None
 
     # ------------------------- 页面：输入文件 -----------------------------
     def _build_inputs_page(self, parent):
@@ -4424,18 +4742,6 @@ nice -n 5 ionice -c2 -n4 \
         """).strip()
         self._add_section_heading(left, "一键后处理 | 论文级出图/表", help_overview, title="后处理说明", pady=(0, 6))
 
-        row = ttk.Frame(left)
-        row.pack(fill=tk.X, pady=2)
-        ttk.Label(row, text="期刊风格").pack(side=tk.LEFT)
-        style_cb = ttk.Combobox(
-            row,
-            values=list(FIG_STYLES.keys()),
-            textvariable=self.figure_style_var,
-            width=10,
-            state="readonly",
-        )
-        style_cb.pack(side=tk.LEFT, padx=6)
-
         row2 = ttk.Frame(left)
         row2.pack(fill=tk.X, pady=2)
         ttk.Label(row2, text="金属性阈值 DOS(E_F) ≤").pack(side=tk.LEFT)
@@ -4539,6 +4845,7 @@ nice -n 5 ionice -c2 -n4 \
             if not proc:
                 messagebox.showwarning(APP_NAME, f"未知的后处理任务：{key}")
                 continue
+            has_demo_payload = self.demo_mode and key in DEMO_POSTPROCS
             missing: list[str] = []
             for need in proc.needs:
                 options = [n.strip() for n in need.split("|") if n.strip()]
@@ -4546,7 +4853,7 @@ nice -n 5 ionice -c2 -n4 \
                     continue
                 if not any((workdir / opt).exists() for opt in options):
                     missing.append(" 或 ".join(str(workdir / opt) for opt in options))
-            if missing:
+            if missing and not has_demo_payload:
                 messagebox.showwarning(APP_NAME, f"[{key}] 缺少必要文件：\n" + "\n".join(missing))
                 continue
             opts: Dict[str, Any] = {
@@ -4559,6 +4866,10 @@ nice -n 5 ionice -c2 -n4 \
                 opts.update({"group": self._pdos_group.get(), "energy_window": (-6, 6)})
             if key == "emass":
                 opts.update({"window_k": int(self._em_win.get())})
+            if self.demo_mode:
+                demo_payload = DEMO_POSTPROCS.get(key)
+                if demo_payload:
+                    opts["demo_payload"] = demo_payload
             queue.append((key, opts))
 
         if not queue:
@@ -4751,9 +5062,12 @@ nice -n 5 ionice -c2 -n4 \
         self.set_project(project_path)
 
     def save_config(self):
+        project_value = self.project_var.get()
+        if self.demo_mode and self._pre_demo_project is not None:
+            project_value = str(self._pre_demo_project)
         data = {
             "geometry": self.geometry(),
-            "project": self.project_var.get(),
+            "project": project_value,
             "pot_dir": self.pot_dir_var.get(),
             "run_mode": self.run_mode.get(),
             "vasp_cmd": self.vasp_cmd.get(),
@@ -5325,6 +5639,7 @@ nice -n 5 ionice -c2 -n4 \
             self.stop_monitor()
             if self.proc and self.proc.poll() is None:
                 self.proc.terminate()
+            self._cleanup_demo_project()
         except Exception:
             pass
         self.destroy()
@@ -5357,7 +5672,6 @@ class FirstTimeWizard(tk.Toplevel):
         self.slurm_nodes = tk.StringVar(value=str(master.slurm_nodes.get()))
         self.slurm_ntasks = tk.StringVar(value=str(master.slurm_ntasks.get()))
         self.slurm_account = tk.StringVar(value=master.slurm_account.get())
-        self.style_var = tk.StringVar(value=master.figure_style_var.get())
         self.emit_report = tk.BooleanVar(value=bool(master.emit_report_var.get()))
 
         container = ttk.Frame(self, padding=12)
@@ -5525,8 +5839,7 @@ class FirstTimeWizard(tk.Toplevel):
     def _build_output_page(self) -> ttk.Frame:
         frame = ttk.Frame(self.stack)
         ttk.Label(frame, text="输出选项：").pack(anchor=tk.W)
-        ttk.Label(frame, text="期刊风格：").pack(anchor=tk.W)
-        ttk.Combobox(frame, values=list(FIG_STYLES.keys()), textvariable=self.style_var, state="readonly").pack(anchor=tk.W, pady=2)
+        ttk.Label(frame, text="图像风格固定为 AFM 期刊预设。", foreground="#555555").pack(anchor=tk.W, pady=(0, 2))
         ttk.Checkbutton(frame, text="生成复现报告", variable=self.emit_report).pack(anchor=tk.W, pady=(6, 2))
         if not HAS_PYMATGEN:
             ttk.Label(frame, text="未检测到 pymatgen，高级结构功能将关闭。", foreground="#aa5500").pack(anchor=tk.W, pady=(6, 0))
@@ -5632,7 +5945,7 @@ class FirstTimeWizard(tk.Toplevel):
             use_slurm=bool(self.use_slurm.get()),
             np=np_total,
             slurm=slurm_cfg,
-            figure_style=_normalize_style(self.style_var.get()),
+            figure_style="AFM",
             emit_report=bool(self.emit_report.get()),
         )
         self.result = profile
