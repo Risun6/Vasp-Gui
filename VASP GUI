@@ -2523,7 +2523,7 @@ class VaspGUI(tk.Tk):
         return frame
 
     # === CODEX BEGIN: twist/shift helpers ===
-    def _tw_show_help_dialog(self, title: str, message: str) -> None:
+    def _show_help_dialog(self, title: str, message: str) -> None:
         """弹出一个带滚动文本的帮助对话框。"""
         dialog = tk.Toplevel(self)
         dialog.title(title)
@@ -2555,18 +2555,18 @@ class VaspGUI(tk.Tk):
             pass
         dialog.bind("<Escape>", lambda _e: dialog.destroy())
 
-    def _tw_add_help_button(self, parent, title: str, message: str) -> ttk.Button:
+    def _add_help_button(self, parent, title: str, message: str) -> ttk.Button:
         btn = ttk.Button(parent, text="？", width=2,
-                         command=lambda: self._tw_show_help_dialog(title, message))
+                         command=lambda: self._show_help_dialog(title, message))
         btn.pack(side=tk.RIGHT, padx=(4, 0))
         return btn
 
-    def _tw_add_section_heading(self, parent, caption: str, help_text: str,
-                                *, title: Optional[str] = None, pady=(8, 4)) -> ttk.Frame:
+    def _add_section_heading(self, parent, caption: str, help_text: str,
+                              *, title: Optional[str] = None, pady=(8, 4)) -> ttk.Frame:
         row = ttk.Frame(parent)
         row.pack(fill=tk.X, pady=pady)
         ttk.Label(row, text=caption, font=("TkDefaultFont", 10, "bold")).pack(side=tk.LEFT)
-        self._tw_add_help_button(row, title or caption, help_text)
+        self._add_help_button(row, title or caption, help_text)
         return row
     # === CODEX END: twist/shift helpers ===
 
@@ -2669,7 +2669,7 @@ class VaspGUI(tk.Tk):
         """).strip()
 
         # 路径选择
-        self._tw_add_section_heading(left, "路径选择", help_poscar, title="上/下层 POSCAR 指南", pady=(0, 4))
+        self._add_section_heading(left, "路径选择", help_poscar, title="上/下层 POSCAR 指南", pady=(0, 4))
         self.tw_top_path = tk.StringVar()
         self.tw_bot_path = tk.StringVar()
 
@@ -2692,7 +2692,7 @@ class VaspGUI(tk.Tk):
         self.tw_enable_twist = tk.BooleanVar(value=True)
         self.tw_enable_slide = tk.BooleanVar(value=True)
 
-        self._tw_add_section_heading(left, "基本几何参数", help_vacuum, title="真空与容许应变")
+        self._add_section_heading(left, "基本几何参数", help_vacuum, title="真空与容许应变")
         row = ttk.Frame(left); row.pack(fill=tk.X, pady=2)
         ttk.Label(row, text="真空(Å):").pack(side=tk.LEFT); ttk.Entry(row, textvariable=self.tw_vacuum, width=7).pack(side=tk.LEFT, padx=4)
         ttk.Label(row, text="容许应变(%)").pack(side=tk.LEFT, padx=(8,0)); ttk.Entry(row, textvariable=self.tw_allow_strain, width=7).pack(side=tk.LEFT, padx=4)
@@ -2706,7 +2706,7 @@ class VaspGUI(tk.Tk):
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
         # 扭转角扫描
-        self._tw_add_section_heading(left, "扭转角扫描", help_twist, title="扭转角 θ（度）")
+        self._add_section_heading(left, "扭转角扫描", help_twist, title="扭转角 θ（度）")
         ttk.Label(left, text="扭转角 θ (度)：").pack(anchor=tk.W)
         self.tw_theta_a = tk.DoubleVar(value=0.0)
         self.tw_theta_b = tk.DoubleVar(value=10.0)
@@ -2718,7 +2718,7 @@ class VaspGUI(tk.Tk):
         ttk.Label(left, text="注：六角晶格通常只需 0–60° 区间。", foreground="#666").pack(anchor=tk.W, pady=(0,4))
 
         # 滑移扫描（分数坐标）
-        self._tw_add_section_heading(left, "滑移网格", help_slide, title="滑移 (分数坐标)")
+        self._add_section_heading(left, "滑移网格", help_slide, title="滑移 (分数坐标)")
         ttk.Label(left, text="滑移 (分数坐标 u_x,u_y)：").pack(anchor=tk.W)
         self.tw_ux_steps = tk.IntVar(value=5)
         self.tw_uy_steps = tk.IntVar(value=5)
@@ -2734,14 +2734,14 @@ class VaspGUI(tk.Tk):
         self.tw_max_tasks = tk.IntVar(value=200)
         self.tw_autorun = tk.BooleanVar(value=False)  # 可选：生成后立刻运行（默认关）
 
-        self._tw_add_section_heading(left, "计算与并行策略", help_compute, title="KSPACING 与任务上限")
+        self._add_section_heading(left, "计算与并行策略", help_compute, title="KSPACING 与任务上限")
         r=ttk.Frame(left); r.pack(fill=tk.X, pady=2)
         ttk.Label(r, text="KSPACING").pack(side=tk.LEFT); ttk.Entry(r, textvariable=self.tw_kspacing, width=7).pack(side=tk.LEFT, padx=4)
         ttk.Label(r, text="任务上限").pack(side=tk.LEFT, padx=(8,0)); ttk.Entry(r, textvariable=self.tw_max_tasks, width=7).pack(side=tk.LEFT, padx=4)
         ttk.Checkbutton(left, text="生成后自动运行（试验性）", variable=self.tw_autorun).pack(anchor=tk.W, pady=(2,4))
 
         # 操作按钮
-        self._tw_add_section_heading(left, "任务操作", help_actions, title="选项与按钮")
+        self._add_section_heading(left, "任务操作", help_actions, title="选项与按钮")
         btns = ttk.Frame(left); btns.pack(fill=tk.X, pady=8)
         ttk.Button(btns, text="预览当前(θ,u)几何", command=self._tw_preview_once).pack(side=tk.LEFT)
         ttk.Button(btns, text="生成单例 POSCAR", command=lambda: self._tw_generate(single=True)).pack(side=tk.LEFT, padx=6)
@@ -2752,8 +2752,16 @@ class VaspGUI(tk.Tk):
         ttk.Button(left, text="绘制 gap 热图（用当前 θ）", command=self._tw_plot_gap_heatmap_btn).pack(anchor=tk.W, pady=(4, 0))
         ttk.Button(left, text="绘制 gap–θ 曲线（min/mean/max）", command=self._tw_plot_gap_vs_theta_btn).pack(anchor=tk.W, pady=(4, 8))
 
-        self._tw_add_section_heading(left, "推荐默认值", help_defaults, title="计算与物理的默认值", pady=(8, 4))
-        self._tw_add_section_heading(left, "常见注意事项", help_notes, title="常见注意事项", pady=(0, 8))
+
+        self._add_section_heading(left, "推荐默认值", help_defaults, title="计算与物理的默认值", pady=(8, 4))
+        self._add_section_heading(left, "常见注意事项", help_notes, title="常见注意事项", pady=(0, 8))
+
+        log_box = ttk.LabelFrame(left, text="运行日志")
+        log_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        self.tw_log = ScrolledText(log_box, height=10, wrap="word")
+        self.tw_log.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self.tw_log.insert(tk.END, "扭转/滑移任务的进度消息会显示在此处。\n")
+        self.tw_log.configure(state=tk.DISABLED)
 
         # 右栏：俯视预览
         right = ttk.Frame(frame, padding=8); right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
@@ -2765,6 +2773,22 @@ class VaspGUI(tk.Tk):
         self.canvas_tw.draw(); self.canvas_tw.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         return frame
+
+    def _tw_append_log(self, message: str) -> None:
+        if not hasattr(self, "tw_log"):
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        try:
+            self.tw_log.configure(state=tk.NORMAL)
+            self.tw_log.insert(tk.END, f"[{timestamp}] {message}\n")
+            self.tw_log.see(tk.END)
+            self.tw_log.configure(state=tk.DISABLED)
+            self.tw_log.update_idletasks()
+        except Exception:
+            try:
+                self.tw_log.configure(state=tk.DISABLED)
+            except Exception:
+                pass
     # === CODEX END: twist/shift page UI ===
 
     # === CODEX BEGIN: twist/shift geometry core ===
@@ -2786,6 +2810,7 @@ class VaspGUI(tk.Tk):
             messagebox.showerror(APP_NAME, f"预览失败：{e}")
             return
         self._tw_draw_topview(st, meta)
+        self._tw_append_log(f"预览已更新：θ={meta.get('theta_deg', 0.0):.3f}°, u=(0.000,0.000)")
 
     def _tw_draw_topview(self, st, meta):
         """简单俯视：投影到 x-y，按层分色。"""
@@ -2817,7 +2842,14 @@ class VaspGUI(tk.Tk):
         tdeg = meta.get("theta_deg")
         ux,uy = meta.get("ux"), meta.get("uy")
         self.ax_tw.set_title(f"θ={tdeg:.3f}°, u=({ux:.3f},{uy:.3f}), atoms={len(st)}")
-        self.canvas_tw.draw_idle()
+        try:
+            self.canvas_tw.draw()
+            widget = self.canvas_tw.get_tk_widget()
+            widget.update_idletasks()
+            widget.update()
+            self.update_idletasks()
+        except Exception:
+            pass
 
     def _tw_find_match(self, A_top_rot, A_bot, allow_strain: float, search_limit: int):
         """返回最优匹配 dict(n1,m1,n2,m2,s,resid,area,atoms)。"""
@@ -3103,6 +3135,7 @@ class VaspGUI(tk.Tk):
             issues.append("u_y 步数需为正整数。")
         if issues:
             messagebox.showwarning(APP_NAME, "\n".join(issues))
+            self._tw_append_log("参数校验失败：" + "；".join(issues))
             return
 
         if slide_enabled:
@@ -3111,6 +3144,7 @@ class VaspGUI(tk.Tk):
         top_p = Path(self.tw_top_path.get()); bot_p = Path(self.tw_bot_path.get())
         if not top_p.exists() or not bot_p.exists():
             messagebox.showwarning(APP_NAME, "请先选择上/下层 POSCAR")
+            self._tw_append_log("未找到上/下层 POSCAR，生成流程已中止。")
             return
 
         # 任务组合
@@ -3151,8 +3185,11 @@ class VaspGUI(tk.Tk):
                     seen.add(key)
                     combos.append((th, float(cu[0]), float(cu[1])))
 
+        self._tw_append_log(
+            f"开始生成：θ 数量={len(thetas)}, u_x 数量={len(uxs)}, u_y 数量={len(uys)}，总计 {len(combos)} 个组合")
         if len(combos) > max_tasks:
             messagebox.showwarning(APP_NAME, f"任务数 {len(combos)} > 上限 {max_tasks}，请降低分辨率或步长")
+            self._tw_append_log(f"任务数 {len(combos)} 超出上限 {max_tasks}，未执行生成。")
             return
 
         proj = self.current_project_path()
@@ -3164,12 +3201,14 @@ class VaspGUI(tk.Tk):
             name = f"theta_{th:+06.2f}_ux_{ux:0.3f}_uy_{uy:0.3f}".replace("+","")
             w = root / name
             w.mkdir(parents=True, exist_ok=True)
+            self._tw_append_log(f"构建 θ={th:.3f}°, u=({ux:.3f},{uy:.3f}) → {w.name}")
             try:
                 st, meta = self._tw_build_structure(top_p, bot_p, th, ux, uy, vacuum, allow_strain, search_limit=8)
             except Exception as e:
                 # 写个失败标记
                 write_text(w / "FAILED.txt", f"{e}\n")
                 skipped += 1
+                self._tw_append_log(f"构建失败：θ={th:.3f}°, u=({ux:.3f},{uy:.3f})，原因：{e}")
                 continue
             # 写 POSCAR
             try:
@@ -3177,6 +3216,7 @@ class VaspGUI(tk.Tk):
             except Exception as e:
                 write_text(w / "FAILED.txt", f"写 POSCAR 失败: {e}\n")
                 skipped += 1
+                self._tw_append_log(f"写入 POSCAR 失败：{e}")
                 continue
 
             # 准备 INCAR：从项目拷贝或用当前编辑器，补丁 2D 设置 + ISYM=0 + KSPACING
@@ -3215,6 +3255,13 @@ class VaspGUI(tk.Tk):
 
             made += 1
 
+            try:
+                self._tw_draw_topview(st, meta2)
+            except Exception:
+                pass
+            else:
+                self._tw_append_log(f"完成：{w.name}，原子数 {len(st)}")
+
             # 可选：自动运行（实验性，依赖你的 run_local.sh 逻辑）
             if self.tw_autorun.get():
                 # 简化：在该子目录下直接调用项目的 run_local.sh（需要 vasp 命令可用）
@@ -3227,10 +3274,13 @@ class VaspGUI(tk.Tk):
                     # 后台起本地
                     if (w / "run_local.sh").exists():
                         subprocess.Popen(["bash","-lc", f"cd '{w}' && ./run_local.sh"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-                except Exception:
+                        self._tw_append_log(f"已触发自动运行：{w.name}/run_local.sh")
+                except Exception as exc:
+                    self._tw_append_log(f"自动运行触发失败：{w.name}，原因：{exc}")
                     pass
 
         messagebox.showinfo(APP_NAME, f"生成完成：成功 {made}，跳过 {skipped}（详见各子目录）。输出根目录：{root}")
+        self._tw_append_log(f"生成完成：成功 {made}，跳过 {skipped}，输出目录 {root}")
         # 刷新概览
         self.refresh_project_overview()
 
@@ -3254,7 +3304,9 @@ class VaspGUI(tk.Tk):
         root = self.current_project_path() / "twist_sweep"
         if not root.exists():
             messagebox.showwarning(APP_NAME, "未找到 twist_sweep 目录。")
+            self._tw_append_log("未找到 twist_sweep 目录，无法汇总结果。")
             return
+        self._tw_append_log("开始汇总 sweep 结果…")
         rows = []
         for sub in sorted(root.iterdir()):
             if not sub.is_dir(): continue
@@ -3315,6 +3367,7 @@ class VaspGUI(tk.Tk):
                 f.write(",".join([r["path"], _fmt(r["theta"]), _fmt(r["ux"]), _fmt(r["uy"]), _fmt(r["gap_eV"]), _fmt(r["totalE"]), (r["note"] or "").replace(",",";")]) + "\n")
 
         messagebox.showinfo(APP_NAME, f"已导出汇总：{csv_path}")
+        self._tw_append_log(f"结果汇总完成：共 {len(rows)} 条记录，输出 {csv_path}")
 
     def _tw_gap_from_eigenval(self, eig_path: Path, outcar_path: Path):
         """非常规兜底：从 EIGENVAL + OUTCAR(E_F) 粗略估算带隙。返回 (gap, is_direct?)；失败返回 (None,None)。"""
@@ -3445,7 +3498,8 @@ class VaspGUI(tk.Tk):
                 grid[i, j] = g
 
         top = tk.Toplevel(self)
-        top.title(f"gap 热图 @ θ={theta:.2f}°")
+
+        top.title(f"Band gap heatmap @ θ={theta:.2f}°")
         fig = Figure(figsize=(6.2, 5.2), dpi=110)
         ax = fig.add_subplot(111)
         im = ax.imshow(
@@ -3518,14 +3572,15 @@ class VaspGUI(tk.Tk):
         g_mean = np.array([np.mean(by_theta[t]) for t in thetas], dtype=float)
 
         top = tk.Toplevel(self)
-        top.title("gap–θ 汇总（min/mean/max）")
+
+        top.title("Band gap vs. twist angle (min/mean/max)")
         fig = Figure(figsize=(6.4, 4.6), dpi=110)
         ax = fig.add_subplot(111)
         ax.plot(thetas, g_mean, label="mean gap")
         ax.fill_between(thetas, g_min, g_max, alpha=0.25, label="range [min, max]")
         ax.set_xlabel("Twist angle θ (deg)")
         ax.set_ylabel("Band gap (eV)")
-        ax.set_title("Band gap vs. twist angle\n(阴影带 = 滑移导致的变化范围)")
+        ax.set_title("Band gap vs. twist angle\n(shaded band = variation across slide grid)")
         ax.legend()
         apply_style(ax, self.figure_style_var.get() or "AFM")
         fig.tight_layout()
@@ -4325,21 +4380,13 @@ nice -n 5 ionice -c2 -n4 \
             widget.bind("<Button-4>", _on_mousewheel)
             widget.bind("<Button-5>", _on_mousewheel)
 
-        def _add_section(caption: str, help_text: str, *, title: Optional[str] = None, pady=(8, 4)):
-            row = ttk.Frame(left)
-            row.pack(fill=tk.X, pady=pady)
-            ttk.Label(row, text=caption, font=("TkDefaultFont", 10, "bold")).pack(side=tk.LEFT)
-            ttk.Button(row, text="？", width=2,
-                       command=lambda: self._tw_show_help_dialog(title or caption, help_text)).pack(side=tk.RIGHT, padx=(4, 0))
-            return row
-
         help_overview = textwrap.dedent("""
             【后处理速览】
             • 从当前项目目录读取 vasprun.xml、EIGENVAL、LOCPOT 等文件，一键生成论文级别的图表。
             • 运行任务会把 PNG/CSV 等输出写入 reports/post_时间戳/ 子目录，可随时导出或复用。
             • 勾选多个任务时将按顺序执行，避免同时解析大文件导致内存占用峰值。
         """).strip()
-        _add_section("一键后处理 | 论文级出图/表", help_overview, title="后处理说明", pady=(0, 6))
+        self._add_section_heading(left, "一键后处理 | 论文级出图/表", help_overview, title="后处理说明", pady=(0, 6))
 
         row = ttk.Frame(left)
         row.pack(fill=tk.X, pady=2)
@@ -4362,7 +4409,8 @@ nice -n 5 ionice -c2 -n4 \
         """).strip()
         tasks_box = ttk.LabelFrame(left, text="任务勾选")
         tasks_box.pack(fill=tk.X, pady=6)
-        _add_section("可用后处理", help_tasks, title="可用后处理", pady=(0, 4))
+
+        self._add_section_heading(left, "可用后处理", help_tasks, title="可用后处理", pady=(0, 4))
         task_defs = [
             ("dos", "总 DOS"),
             ("pdos", "投影 DOS"),
@@ -4384,7 +4432,7 @@ nice -n 5 ionice -c2 -n4 \
         """).strip()
         pdos_box = ttk.LabelFrame(left, text="投影选项")
         pdos_box.pack(fill=tk.X, pady=6)
-        _add_section("PDOS 设置", help_pdos, title="PDOS 设置", pady=(0, 4))
+        self._add_section_heading(left, "PDOS 设置", help_pdos, title="PDOS 设置", pady=(0, 4))
         self._pdos_group = tk.StringVar(value="element")
         rb_row = ttk.Frame(pdos_box)
         rb_row.pack(fill=tk.X, pady=2)
@@ -4399,7 +4447,8 @@ nice -n 5 ionice -c2 -n4 \
         """).strip()
         em_box = ttk.LabelFrame(left, text="拟合参数")
         em_box.pack(fill=tk.X, pady=6)
-        _add_section("m* 拟合", help_emass, title="有效质量 m*", pady=(0, 4))
+
+        self._add_section_heading(left, "m* 拟合", help_emass, title="有效质量 m*", pady=(0, 4))
         ttk.Label(em_box, text="窗口 ±k 点").pack(side=tk.LEFT)
         self._em_win = tk.IntVar(value=4)
         ttk.Spinbox(em_box, from_=2, to=12, textvariable=self._em_win, width=5).pack(side=tk.LEFT, padx=4)
@@ -4410,7 +4459,8 @@ nice -n 5 ionice -c2 -n4 \
             • 报告目录统一保存在项目 reports/ 下，可通过“打开报告文件夹”快速定位最新一次输出。
             • 日志窗口会记录每个任务的指标 metrics、备注 notes 以及潜在错误信息。
         """).strip()
-        _add_section("运行与导出", help_actions, title="运行与导出", pady=(8, 4))
+
+        self._add_section_heading(left, "运行与导出", help_actions, title="运行与导出", pady=(8, 4))
         btns = ttk.Frame(left)
         btns.pack(fill=tk.X, pady=4)
         ttk.Button(btns, text="运行所选", command=self._run_selected_postprocs).pack(side=tk.LEFT)
@@ -4541,8 +4591,6 @@ nice -n 5 ionice -c2 -n4 \
         self.post_metrics.insert(tk.END, f"[{timestamp}] {text}\n")
         self.post_metrics.see(tk.END)
         self.post_metrics.configure(state=tk.DISABLED)
-
-
     def plot_once_from_oszicar(self):
         proj = self.current_project_path()
         osz = proj / "OSZICAR"
