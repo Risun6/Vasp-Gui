@@ -64,6 +64,17 @@ except Exception:
     tb = None
     HAS_TTKBOOTSTRAP = False
 
+if HAS_TTKBOOTSTRAP and tb is not None:
+    BaseWindow = tb.Window
+    BaseToplevel = tb.Toplevel
+    BootstrapFrame = tb.Frame
+    BootstrapButton = tb.Button
+else:
+    BaseWindow = tk.Tk
+    BaseToplevel = tk.Toplevel
+    BootstrapFrame = ttk.Frame
+    BootstrapButton = ttk.Button
+
 try:
     import pymatgen  # type: ignore  # noqa: F401
     HAS_PYMATGEN = True
@@ -746,16 +757,16 @@ class EnergyMonitor(threading.Thread):
             return
 
 
-class VaspGUI(tk.Tk):
+class VaspGUI(BaseWindow):
     def __init__(self):
-        super().__init__()
+        if HAS_TTKBOOTSTRAP and tb is not None:
+            super().__init__(themename="cosmo")
+            self.using_bootstrap = True
+        else:
+            super().__init__()
+            self.using_bootstrap = False
         self.title(f"{APP_NAME} v{APP_VER}")
         self.geometry("1200x800")
-        if HAS_TTKBOOTSTRAP and tb is not None:
-            try:
-                tb.Style("cosmo")
-            except Exception:
-                pass
 
         self.project_dir = Path.cwd()
         self.proc = None  # subprocess.Popen or None
@@ -1405,7 +1416,7 @@ class VaspGUI(tk.Tk):
             self.pot_dir_var.set(sel)
 
     def select_from_list(self, title, items):
-        top = tk.Toplevel(self)
+        top = BaseToplevel(self)
         top.title(title)
         top.geometry("720x380")
         lb = tk.Listbox(top, selectmode=tk.SINGLE)
@@ -1420,7 +1431,8 @@ class VaspGUI(tk.Tk):
             except Exception:
                 sel["val"] = None
             top.destroy()
-        ttk.Button(top, text="使用选中", command=ok).pack(pady=6)
+        btn_kwargs = {"bootstyle": "primary"} if self.using_bootstrap else {}
+        BootstrapButton(top, text="使用选中", command=ok, **btn_kwargs).pack(pady=6)
         top.transient(self); top.grab_set(); self.wait_window(top)
         return sel["val"]
 
@@ -1515,6 +1527,61 @@ class VaspGUI(tk.Tk):
         self._populate_kpoints_section(frame)
         return frame
 
+    # === CODEX BEGIN: twist/shift helpers ===
+    def _tw_show_help_dialog(self, title: str, message: str) -> None:
+        """弹出一个带滚动文本的帮助对话框。"""
+        dialog = BaseToplevel(self)
+        dialog.title(title)
+        dialog.transient(self)
+        dialog.resizable(True, True)
+        dialog.grab_set()
+
+        frame = BootstrapFrame(dialog, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        text = ScrolledText(frame, wrap=tk.WORD, width=68, height=20)
+        text.insert(tk.END, message)
+        text.configure(state=tk.DISABLED)
+        text.pack(fill=tk.BOTH, expand=True)
+
+        btn_row = BootstrapFrame(frame)
+        btn_row.pack(fill=tk.X, pady=(12, 0))
+        btn_kwargs = {"bootstyle": "secondary-outline"} if self.using_bootstrap else {}
+        BootstrapButton(btn_row, text="关闭", command=dialog.destroy, **btn_kwargs).pack(side=tk.RIGHT)
+
+        dialog.update_idletasks()
+        try:
+            self.update_idletasks()
+            w = dialog.winfo_width()
+            h = dialog.winfo_height()
+            x = self.winfo_rootx() + (self.winfo_width() - w) // 2
+            y = self.winfo_rooty() + (self.winfo_height() - h) // 2
+            dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        except Exception:
+            pass
+        dialog.bind("<Escape>", lambda _e: dialog.destroy())
+
+    def _tw_add_help_button(self, parent, title: str, message: str) -> ttk.Button:
+        btn_kwargs = {"bootstyle": "info-outline"} if self.using_bootstrap else {}
+        btn = BootstrapButton(
+            parent,
+            text="？",
+            width=2,
+            command=lambda: self._tw_show_help_dialog(title, message),
+            **btn_kwargs,
+        )
+        btn.pack(side=tk.RIGHT, padx=(4, 0))
+        return btn
+
+    def _tw_add_section_heading(self, parent, caption: str, help_text: str,
+                                *, title: Optional[str] = None, pady=(8, 4)) -> ttk.Frame:
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, pady=pady)
+        ttk.Label(row, text=caption, font=("TkDefaultFont", 10, "bold")).pack(side=tk.LEFT)
+        self._tw_add_help_button(row, title or caption, help_text)
+        return row
+    # === CODEX END: twist/shift helpers ===
+
     # === CODEX BEGIN: twist/shift page UI ===
     def _build_twistshift_page(self, parent):
         frame = ttk.Frame(parent)
@@ -1556,7 +1623,65 @@ class VaspGUI(tk.Tk):
             widget.bind("<Button-5>", _on_mousewheel)
         ttk.Label(left, text="二维材料扭转/滑移 | 生成批量 POSCAR 与扫参任务").pack(anchor=tk.W, pady=(0,6))
 
+        help_poscar = textwrap.dedent("""
+            【基础输入】
+            • 先后选择底层 (B) 与上层 (T) 的 POSCAR。
+            • 默认假设 POSCAR 的 c 轴接近层法向；若不符合，请先在外部对齐晶格。
+            • 上层以刚体方式旋转/滑移，并按“真空(Å)”设定层间距。
+        """).strip()
+        help_vacuum = textwrap.dedent("""
+            【真空与容许应变】
+            • “真空(Å)” 决定最终 c 轴长度 = 层间距 + 真空层，常用 15–20 Å。
+            • 建议配合 INCAR 中 LDIPOL=.TRUE. 与 IDIPOL=3 以消除偶极。
+            • “容许应变(%)” 控制搜索近共格超胞时允许的面内等效拉伸/压缩，常用 0.5–1.0%。
+            • 程序会在限制内搜索对角超胞，若仍匹配失败可放宽容许应变或提高搜索阶数。
+        """).strip()
+        help_twist = textwrap.dedent("""
+            【扭转角扫描】
+            • 起/止/步长按闭区间生成角度序列；步长不能整除区间时，会截断在终点前的最后一个值。
+            • 六角或三角晶格在 0–60° 内即可覆盖独立堆垛；异质双层通常也采用该范围。
+            • 角度数量 Nθ = floor((止 − 起)/步长) + 1。
+        """).strip()
+        help_slide = textwrap.dedent("""
+            【滑移网格】
+            • 滑移向量定义为 t = uₓ·a₁ + uᵧ·a₂，其中 a₁、a₂ 为底层面内基矢。
+            • 网格在 [0,1)×[0,1) 内均匀采样，u=1 与 u=0 等价。
+            • 设 uₓ 步数 = nₓ、uᵧ 步数 = nᵧ，共生成 nₓ×nᵧ 个组合；六角晶格会按对称性自动去重。
+        """).strip()
+        help_compute = textwrap.dedent("""
+            【KSPACING 与任务上限】
+            • KSPACING 优先写入 INCAR：金属或小原胞常用 0.18–0.22；半导体 0.22–0.30；莫尔超胞可先用 Γ-only 或 0.35 预筛。
+            • 若项目目录存在 KPOINTS 文件，则沿用原网格；否则采用 KSPACING 自动生成。
+            • 任务上限用于约束 sweep 规模，总任务数近似为 Nθ × nₓ × nᵧ。
+        """).strip()
+        help_actions = textwrap.dedent("""
+            【操作按钮】
+            • “预览当前(θ,u)几何”：即时构造当前组合以核对结构。
+            • “生成单例 POSCAR”：仅输出当前参数对应的单个目录。
+            • “批量遍历并生成”：按角度与滑移网格生成全部任务、脚本与 meta.json。
+            • “生成后自动运行”：复制项目脚本并尝试调用 run_local.sh（实验性功能）。
+            • “解析 sweep 结果 → CSV”：统计能量、带隙与备注生成汇总表。
+        """).strip()
+        help_defaults = textwrap.dedent("""
+            【推荐默认值】
+            • 真空 20 Å，INCAR 建议 LDIPOL=.TRUE. 与 IDIPOL=3。
+            • 容许应变 0.5–0.8%，极小角度可放宽至 1.0%。
+            • 角度初扫 0–10°、步长 2°，重点角度再加密。
+            • 滑移网格常用 5×5 或 7×7；势垒/摩擦研究可加密到 15×15。
+            • KSPACING ≈0.22，超大胞可先用 Γ-only 预筛后再细化。
+            • SCF/DOS：ISMEAR=0, SIGMA=0.05；结构优化或金属可改 ISMEAR=1, SIGMA=0.2。
+            • 层间范德华建议统一采用 IVDW=12 或 rVV10。
+        """).strip()
+        help_notes = textwrap.dedent("""
+            【常见注意事项】
+            • 小角度会显著增加原子数，可结合任务上限、Γ-only 预筛或提高容许应变控制规模。
+            • 滑移始终以底层基矢的分数坐标描述，可借助预览面板显示的 t = uₓ·a₁ + uᵧ·a₂ 校验。
+            • 网格采用 [0,1) 范围避免端点重复；设定角度步长时请确认覆盖目标终点。
+            • PBE 带隙偏低，关键构型建议追加 HSE 或 scGW 以形成多保真修正。
+        """).strip()
+
         # 路径选择
+        self._tw_add_section_heading(left, "路径选择", help_poscar, title="上/下层 POSCAR 指南", pady=(0, 4))
         self.tw_top_path = tk.StringVar()
         self.tw_bot_path = tk.StringVar()
 
@@ -1570,14 +1695,6 @@ class VaspGUI(tk.Tk):
         ttk.Entry(row, textvariable=self.tw_bot_path, width=44).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text="选择…", command=lambda: self._tw_pick_poscar(self.tw_bot_path)).pack(side=tk.LEFT)
 
-        info1 = textwrap.dedent("""
-            1) 上/下层 POSCAR
-
-
-            选择底层 (B) 与上层 (T) 的 POSCAR。程序假定 c 轴接近层法向，必要时会自动把法向对齐 z 轴。上层按刚体处理参与旋转与滑移，最终叠加在底层之上，层间距由真空参数控制。
-        """).strip()
-        ttk.Label(left, text=info1, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(4, 8))
-
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
         # 基本几何参数
@@ -1587,17 +1704,10 @@ class VaspGUI(tk.Tk):
         self.tw_enable_twist = tk.BooleanVar(value=True)
         self.tw_enable_slide = tk.BooleanVar(value=True)
 
+        self._tw_add_section_heading(left, "基本几何参数", help_vacuum, title="真空与容许应变")
         row = ttk.Frame(left); row.pack(fill=tk.X, pady=2)
         ttk.Label(row, text="真空(Å):").pack(side=tk.LEFT); ttk.Entry(row, textvariable=self.tw_vacuum, width=7).pack(side=tk.LEFT, padx=4)
         ttk.Label(row, text="容许应变(%)").pack(side=tk.LEFT, padx=(8,0)); ttk.Entry(row, textvariable=self.tw_allow_strain, width=7).pack(side=tk.LEFT, padx=4)
-
-        info2 = textwrap.dedent("""
-            2) 真空 (Å) 与 容许应变 (%)
-
-            真空控制 c 方向晶格长度（层间距离加真空层），二维体系通常取 15–20 Å，并配合 LDIPOL=.TRUE., IDIPOL=3。容许应变 ε 允许面内各向同性拉伸或压缩以构造近共格超胞，内部搜索满足 |Mᵦ·Aᵦ − R(θ)·Mₜ·Aₜ| / |·| ≤ ε 的整数矩阵对；常用 0.5–1.0%。莫尔超胞原子数随 1/θ² 增长，可通过任务上限控制规模。
-
-        """).strip()
-        ttk.Label(left, text=info2, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(4, 8))
 
         dim_frame = ttk.LabelFrame(left, text="扫描维度")
         dim_frame.pack(fill=tk.X, pady=4)
@@ -1608,6 +1718,7 @@ class VaspGUI(tk.Tk):
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
         # 扭转角扫描
+        self._tw_add_section_heading(left, "扭转角扫描", help_twist, title="扭转角 θ（度）")
         ttk.Label(left, text="扭转角 θ (度)：").pack(anchor=tk.W)
         self.tw_theta_a = tk.DoubleVar(value=0.0)
         self.tw_theta_b = tk.DoubleVar(value=10.0)
@@ -1618,15 +1729,8 @@ class VaspGUI(tk.Tk):
         ttk.Label(r, text="步").pack(side=tk.LEFT); ttk.Entry(r, textvariable=self.tw_theta_step, width=7).pack(side=tk.LEFT, padx=4)
         ttk.Label(left, text="注：六角晶格通常只需 0–60° 区间。", foreground="#666").pack(anchor=tk.W, pady=(0,4))
 
-        info3 = textwrap.dedent("""
-            3) 扭转角 θ（度）
-
-            起、止与步长按闭区间生成角度序列，若步长不整除区间则截断到不超过止点的最后一个角度。六角或三角晶格在 0–60° 范围内即可覆盖独立堆垛，异质双层通常也采用该区间。角度数量计算公式为 Nθ = floor((止 − 起)/步) + 1。
-
-        """).strip()
-        ttk.Label(left, text=info3, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
-
         # 滑移扫描（分数坐标）
+        self._tw_add_section_heading(left, "滑移网格", help_slide, title="滑移 (分数坐标)")
         ttk.Label(left, text="滑移 (分数坐标 u_x,u_y)：").pack(anchor=tk.W)
         self.tw_ux_steps = tk.IntVar(value=5)
         self.tw_uy_steps = tk.IntVar(value=5)
@@ -1635,14 +1739,6 @@ class VaspGUI(tk.Tk):
         ttk.Label(r, text="u_y 步数").pack(side=tk.LEFT, padx=(8,0)); ttk.Spinbox(r, from_=1, to=32, textvariable=self.tw_uy_steps, width=6).pack(side=tk.LEFT, padx=4)
         ttk.Label(left, text="网格覆盖 [0,1)×[0,1)，自动等间隔。", foreground="#666").pack(anchor=tk.W)
 
-        info4 = textwrap.dedent("""
-            4) 滑移 (分数坐标 uₓ,uᵧ)
-
-            上层平移向量定义为 t = uₓ·a₁ + uᵧ·a₂，其中 a₁、a₂ 为底层面内基矢。网格在 [0,1)×[0,1) 内均匀采样，u=1 与 u=0 等价。uₓ 步数 = nₓ、uᵧ 步数 = nᵧ 将生成 nₓ×nᵧ 个滑移组合；六角格体系可按对称性自动去重。
-
-        """).strip()
-        ttk.Label(left, text=info4, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
-
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
         # 计算与并行策略
@@ -1650,53 +1746,24 @@ class VaspGUI(tk.Tk):
         self.tw_max_tasks = tk.IntVar(value=200)
         self.tw_autorun = tk.BooleanVar(value=False)  # 可选：生成后立刻运行（默认关）
 
+        self._tw_add_section_heading(left, "计算与并行策略", help_compute, title="KSPACING 与任务上限")
         r=ttk.Frame(left); r.pack(fill=tk.X, pady=2)
         ttk.Label(r, text="KSPACING").pack(side=tk.LEFT); ttk.Entry(r, textvariable=self.tw_kspacing, width=7).pack(side=tk.LEFT, padx=4)
         ttk.Label(r, text="任务上限").pack(side=tk.LEFT, padx=(8,0)); ttk.Entry(r, textvariable=self.tw_max_tasks, width=7).pack(side=tk.LEFT, padx=4)
         ttk.Checkbutton(left, text="生成后自动运行（试验性）", variable=self.tw_autorun).pack(anchor=tk.W, pady=(2,4))
 
-        info5 = textwrap.dedent("""
-            5) KSPACING 与 任务上限
-
-            KSPACING 控制每个任务的 k 网密度，优先写入 INCAR；若已提供 KPOINTS，则按指定网格执行。常用取值：小原胞或金属 0.18–0.22，半导体 0.22–0.30，超大莫尔超胞可先以 Γ-only 或 KSPACING≈0.35 预筛。任务上限用于约束 sweep 规模，总任务数可按 N_tot = Nθ × nₓ × nᵧ 估算。
-
-        """).strip()
-        ttk.Label(left, text=info5, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
-
         # 操作按钮
+        self._tw_add_section_heading(left, "任务操作", help_actions, title="选项与按钮")
         btns = ttk.Frame(left); btns.pack(fill=tk.X, pady=8)
         ttk.Button(btns, text="预览当前(θ,u)几何", command=self._tw_preview_once).pack(side=tk.LEFT)
         ttk.Button(btns, text="生成单例 POSCAR", command=lambda: self._tw_generate(single=True)).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="批量遍历并生成", command=lambda: self._tw_generate(single=False)).pack(side=tk.LEFT)
 
-        info6 = textwrap.dedent("""
-            6) 选项与按钮
-
-            “生成后自动运行”会在批量生成任务的同时写入脚本并按当前运行模式触发，默认保持关闭以便先核对结构。“预览当前(θ,u)几何”即时构造当前组合便于检查。“生成单例 POSCAR”仅输出当前参数的单个目录。“批量遍历并生成”根据角度与滑移网格写出全部任务、脚本与 meta.json。“解析 sweep 结果 → CSV”汇总能量、带隙和收敛信息供后续筛选。
-
-        """).strip()
-        ttk.Label(left, text=info6, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
-
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
         ttk.Button(left, text="解析 sweep 结果 → CSV", command=self._tw_collect_results).pack(anchor=tk.W)
 
-        info7 = textwrap.dedent("""
-        
-            7) 计算与物理的默认值
-
-            建议起点：真空 20 Å 并启用 LDIPOL=.TRUE., IDIPOL=3；容许应变 0.5–0.8%，在极小角度时可放宽至 1.0%。角度扫描可先覆盖 0–10°、步长 2°，再对重点角度加密。滑移网格常用 5×5 或 7×7，势垒或摩擦研究可加密至 15×15。KSPACING 约 0.22，超大胞先用 Γ-only 预筛再细化。SCF/DOS 步推荐 ISMEAR=0, SIGMA=0.05；Relax 或金属步可切换 ISMEAR=1, SIGMA=0.2。vdW 建议统一采用 IVDW=12 或 rVV10。
-
-        """).strip()
-        ttk.Label(left, text=info7, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(8, 8))
-
-        info8 = textwrap.dedent("""
-        
-            8) 常见注意事项
-
-            小角度会显著增加原子数，可结合任务上限、Γ-only 预筛及更高容许应变限制规模。滑移始终使用底层基矢的分数坐标，预览界面显示的 t = ux·a1 + uy·a2 可用于校验。滑移网格采用 [0,1) 区间避免端点重合，角度扫描需确保步长与终点一致。PBE 带隙偏低，关键构型应追加 HSE 或 scGW 以建立多保真修正。
-
-        """).strip()
-        ttk.Label(left, text=info8, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
+        self._tw_add_section_heading(left, "推荐默认值", help_defaults, title="计算与物理的默认值", pady=(8, 4))
+        self._tw_add_section_heading(left, "常见注意事项", help_notes, title="常见注意事项", pady=(0, 8))
 
         # 右栏：俯视预览
         right = ttk.Frame(frame, padding=8); right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
@@ -2029,6 +2096,25 @@ class VaspGUI(tk.Tk):
 
         twist_enabled = bool(self.tw_enable_twist.get()) if hasattr(self, "tw_enable_twist") else True
         slide_enabled = bool(self.tw_enable_slide.get()) if hasattr(self, "tw_enable_slide") else True
+        issues = []
+        if vacuum <= 0:
+            issues.append("真空(Å) 必须为正数。")
+        if allow_strain < 0:
+            issues.append("容许应变(%) 不能为负值。")
+        if kspacing <= 0:
+            issues.append("KSPACING 需为正数。")
+        if max_tasks <= 0:
+            issues.append("任务上限需为正整数。")
+        if twist_enabled and not single and abs(theta_b - theta_a) > 1e-9 and theta_step <= 0:
+            issues.append("扭转角步长需为正数，以便生成多角度扫描。")
+        if slide_enabled and ux_steps <= 0:
+            issues.append("u_x 步数需为正整数。")
+        if slide_enabled and uy_steps <= 0:
+            issues.append("u_y 步数需为正整数。")
+        if issues:
+            messagebox.showwarning(APP_NAME, "\n".join(issues))
+            return
+
         if slide_enabled:
             slide_enabled = slide_enabled and ux_steps > 0 and uy_steps > 0
 
@@ -3716,7 +3802,7 @@ nice -n 5 ionice -c2 -n4 \
         self._stop_following_log()
 
 
-class FirstTimeWizard(tk.Toplevel):
+class FirstTimeWizard(BaseToplevel):
     def __init__(self, master: VaspGUI):
         super().__init__(master)
         self.result: WizardProfile | None = None
@@ -3727,6 +3813,11 @@ class FirstTimeWizard(tk.Toplevel):
         # 适当扩大初始尺寸，避免表单内容被截断（尤其是第三步的精度设置）
         self.geometry("720x540")
         self.protocol("WM_DELETE_WINDOW", self.on_cancel)
+
+        self.using_bootstrap = getattr(master, "using_bootstrap", False)
+        self._frame_cls = BootstrapFrame if self.using_bootstrap else ttk.Frame
+        self._button_cls = BootstrapButton if self.using_bootstrap else ttk.Button
+        self._button_kwargs = {"bootstyle": "secondary"} if self.using_bootstrap else {}
 
         self.system_type = tk.StringVar(value="semiconductor")
         self.workflow = tk.StringVar(value="relax_scf_dos")
@@ -3745,12 +3836,12 @@ class FirstTimeWizard(tk.Toplevel):
         self.style_var = tk.StringVar(value=master.figure_style_var.get())
         self.emit_report = tk.BooleanVar(value=bool(master.emit_report_var.get()))
 
-        container = ttk.Frame(self, padding=12)
+        container = self._frame_cls(self, padding=12)
         container.pack(fill=tk.BOTH, expand=True)
         self.step_var = tk.StringVar(value="步骤 1/5")
         ttk.Label(container, textvariable=self.step_var, font=("", 12, "bold")).pack(anchor=tk.W, pady=(0, 8))
 
-        self.stack = ttk.Frame(container)
+        self.stack = self._frame_cls(container)
         self.stack.pack(fill=tk.BOTH, expand=True)
         self.pages: list[ttk.Frame] = []
         self.slurm_widgets: list[ttk.Widget] = []
@@ -3760,15 +3851,16 @@ class FirstTimeWizard(tk.Toplevel):
         self.pages.append(self._build_resource_page())
         self.pages.append(self._build_output_page())
 
-        nav = ttk.Frame(container)
+        nav = self._frame_cls(container)
         nav.pack(fill=tk.X, pady=(12, 0))
-        self.btn_prev = ttk.Button(nav, text="上一步", command=self.on_prev)
+        primary_kwargs = {"bootstyle": "primary"} if self.using_bootstrap else {}
+        self.btn_prev = self._button_cls(nav, text="上一步", command=self.on_prev, **self._button_kwargs)
         self.btn_prev.pack(side=tk.LEFT)
-        self.btn_cancel = ttk.Button(nav, text="取消", command=self.on_cancel)
+        self.btn_cancel = self._button_cls(nav, text="取消", command=self.on_cancel, **self._button_kwargs)
         self.btn_cancel.pack(side=tk.RIGHT)
-        self.btn_finish = ttk.Button(nav, text="完成", command=self.on_finish)
+        self.btn_finish = self._button_cls(nav, text="完成", command=self.on_finish, **primary_kwargs)
         self.btn_finish.pack(side=tk.RIGHT, padx=6)
-        self.btn_next = ttk.Button(nav, text="下一步", command=self.on_next)
+        self.btn_next = self._button_cls(nav, text="下一步", command=self.on_next, **primary_kwargs)
         self.btn_next.pack(side=tk.RIGHT)
 
         self.current_index = 0
