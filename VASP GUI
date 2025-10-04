@@ -3692,6 +3692,22 @@ class FirstTimeWizard(tk.Toplevel):
         ]:
             ttk.Radiobutton(frame, text=text, value=value, variable=self.workflow).pack(anchor=tk.W, pady=2)
         ttk.Label(frame, text="流程将决定生成的脚本与建议。", foreground="#555555").pack(anchor=tk.W, pady=(6, 0))
+        ttk.Label(
+            frame,
+            text=(
+                "Relax → SCF → DOS（默认）\n"
+                "用于“有应力/对齐方式不确定”的结构：先几何优化，再精细自洽，最后基于该电荷做 DOS。\n"
+                "可靠稳健，适合多数 2D 扭转/滑移扫描。\n\n"
+                "Relax → SCF → Bands\n"
+                "目标是能带路径：先 Relax，再 SCF 得到准确电荷，最后用 ICHARG=11 的 band run 走高对称线。\n"
+                "适合在 DOS/带隙初筛后，对少量代表构型出图。\n\n"
+                "SCF → DOS（无 Relax）\n"
+                "当几何已可信或做快速预筛时可直接 SCF，随后投 DOS。速度快，但若未 Relax 可能影响能量和带隙。"
+            ),
+            wraplength=660,
+            justify=tk.LEFT,
+            foreground="#444444",
+        ).pack(anchor=tk.W, pady=(8, 0))
         return frame
 
     def _build_precision_page(self) -> ttk.Frame:
@@ -3706,6 +3722,16 @@ class FirstTimeWizard(tk.Toplevel):
         ttk.Label(row, text="ENCUT (eV):").pack(side=tk.LEFT)
         self.encut_entry = ttk.Entry(row, textvariable=self.encut_value, width=8)
         self.encut_entry.pack(side=tk.LEFT, padx=4)
+        ttk.Label(
+            encut_box,
+            text=(
+                "自动（推荐）：ENCUT ≈ 1.3 × 元素最大 ENMAX，适合混合元素或批量扫描。\n"
+                "手动：仅在做收敛测试或沿用既有基准时使用；常见半导体 450–550 eV，含 O/N/F 时 520–600 eV。"
+            ),
+            wraplength=640,
+            justify=tk.LEFT,
+            foreground="#444444",
+        ).pack(anchor=tk.W, pady=(4, 0))
 
         k_box = ttk.LabelFrame(frame, text="K 网格")
         k_box.pack(fill=tk.X, pady=4)
@@ -3721,6 +3747,17 @@ class FirstTimeWizard(tk.Toplevel):
         for label, var in zip(["Nx", "Ny", "Nz"], self.kgrid):
             ttk.Label(grid_row, text=label).pack(side=tk.LEFT, padx=(0, 2))
             ttk.Spinbox(grid_row, from_=1, to=24, textvariable=var, width=4).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(
+            k_box,
+            text=(
+                "KSPACING（推荐）：以倒空间点间距控制密度，随超胞自动缩放。\n"
+                "金属/小原胞 0.18–0.22，半导体 0.22–0.30，大莫尔超胞可改为 Γ-only 并放宽到 ~0.35。\n"
+                "Monkhorst-Pack：当你明确需要 Nx×Ny×Nz 网格时使用；2D 薄膜通常 Nz=1，金属可考虑取消 Γ 中心。"
+            ),
+            wraplength=640,
+            justify=tk.LEFT,
+            foreground="#444444",
+        ).pack(anchor=tk.W, pady=(4, 0))
         if not HAS_SEEKPATH:
             ttk.Label(k_box, text="未检测到 seekpath，建议优先使用 KSPACING。", foreground="#aa5500").pack(anchor=tk.W, pady=(4, 0))
         return frame
