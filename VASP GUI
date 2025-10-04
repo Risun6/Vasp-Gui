@@ -65,6 +65,13 @@ except Exception:
     HAS_TTKBOOTSTRAP = False
 
 try:
+    from azure.ttk import theme as azure_theme  # type: ignore
+    HAS_AZURE_THEME = True
+except Exception:
+    azure_theme = None  # type: ignore
+    HAS_AZURE_THEME = False
+
+try:
     import pymatgen  # type: ignore  # noqa: F401
     HAS_PYMATGEN = True
 except Exception:
@@ -97,6 +104,243 @@ APP_VER = "0.1.0-MVP"
 CONFIG_DIR = Path.home() / ".config" / "vasp_gui"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
+
+
+class AzureThemeManager:
+    """Create a bright Azure-inspired light theme for the app."""
+
+    PALETTES: Dict[str, Dict[str, str]] = {
+        "light": {
+            "window": "#f4f6fb",
+            "surface": "#f8faff",
+            "card": "#ffffff",
+            "border": "#d8e2f6",
+            "accent": "#1f6feb",
+            "accent_hover": "#1a56d6",
+            "text": "#0f172a",
+            "muted": "#6b7b8f",
+            "entry": "#ffffff",
+            "tree_even": "#ffffff",
+            "tree_odd": "#f3f6fc",
+            "select_fg": "#ffffff",
+        },
+    }
+
+    def __init__(self, root: tk.Misc):
+        self.root = root
+        self.style = ttk.Style(root)
+        self.current_mode = "light"
+        self.using_native_package = False
+        if HAS_AZURE_THEME and azure_theme is not None:
+            try:
+                if hasattr(azure_theme, "use_theme"):
+                    azure_theme.use_theme(root, "light")
+                    self.using_native_package = True
+                elif hasattr(azure_theme, "use_light_theme"):
+                    azure_theme.use_light_theme(root)
+                    self.using_native_package = True
+            except Exception:
+                self.using_native_package = False
+        if not self.using_native_package:
+            self._ensure_base_theme("light")
+        self.use("light")
+
+    def _ensure_base_theme(self, mode: Literal["light"] = "light"):
+        theme_name = "azure-light"
+        if theme_name in self.style.theme_names():
+            return
+        base = "clam" if "clam" in self.style.theme_names() else self.style.theme_use()
+        palette = self.PALETTES["light"]
+        self.style.theme_create(
+            theme_name,
+            parent=base,
+            settings={
+                "TNotebook": {
+                    "configure": {
+                        "tabmargins": (12, 6, 12, 0),
+                        "background": palette["surface"],
+                        "borderwidth": 0,
+                    }
+                },
+                "TNotebook.Tab": {
+                    "configure": {
+                        "padding": (18, 10),
+                        "background": palette["surface"],
+                        "foreground": palette["muted"],
+                    },
+                    "map": {
+                        "background": [("selected", palette["card"])],
+                        "foreground": [("selected", palette["text"])],
+                    },
+                },
+                "Horizontal.TScrollbar": {
+                    "configure": {
+                        "background": palette["card"],
+                        "troughcolor": palette["surface"],
+                        "bordercolor": palette["border"],
+                    }
+                },
+                "Vertical.TScrollbar": {
+                    "configure": {
+                        "background": palette["card"],
+                        "troughcolor": palette["surface"],
+                        "bordercolor": palette["border"],
+                    }
+                },
+            },
+        )
+
+    def use(self, mode: Literal["light"] = "light"):
+        self.current_mode = "light"
+        if self.using_native_package:
+            try:
+                if hasattr(azure_theme, "use_theme"):
+                    azure_theme.use_theme(self.root, "light")
+                elif hasattr(azure_theme, "use_light_theme"):
+                    azure_theme.use_light_theme(self.root)
+            except Exception:
+                self.using_native_package = False
+                self._ensure_base_theme("light")
+        if not self.using_native_package:
+            theme_name = "azure-light"
+            self.style.theme_use(theme_name)
+        palette = self.PALETTES["light"]
+        self.root.configure(background=palette["window"])
+        self._apply_shared_styles(palette)
+
+    def _apply_shared_styles(self, palette: Dict[str, str]):
+        accent = palette["accent"]
+        accent_hover = palette["accent_hover"]
+
+        self.style.configure("TFrame", background=palette["surface"])
+        self.style.configure("Page.TFrame", background=palette["surface"])
+        self.style.configure("Toolbar.TFrame", background=palette["window"], padding=(12, 10))
+        self.style.configure("Card.TFrame", background=palette["card"], relief="flat")
+        self.style.configure("TLabel", background=palette["surface"], foreground=palette["text"])
+        self.style.configure("Muted.TLabel", background=palette["surface"], foreground=palette["muted"])
+        self.style.configure("Header.TLabel", font=("Segoe UI Semibold", 12), background=palette["surface"], foreground=palette["text"])
+        self.style.configure("Caption.TLabel", font=("Segoe UI", 10), background=palette["surface"], foreground=palette["muted"])
+        self.style.configure("TLabelframe", background=palette["card"], borderwidth=1, relief="flat")
+        self.style.configure("TLabelframe.Label", background=palette["card"], foreground=palette["muted"], font=("Segoe UI", 10, "bold"))
+        self.style.configure("TSeparator", background=palette["border"], borderwidth=0)
+
+        self.style.configure(
+            "TButton",
+            background=accent,
+            foreground=palette["select_fg"],
+            borderwidth=0,
+            focusthickness=1,
+            focuscolor=accent,
+            padding=(12, 7),
+        )
+        self.style.map(
+            "TButton",
+            background=[("active", accent_hover), ("pressed", accent_hover)],
+            foreground=[("disabled", palette["muted"]), ("pressed", palette["select_fg"]), ("active", palette["select_fg"])],
+        )
+
+        self.style.configure(
+            "Accent.TButton",
+            background=accent,
+            foreground=palette["select_fg"],
+            padding=(14, 9),
+        )
+        self.style.map(
+            "Accent.TButton",
+            background=[("active", accent_hover), ("pressed", accent_hover)],
+        )
+
+        self.style.configure(
+            "TEntry",
+            fieldbackground=palette["entry"],
+            foreground=palette["text"],
+            bordercolor=palette["border"],
+            lightcolor=accent,
+            darkcolor=palette["border"],
+            padding=(10, 6),
+        )
+        self.style.map(
+            "TEntry",
+            bordercolor=[("focus", accent)],
+        )
+
+        self.style.configure(
+            "TCombobox",
+            fieldbackground=palette["entry"],
+            background=palette["entry"],
+            foreground=palette["text"],
+            bordercolor=palette["border"],
+            padding=(10, 6),
+        )
+        self.style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", palette["entry"]), ("active", palette["entry"])],
+            foreground=[("readonly", palette["text"]), ("disabled", palette["muted"])],
+            bordercolor=[("focus", accent)],
+        )
+
+        self.style.configure(
+            "TCheckbutton",
+            background=palette["surface"],
+            foreground=palette["text"],
+        )
+        self.style.configure(
+            "TRadiobutton",
+            background=palette["surface"],
+            foreground=palette["text"],
+        )
+
+        self.style.configure(
+            "Treeview",
+            background=palette["card"],
+            fieldbackground=palette["card"],
+            foreground=palette["text"],
+            bordercolor=palette["border"],
+        )
+        self.style.configure(
+            "Treeview.Heading",
+            background=palette["surface"],
+            foreground=palette["muted"],
+            relief="flat",
+        )
+        self.style.map(
+            "Treeview",
+            background=[("selected", accent)],
+            foreground=[("selected", palette["select_fg"])],
+        )
+
+        self.root.option_add("*TCombobox*Listbox.background", palette["card"])
+        self.root.option_add("*TCombobox*Listbox.foreground", palette["text"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", accent)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", palette["select_fg"])
+
+        self.style.configure(
+            "StatusAccent.TLabel",
+            font=("Segoe UI", 10, "bold"),
+            foreground=accent,
+            background=palette["surface"],
+        )
+
+    def style_text_widget(self, widget: tk.Text):
+        palette = self.PALETTES[self.current_mode]
+        prev_state = widget.cget("state")
+        if prev_state == tk.DISABLED:
+            widget.configure(state=tk.NORMAL)
+        widget.configure(
+            background=palette["surface"],
+            foreground=palette["text"],
+            insertbackground=palette["text"],
+            selectbackground=palette["accent"],
+            selectforeground=palette["select_fg"],
+            highlightthickness=1,
+            highlightbackground=palette["border"],
+            highlightcolor=palette["accent"],
+            bd=0,
+            relief=tk.FLAT,
+        )
+        if prev_state == tk.DISABLED:
+            widget.configure(foreground=palette["muted"])
+            widget.configure(state=tk.DISABLED)
 
 @dataclass
 class WizardProfile:
@@ -751,11 +995,7 @@ class VaspGUI(tk.Tk):
         super().__init__()
         self.title(f"{APP_NAME} v{APP_VER}")
         self.geometry("1200x800")
-        if HAS_TTKBOOTSTRAP and tb is not None:
-            try:
-                tb.Style("cosmo")
-            except Exception:
-                pass
+        self.theme_manager = AzureThemeManager(self)
 
         self.project_dir = Path.cwd()
         self.proc = None  # subprocess.Popen or None
@@ -765,6 +1005,8 @@ class VaspGUI(tk.Tk):
         self.figure_style_var = tk.StringVar(value="AFM")
         self.emit_report_var = tk.BooleanVar(value=True)
         self.run_suggestion_widgets: list[tk.Text] = []
+        self.themable_texts: list[tk.Text] = []
+        self.themable_canvases: list[tk.Canvas] = []
         self.overview_items = [
             ("__project__", "项目目录"),
             ("INCAR", "INCAR"),
@@ -791,17 +1033,21 @@ class VaspGUI(tk.Tk):
     # ------------------------- UI 构建 ----------------------------------
     def _build_ui(self):
         # 顶部工具栏
-        toolbar = ttk.Frame(self)
+        toolbar = ttk.Frame(self, style="Toolbar.TFrame")
         toolbar.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(toolbar, text=APP_NAME, style="Header.TLabel").pack(side=tk.LEFT, padx=(10, 24))
 
         ttk.Label(toolbar, text="项目目录:").pack(side=tk.LEFT, padx=6)
         self.project_var = tk.StringVar(value=str(self.project_dir))
         self.project_entry = ttk.Entry(toolbar, textvariable=self.project_var, width=80)
         self.project_entry.pack(side=tk.LEFT, padx=4)
-        ttk.Button(toolbar, text="选择…", command=self.choose_project).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="新建项目", command=self.create_project).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="选择…", command=self.choose_project, style="Accent.TButton").pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="新建项目", command=self.create_project, style="Accent.TButton").pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="首次向导", command=self.launch_first_time_wizard).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="创建示例项目", command=self.on_create_example_project).pack(side=tk.LEFT, padx=4)
+
+        ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X)
 
         # Notebook
         self.nb = ttk.Notebook(self)
@@ -830,18 +1076,38 @@ class VaspGUI(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
+    def _register_themable_text(self, widget: tk.Text):
+        if widget not in self.themable_texts:
+            self.themable_texts.append(widget)
+        self.theme_manager.style_text_widget(widget)
+
+    def _style_canvas(self, canvas: tk.Canvas):
+        palette = self.theme_manager.PALETTES[self.theme_manager.current_mode]
+        canvas.configure(
+            background=palette["surface"],
+            highlightbackground=palette["surface"],
+            highlightthickness=0,
+            borderwidth=0,
+        )
+
+    def _register_canvas(self, canvas: tk.Canvas):
+        if canvas not in self.themable_canvases:
+            self.themable_canvases.append(canvas)
+        self._style_canvas(canvas)
+
     # ------------------------- 页面：输入文件 -----------------------------
     def _build_inputs_page(self, parent):
-        frame = ttk.Frame(parent)
+        frame = ttk.Frame(parent, style="Page.TFrame")
 
         # 外层滚动容器，确保内容较多时仍可完整浏览
-        canvas = tk.Canvas(frame, highlightthickness=0)
+        canvas = tk.Canvas(frame, highlightthickness=0, bd=0)
         vscroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=canvas.yview)
         canvas.configure(yscrollcommand=vscroll.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._register_canvas(canvas)
 
-        inner = ttk.Frame(canvas)
+        inner = ttk.Frame(canvas, style="Page.TFrame")
         inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
 
         def _update_scrollregion(event=None):
@@ -884,11 +1150,11 @@ class VaspGUI(tk.Tk):
         paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         # 左边：INCAR 模板
-        left = ttk.Frame(paned, padding=8)
+        left = ttk.Frame(paned, padding=8, style="Card.TFrame")
         paned.add(left, weight=1)
 
         ttk.Label(left, text="INCAR 模板与编辑").pack(anchor=tk.W)
-        temp_bar = ttk.Frame(left)
+        temp_bar = ttk.Frame(left, style="Card.TFrame")
         temp_bar.pack(fill=tk.X, pady=4)
         self.incar_template = tk.StringVar(value="relax")
         for key, txt in [
@@ -901,7 +1167,7 @@ class VaspGUI(tk.Tk):
         ttk.Button(temp_bar, text="加载模板到编辑器", command=self.load_incar_template).pack(side=tk.RIGHT)
 
         # INCAR 简单面板
-        simple_box = ttk.LabelFrame(left, text="INCAR 简单面板")
+        simple_box = ttk.LabelFrame(left, text="INCAR 简单面板", padding=8)
         simple_box.pack(fill=tk.X, pady=4)
         self.incar_simple_vars: dict[str, tk.StringVar] = {}
         simple_items = [
@@ -916,7 +1182,7 @@ class VaspGUI(tk.Tk):
         for idx, (key, label) in enumerate(simple_items):
             row = idx // 2
             col = idx % 2
-            frame_cell = ttk.Frame(simple_box)
+            frame_cell = ttk.Frame(simple_box, style="Card.TFrame")
             frame_cell.grid(row=row, column=col, sticky="ew", padx=4, pady=2)
             ttk.Label(frame_cell, text=label + ":").pack(side=tk.LEFT)
             var = tk.StringVar()
@@ -925,26 +1191,30 @@ class VaspGUI(tk.Tk):
             entry.pack(side=tk.LEFT, padx=4)
         for i in range(2):
             simple_box.grid_columnconfigure(i, weight=1)
-        btn_row = ttk.Frame(simple_box)
+        btn_row = ttk.Frame(simple_box, style="Card.TFrame")
         btn_row.grid(row=(len(simple_items)+1)//2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         ttk.Button(btn_row, text="从编辑器读取", command=self.refresh_incar_simple_panel).pack(side=tk.LEFT)
         ttk.Button(btn_row, text="写入到编辑器", command=self.apply_incar_simple_panel).pack(side=tk.LEFT, padx=6)
 
         self.incar_text = ScrolledText(left, height=20, undo=True, wrap="none")
         self.incar_text.pack(fill=tk.BOTH, expand=True)
-        btns = ttk.Frame(left)
+        self._register_themable_text(self.incar_text)
+
+        btns = ttk.Frame(left, style="Card.TFrame")
         btns.pack(fill=tk.X, pady=4)
         ttk.Button(btns, text="打开现有 INCAR", command=lambda: self.open_into_editor("INCAR", self.incar_text)).pack(side=tk.LEFT)
         ttk.Button(btns, text="保存到项目", command=lambda: self.save_from_editor("INCAR", self.incar_text)).pack(side=tk.LEFT, padx=6)
 
         # 右边：POSCAR & KPOINTS 编辑
-        right = ttk.Frame(paned, padding=8)
+        right = ttk.Frame(paned, padding=8, style="Card.TFrame")
         paned.add(right, weight=1)
 
         ttk.Label(right, text="POSCAR 编辑").pack(anchor=tk.W)
         self.poscar_text = ScrolledText(right, height=10, undo=True, wrap="none")
         self.poscar_text.pack(fill=tk.BOTH, expand=True)
-        row = ttk.Frame(right)
+        self._register_themable_text(self.poscar_text)
+
+        row = ttk.Frame(right, style="Card.TFrame")
         row.pack(fill=tk.X, pady=4)
         ttk.Button(row, text="打开 POSCAR", command=lambda: self.open_into_editor("POSCAR", self.poscar_text)).pack(side=tk.LEFT)
         ttk.Button(row, text="保存 POSCAR", command=lambda: self.save_from_editor("POSCAR", self.poscar_text)).pack(side=tk.LEFT, padx=6)
@@ -955,7 +1225,9 @@ class VaspGUI(tk.Tk):
         ttk.Label(right, text="KPOINTS 编辑（可在K 点生成页自动生成）").pack(anchor=tk.W)
         self.kpoints_text = ScrolledText(right, height=10, undo=True, wrap="none")
         self.kpoints_text.pack(fill=tk.BOTH, expand=True)
-        row2 = ttk.Frame(right)
+        self._register_themable_text(self.kpoints_text)
+
+        row2 = ttk.Frame(right, style="Card.TFrame")
         row2.pack(fill=tk.X, pady=4)
         ttk.Button(row2, text="打开 KPOINTS", command=lambda: self.open_into_editor("KPOINTS", self.kpoints_text)).pack(side=tk.LEFT)
         ttk.Button(row2, text="保存 KPOINTS", command=lambda: self.save_from_editor("KPOINTS", self.kpoints_text)).pack(side=tk.LEFT, padx=6)
@@ -1315,7 +1587,7 @@ class VaspGUI(tk.Tk):
 
     # ------------------------- 页面：POTCAR --------------------------------
     def _populate_potcar_section(self, container):
-        row1 = ttk.Frame(container)
+        row1 = ttk.Frame(container, style="Card.TFrame")
         row1.pack(fill=tk.X, padx=8, pady=8)
         ttk.Label(row1, text="赝势库根目录：").pack(side=tk.LEFT)
         self.pot_dir_var = tk.StringVar(value=str(Path.home() / "potcars"))
@@ -1323,18 +1595,19 @@ class VaspGUI(tk.Tk):
         ttk.Button(row1, text="选择…", command=self.choose_pot_dir).pack(side=tk.LEFT)
         ttk.Button(row1, text="探测赝势库", command=self.detect_pot_roots).pack(side=tk.LEFT, padx=6)
 
-        row2 = ttk.Frame(container)
+        row2 = ttk.Frame(container, style="Card.TFrame")
         row2.pack(fill=tk.X, padx=8, pady=4)
         ttk.Label(row2, text="从 POSCAR 自动解析元素并生成 POTCAR：").pack(side=tk.LEFT)
         ttk.Button(row2, text="生成 POTCAR", command=self.do_build_potcar).pack(side=tk.LEFT, padx=8)
 
         self.pot_msg = ScrolledText(container, height=12, wrap="word")
         self.pot_msg.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self._register_themable_text(self.pot_msg)
 
         return container
 
     def _build_potcar_page(self, parent):
-        frame = ttk.Frame(parent)
+        frame = ttk.Frame(parent, style="Page.TFrame")
         self._populate_potcar_section(frame)
         return frame
 
@@ -1482,7 +1755,7 @@ class VaspGUI(tk.Tk):
 
     # ------------------------- 页面：KPOINTS -------------------------------
     def _populate_kpoints_section(self, container):
-        box = ttk.LabelFrame(container, text="Monkhorst-Pack 网格")
+        box = ttk.LabelFrame(container, text="Monkhorst-Pack 网格", padding=8)
         box.pack(fill=tk.X, padx=8, pady=8)
 
         self.k_nx = tk.IntVar(value=5)
@@ -1490,7 +1763,7 @@ class VaspGUI(tk.Tk):
         self.k_nz = tk.IntVar(value=5)
         self.k_gamma = tk.BooleanVar(value=True)
 
-        row = ttk.Frame(box)
+        row = ttk.Frame(box, style="Card.TFrame")
         row.pack(fill=tk.X, pady=4)
         ttk.Label(row, text="Nx").pack(side=tk.LEFT)
         ttk.Spinbox(row, from_=1, to=50, textvariable=self.k_nx, width=5).pack(side=tk.LEFT, padx=6)
@@ -1500,18 +1773,18 @@ class VaspGUI(tk.Tk):
         ttk.Spinbox(row, from_=1, to=50, textvariable=self.k_nz, width=5).pack(side=tk.LEFT, padx=6)
         ttk.Checkbutton(box, text="Gamma 中心", variable=self.k_gamma).pack(anchor=tk.W, padx=8)
 
-        btns = ttk.Frame(container)
+        btns = ttk.Frame(container, style="Card.TFrame")
         btns.pack(fill=tk.X, padx=8, pady=4)
         ttk.Button(btns, text="生成到编辑器", command=self.kpoints_to_editor).pack(side=tk.LEFT)
         ttk.Button(btns, text="保存到项目(KPOINTS)", command=self.kpoints_save).pack(side=tk.LEFT, padx=8)
 
-        tip = ttk.Label(container, text="提示：也可在 INCAR 使用 KSPACING，省去 KPOINTS（VASP 5.4.4+）")
+        tip = ttk.Label(container, text="提示：也可在 INCAR 使用 KSPACING，省去 KPOINTS（VASP 5.4.4+）", style="Caption.TLabel")
         tip.pack(anchor=tk.W, padx=12, pady=4)
 
         return container
 
     def _build_kpoints_page(self, parent):
-        frame = ttk.Frame(parent)
+        frame = ttk.Frame(parent, style="Page.TFrame")
         self._populate_kpoints_section(frame)
         return frame
 
@@ -1524,15 +1797,16 @@ class VaspGUI(tk.Tk):
         dialog.resizable(True, True)
         dialog.grab_set()
 
-        frame = ttk.Frame(dialog, padding=12)
+        frame = ttk.Frame(dialog, padding=12, style="Card.TFrame")
         frame.pack(fill=tk.BOTH, expand=True)
 
         text = ScrolledText(frame, wrap=tk.WORD, width=68, height=20)
         text.insert(tk.END, message)
         text.configure(state=tk.DISABLED)
         text.pack(fill=tk.BOTH, expand=True)
+        self.theme_manager.style_text_widget(text)
 
-        btn_row = ttk.Frame(frame)
+        btn_row = ttk.Frame(frame, style="Card.TFrame")
         btn_row.pack(fill=tk.X, pady=(12, 0))
         ttk.Button(btn_row, text="关闭", command=dialog.destroy).pack(side=tk.RIGHT)
 
@@ -1556,27 +1830,28 @@ class VaspGUI(tk.Tk):
 
     def _tw_add_section_heading(self, parent, caption: str, help_text: str,
                                 *, title: Optional[str] = None, pady=(8, 4)) -> ttk.Frame:
-        row = ttk.Frame(parent)
+        row = ttk.Frame(parent, style="Card.TFrame")
         row.pack(fill=tk.X, pady=pady)
-        ttk.Label(row, text=caption, font=("TkDefaultFont", 10, "bold")).pack(side=tk.LEFT)
+        ttk.Label(row, text=caption, style="Header.TLabel").pack(side=tk.LEFT)
         self._tw_add_help_button(row, title or caption, help_text)
         return row
     # === CODEX END: twist/shift helpers ===
 
     # === CODEX BEGIN: twist/shift page UI ===
     def _build_twistshift_page(self, parent):
-        frame = ttk.Frame(parent)
+        frame = ttk.Frame(parent, style="Page.TFrame")
 
         # 左栏：输入与控制（带滚动条）
-        left_container = ttk.Frame(frame)
+        left_container = ttk.Frame(frame, style="Card.TFrame")
         left_container.pack(side=tk.LEFT, fill=tk.Y)
         left_canvas = tk.Canvas(left_container, borderwidth=0, highlightthickness=0, width=420)
         left_scroll = ttk.Scrollbar(left_container, orient=tk.VERTICAL, command=left_canvas.yview)
         left_canvas.configure(yscrollcommand=left_scroll.set)
         left_canvas.pack(side=tk.LEFT, fill=tk.Y, expand=False)
         left_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._register_canvas(left_canvas)
 
-        left = ttk.Frame(left_canvas, padding=8)
+        left = ttk.Frame(left_canvas, padding=8, style="Card.TFrame")
         left_window = left_canvas.create_window((0, 0), window=left, anchor="nw")
 
         def _sync_scrollregion(event):
@@ -1694,7 +1969,13 @@ class VaspGUI(tk.Tk):
         dim_frame.pack(fill=tk.X, pady=4)
         ttk.Checkbutton(dim_frame, text="启用扭转角扫描", variable=self.tw_enable_twist).pack(anchor=tk.W, padx=6, pady=2)
         ttk.Checkbutton(dim_frame, text="启用滑移网格扫描", variable=self.tw_enable_slide).pack(anchor=tk.W, padx=6, pady=2)
-        ttk.Label(dim_frame, text="可按需只做扭转或只做滑移，两者都开时则全量组合。", wraplength=340, justify=tk.LEFT, foreground="#555").pack(anchor=tk.W, padx=6, pady=(0, 4))
+        ttk.Label(
+            dim_frame,
+            text="可按需只做扭转或只做滑移，两者都开时则全量组合。",
+            wraplength=340,
+            justify=tk.LEFT,
+            style="Caption.TLabel",
+        ).pack(anchor=tk.W, padx=6, pady=(0, 4))
 
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
@@ -1747,7 +2028,8 @@ class VaspGUI(tk.Tk):
         self._tw_add_section_heading(left, "常见注意事项", help_notes, title="常见注意事项", pady=(0, 8))
 
         # 右栏：俯视预览
-        right = ttk.Frame(frame, padding=8); right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        right = ttk.Frame(frame, padding=8, style="Card.TFrame")
+        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
         self.fig_tw = Figure(figsize=(6.0,4.5), dpi=100)
         self.ax_tw = self.fig_tw.add_subplot(111)
         self.ax_tw.set_title("Top view preview")
@@ -2350,26 +2632,27 @@ class VaspGUI(tk.Tk):
 
     # ------------------------- 页面：流程助手 ------------------------------
     def _build_workflow_page(self, parent):
-        frame = ttk.Frame(parent)
+        frame = ttk.Frame(parent, style="Page.TFrame")
 
         intro = ttk.Label(
             frame,
             text="按照从上到下的步骤完成一次 VASP 计算，可点击按钮快速跳转到对应面板。",
             wraplength=900,
             justify=tk.LEFT,
+            style="Muted.TLabel",
         )
         intro.pack(fill=tk.X, padx=12, pady=8)
 
-        status_box = ttk.LabelFrame(frame, text="当前项目状态")
+        status_box = ttk.LabelFrame(frame, text="当前项目状态", padding=8)
         status_box.pack(fill=tk.BOTH, expand=False, padx=12, pady=6)
 
-        status_row = ttk.Frame(status_box)
+        status_row = ttk.Frame(status_box, style="Card.TFrame")
         status_row.pack(fill=tk.X, padx=8, pady=6)
         ttk.Label(status_row, text="运行状态：").pack(side=tk.LEFT)
         ttk.Label(status_row, textvariable=self.run_status_var).pack(side=tk.LEFT, padx=4)
         ttk.Button(status_row, text="刷新状态", command=self.refresh_run_status).pack(side=tk.RIGHT)
 
-        tree_frame = ttk.Frame(status_box)
+        tree_frame = ttk.Frame(status_box, style="Card.TFrame")
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
         columns = ("name", "status", "detail")
         self.workflow_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=6)
@@ -2384,7 +2667,7 @@ class VaspGUI(tk.Tk):
         self.workflow_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        sugg = ttk.Frame(status_box)
+        sugg = ttk.Frame(status_box, style="Card.TFrame")
         sugg.pack(fill=tk.BOTH, expand=False, padx=8, pady=(0, 6))
         ttk.Label(sugg, text="运行建议：").pack(anchor=tk.W)
         wf_suggest = ScrolledText(sugg, height=4, wrap="word", state="disabled")
@@ -2450,25 +2733,26 @@ class VaspGUI(tk.Tk):
             ),
         ]
 
-        steps_frame = ttk.Frame(frame)
+        steps_frame = ttk.Frame(frame, style="Card.TFrame")
         steps_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
         steps_frame.grid_columnconfigure(0, weight=1)
         steps_frame.grid_columnconfigure(1, weight=1)
         for idx, (title, desc, buttons, page) in enumerate(steps):
             row, col = divmod(idx, 2)
-            box = ttk.LabelFrame(steps_frame, text=title)
+            box = ttk.LabelFrame(steps_frame, text=title, padding=8)
             box.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
             ttk.Label(box, text=desc, justify=tk.LEFT, wraplength=360).pack(anchor=tk.W, padx=8, pady=4)
-            row_frame = ttk.Frame(box)
+            row_frame = ttk.Frame(box, style="Card.TFrame")
             row_frame.pack(anchor=tk.W, padx=8, pady=4)
             for txt, cmd in buttons:
                 ttk.Button(row_frame, text=txt, command=cmd).pack(side=tk.LEFT, padx=4)
             ttk.Button(row_frame, text="打开此面板", command=lambda p=page: self.goto_tab(p)).pack(side=tk.LEFT, padx=8)
 
-        notes = ttk.LabelFrame(frame, text="流程备注 / 待办")
+        notes = ttk.LabelFrame(frame, text="流程备注 / 待办", padding=8)
         notes.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
         self.workflow_notes = ScrolledText(notes, height=8, wrap="word")
         self.workflow_notes.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self._register_themable_text(self.workflow_notes)
         self.workflow_notes.insert(
             tk.END,
             "可在此记录当前任务的特殊参数、检查列表或备注。内容不会自动保存。",
@@ -2555,11 +2839,11 @@ class VaspGUI(tk.Tk):
 
     # ------------------------- 页面：运行 / 提交 ----------------------------
     def _build_run_page(self, parent):
-        frame = ttk.Frame(parent)
+        frame = ttk.Frame(parent, style="Page.TFrame")
 
-        status = ttk.LabelFrame(frame, text="运行状态")
+        status = ttk.LabelFrame(frame, text="运行状态", padding=8)
         status.pack(fill=tk.X, padx=8, pady=6)
-        row = ttk.Frame(status)
+        row = ttk.Frame(status, style="Card.TFrame")
         row.pack(fill=tk.X, padx=6, pady=4)
         ttk.Label(row, text="当前状态：").pack(side=tk.LEFT)
         ttk.Label(row, textvariable=self.run_status_var).pack(side=tk.LEFT, padx=4)
@@ -2569,7 +2853,7 @@ class VaspGUI(tk.Tk):
         self._register_suggestion_widget(run_suggest)
 
         # 运行方式
-        row0 = ttk.LabelFrame(frame, text="运行方式")
+        row0 = ttk.LabelFrame(frame, text="运行方式", padding=8)
         row0.pack(fill=tk.X, padx=8, pady=8)
         self.run_mode = tk.StringVar(value="local")
         ttk.Radiobutton(row0, text="本地 mpirun", value="local", variable=self.run_mode).pack(side=tk.LEFT, padx=8)
@@ -2577,7 +2861,7 @@ class VaspGUI(tk.Tk):
         ttk.Radiobutton(row0, text="SLURM 集群", value="slurm", variable=self.run_mode).pack(side=tk.LEFT)
 
         # VASP 执行文件 & 核心数
-        row1 = ttk.LabelFrame(frame, text="VASP 执行配置")
+        row1 = ttk.LabelFrame(frame, text="VASP 执行配置", padding=8)
         row1.pack(fill=tk.X, padx=8, pady=4)
         ttk.Label(row1, text="VASP 命令").grid(row=0, column=0, sticky=tk.W, padx=6, pady=4)
         self.vasp_cmd = tk.StringVar(value="vasp_std")
@@ -2593,7 +2877,7 @@ class VaspGUI(tk.Tk):
         ttk.Spinbox(row1, from_=1, to=2048, textvariable=self.mpi_np, width=8).grid(row=1, column=1, sticky=tk.W)
 
         # SLURM 区域
-        row2 = ttk.LabelFrame(frame, text="SLURM 提交（仅在选择 SLURM 运行时使用）")
+        row2 = ttk.LabelFrame(frame, text="SLURM 提交（仅在选择 SLURM 运行时使用）", padding=8)
         row2.pack(fill=tk.X, padx=8, pady=4)
         self.slurm_part = tk.StringVar(value="normal")
         self.slurm_time = tk.StringVar(value="02:00:00")
@@ -2611,7 +2895,7 @@ class VaspGUI(tk.Tk):
         ttk.Label(row2, text="账号").grid(row=0, column=8, sticky=tk.W, padx=6)
         ttk.Entry(row2, textvariable=self.slurm_account, width=12).grid(row=0, column=9)
 
-        btns = ttk.Frame(frame)
+        btns = ttk.Frame(frame, style="Card.TFrame")
         btns.pack(fill=tk.X, padx=8, pady=8)
         ttk.Button(btns, text="生成运行脚本", command=self.write_job_script).pack(side=tk.LEFT)
         ttk.Button(btns, text="启动/提交", command=self.start_run).pack(side=tk.LEFT, padx=8)
@@ -2619,6 +2903,7 @@ class VaspGUI(tk.Tk):
 
         self.run_log = ScrolledText(frame, height=14, wrap="word")
         self.run_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self._register_themable_text(self.run_log)
 
         return frame
 
@@ -2878,11 +3163,11 @@ nice -n 5 ionice -c2 -n4 \
 
     # ------------------------- 页面：监视 ----------------------------------
     def _build_monitor_page(self, parent):
-        frame = ttk.Frame(parent)
+        frame = ttk.Frame(parent, style="Page.TFrame")
 
-        status_box = ttk.LabelFrame(frame, text="运行状态概览")
+        status_box = ttk.LabelFrame(frame, text="运行状态概览", padding=8)
         status_box.pack(fill=tk.X, padx=8, pady=10)
-        row = ttk.Frame(status_box)
+        row = ttk.Frame(status_box, style="Card.TFrame")
         row.pack(fill=tk.X, padx=6, pady=8)
         ttk.Label(row, text="当前状态：").pack(side=tk.LEFT)
         ttk.Label(row, textvariable=self.run_status_var).pack(side=tk.LEFT, padx=4)
@@ -2891,7 +3176,7 @@ nice -n 5 ionice -c2 -n4 \
         monitor_suggest.pack(fill=tk.X, padx=6, pady=(2, 8))
         self._register_suggestion_widget(monitor_suggest)
 
-        top = ttk.Frame(frame)
+        top = ttk.Frame(frame, style="Card.TFrame")
         top.pack(fill=tk.X, padx=8, pady=6)
         ttk.Button(top, text="开始监视", command=self.start_monitor).pack(side=tk.LEFT)
         ttk.Button(top, text="停止监视", command=self.stop_monitor).pack(side=tk.LEFT, padx=6)
@@ -2911,21 +3196,23 @@ nice -n 5 ionice -c2 -n4 \
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         # ETA 显示
-        eta_row = ttk.Frame(frame)
+        eta_row = ttk.Frame(frame, style="Card.TFrame")
         eta_row.pack(fill=tk.X, padx=8, pady=(0, 4))
         ttk.Label(eta_row, text="预计剩余时间：").pack(side=tk.LEFT)
         self.eta_var = tk.StringVar(value="—")
-        self.eta_label = ttk.Label(eta_row, textvariable=self.eta_var, foreground="#2b8a3e")
+        self.eta_label = ttk.Label(eta_row, textvariable=self.eta_var, style="StatusAccent.TLabel")
         self.eta_label.pack(side=tk.LEFT, padx=6)
         ttk.Label(eta_row, text="(基于最近 SCF 平均耗时与 OSZICAR 迭代统计)").pack(side=tk.LEFT, padx=6)
 
         self.mon_info = ScrolledText(frame, height=6, wrap="word")
         self.mon_info.pack(fill=tk.BOTH, expand=False, padx=8, pady=4)
+        self._register_themable_text(self.mon_info)
 
-        sys_frame = ttk.LabelFrame(frame, text="系统状态：CPU / 进程 / 文件增长")
+        sys_frame = ttk.LabelFrame(frame, text="系统状态：CPU / 进程 / 文件增长", padding=8)
         sys_frame.pack(fill=tk.BOTH, expand=False, padx=8, pady=6)
         self.sys_info = ScrolledText(sys_frame, height=10, wrap="word")
         self.sys_info.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self._register_themable_text(self.sys_info)
 
         self.sys_info.insert(tk.END, "点击“开始监视”以获取实时系统信息。\n")
 
@@ -3083,14 +3370,15 @@ nice -n 5 ionice -c2 -n4 \
 
     # ------------------------- 页面：后处理 ---------------------------
     def _build_post_page(self, parent):
-        frame = ttk.Frame(parent)
-        row = ttk.Frame(frame)
+        frame = ttk.Frame(parent, style="Page.TFrame")
+        row = ttk.Frame(frame, style="Card.TFrame")
         row.pack(fill=tk.X, padx=8, pady=8)
         ttk.Button(row, text="收敛曲线（OSZICAR）→ 图/CSV", command=self.export_convergence).pack(side=tk.LEFT)
         ttk.Button(row, text="总 DOS（DOSCAR）→ 图/CSV", command=self.export_dos_total).pack(side=tk.LEFT, padx=8)
         ttk.Button(row, text="能带（EIGENVAL）→ 图/CSV", command=self.export_bands).pack(side=tk.LEFT)
         self.post_log = ScrolledText(frame, height=18, wrap="word")
         self.post_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self._register_themable_text(self.post_log)
         return frame
 
     def plot_once_from_oszicar(self):
@@ -3234,6 +3522,7 @@ nice -n 5 ionice -c2 -n4 \
 
     def _register_suggestion_widget(self, widget: tk.Text):
         self.run_suggestion_widgets.append(widget)
+        self._register_themable_text(widget)
 
     def current_project_path(self) -> Path:
         val = self.project_var.get()
