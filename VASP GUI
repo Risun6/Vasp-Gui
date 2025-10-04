@@ -4350,6 +4350,7 @@ class VaspGUI(tk.Tk):
 
         self.tw_results = rows
         thetas = sorted({round(r["theta"], 6) for r in rows})
+
         try:
             current_theta = float(self.tw_theta.get())
         except (tk.TclError, TypeError, ValueError):
@@ -4391,6 +4392,7 @@ class VaspGUI(tk.Tk):
     def _tw_refilter_and_redraw(self):
         if not getattr(self, "tw_results", None):
             return
+
         try:
             theta_val = float(self.tw_theta.get())
         except (tk.TclError, TypeError, ValueError):
@@ -4429,6 +4431,7 @@ class VaspGUI(tk.Tk):
             return
         self.tw_ax.clear()
         if not rows:
+
             self.tw_ax.set_title("No data available")
             self.tw_canvas.draw_idle()
             return
