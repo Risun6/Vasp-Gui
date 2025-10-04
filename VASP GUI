@@ -1573,6 +1573,7 @@ class VaspGUI(tk.Tk):
         info1 = textwrap.dedent("""
             1) 上/下层 POSCAR
 
+
             选择底层 (B) 与上层 (T) 的 POSCAR。程序假定 c 轴接近层法向，必要时会自动把法向对齐 z 轴。上层按刚体处理参与旋转与滑移，最终叠加在底层之上，层间距由真空参数控制。
         """).strip()
         ttk.Label(left, text=info1, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(4, 8))
@@ -1594,6 +1595,7 @@ class VaspGUI(tk.Tk):
             2) 真空 (Å) 与 容许应变 (%)
 
             真空控制 c 方向晶格长度（层间距离加真空层），二维体系通常取 15–20 Å，并配合 LDIPOL=.TRUE., IDIPOL=3。容许应变 ε 允许面内各向同性拉伸或压缩以构造近共格超胞，内部搜索满足 |Mᵦ·Aᵦ − R(θ)·Mₜ·Aₜ| / |·| ≤ ε 的整数矩阵对；常用 0.5–1.0%。莫尔超胞原子数随 1/θ² 增长，可通过任务上限控制规模。
+
         """).strip()
         ttk.Label(left, text=info2, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(4, 8))
 
@@ -1620,6 +1622,7 @@ class VaspGUI(tk.Tk):
             3) 扭转角 θ（度）
 
             起、止与步长按闭区间生成角度序列，若步长不整除区间则截断到不超过止点的最后一个角度。六角或三角晶格在 0–60° 范围内即可覆盖独立堆垛，异质双层通常也采用该区间。角度数量计算公式为 Nθ = floor((止 − 起)/步) + 1。
+
         """).strip()
         ttk.Label(left, text=info3, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
 
@@ -1636,6 +1639,7 @@ class VaspGUI(tk.Tk):
             4) 滑移 (分数坐标 uₓ,uᵧ)
 
             上层平移向量定义为 t = uₓ·a₁ + uᵧ·a₂，其中 a₁、a₂ 为底层面内基矢。网格在 [0,1)×[0,1) 内均匀采样，u=1 与 u=0 等价。uₓ 步数 = nₓ、uᵧ 步数 = nᵧ 将生成 nₓ×nᵧ 个滑移组合；六角格体系可按对称性自动去重。
+
         """).strip()
         ttk.Label(left, text=info4, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
 
@@ -1655,6 +1659,7 @@ class VaspGUI(tk.Tk):
             5) KSPACING 与 任务上限
 
             KSPACING 控制每个任务的 k 网密度，优先写入 INCAR；若已提供 KPOINTS，则按指定网格执行。常用取值：小原胞或金属 0.18–0.22，半导体 0.22–0.30，超大莫尔超胞可先以 Γ-only 或 KSPACING≈0.35 预筛。任务上限用于约束 sweep 规模，总任务数可按 N_tot = Nθ × nₓ × nᵧ 估算。
+
         """).strip()
         ttk.Label(left, text=info5, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
 
@@ -1668,6 +1673,7 @@ class VaspGUI(tk.Tk):
             6) 选项与按钮
 
             “生成后自动运行”会在批量生成任务的同时写入脚本并按当前运行模式触发，默认保持关闭以便先核对结构。“预览当前(θ,u)几何”即时构造当前组合便于检查。“生成单例 POSCAR”仅输出当前参数的单个目录。“批量遍历并生成”根据角度与滑移网格写出全部任务、脚本与 meta.json。“解析 sweep 结果 → CSV”汇总能量、带隙和收敛信息供后续筛选。
+
         """).strip()
         ttk.Label(left, text=info6, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
 
@@ -1675,16 +1681,20 @@ class VaspGUI(tk.Tk):
         ttk.Button(left, text="解析 sweep 结果 → CSV", command=self._tw_collect_results).pack(anchor=tk.W)
 
         info7 = textwrap.dedent("""
+        
             7) 计算与物理的默认值
 
             建议起点：真空 20 Å 并启用 LDIPOL=.TRUE., IDIPOL=3；容许应变 0.5–0.8%，在极小角度时可放宽至 1.0%。角度扫描可先覆盖 0–10°、步长 2°，再对重点角度加密。滑移网格常用 5×5 或 7×7，势垒或摩擦研究可加密至 15×15。KSPACING 约 0.22，超大胞先用 Γ-only 预筛再细化。SCF/DOS 步推荐 ISMEAR=0, SIGMA=0.05；Relax 或金属步可切换 ISMEAR=1, SIGMA=0.2。vdW 建议统一采用 IVDW=12 或 rVV10。
+
         """).strip()
         ttk.Label(left, text=info7, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(8, 8))
 
         info8 = textwrap.dedent("""
+        
             8) 常见注意事项
 
             小角度会显著增加原子数，可结合任务上限、Γ-only 预筛及更高容许应变限制规模。滑移始终使用底层基矢的分数坐标，预览界面显示的 t = ux·a1 + uy·a2 可用于校验。滑移网格采用 [0,1) 区间避免端点重合，角度扫描需确保步长与终点一致。PBE 带隙偏低，关键构型应追加 HSE 或 scGW 以建立多保真修正。
+
         """).strip()
         ttk.Label(left, text=info8, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
 
