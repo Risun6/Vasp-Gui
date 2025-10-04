@@ -4480,6 +4480,163 @@ nice -n 5 ionice -c2 -n4 \
         self.post_metrics.see(tk.END)
         self.post_metrics.configure(state=tk.DISABLED)
 
+
+    def _refresh_post_env_capability(self):
+        badges: list[str] = []
+        badges.append("✅ seekpath" if HAS_SEEKPATH else "⛔︎ seekpath")
+        badges.append("✅ pymatgen" if HAS_PYMATGEN else "⛔︎ pymatgen")
+        badges.append("✅ numpy" if HAS_NUMPY else "⛔︎ numpy")
+        self.post_env_var.set(" / ".join(badges))
+
+    def _append_post_log(self, text: str):
+        if not hasattr(self, "post_log"):
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        try:
+            self.post_log.insert(tk.END, f"[{timestamp}] {text}\n")
+            self.post_log.see(tk.END)
+        except Exception:
+            pass
+
+    def _set_postproc_running(self, key: str, running: bool):
+        btn = self.post_run_buttons.get(key)
+        if btn:
+            btn.configure(state=tk.DISABLED if running else tk.NORMAL)
+        export_btn = self.post_export_buttons.get(key)
+        if export_btn and running:
+            export_btn.configure(state=tk.DISABLED)
+
+    def run_postproc(self, key: str, extra_opts: Optional[Dict[str, Any]] = None):
+        proc = POSTPROCS.get(key)
+        if not proc:
+            messagebox.showerror(APP_NAME, f"未注册的后处理任务：{key}")
+            return
+        workdir = self.current_project_path()
+        opts: Dict[str, Any] = dict(extra_opts or {})
+        opts.setdefault("style", self.figure_style_var.get())
+        opts.setdefault("metal_threshold", 0.02)
+        opts["workdir"] = workdir
+
+        missing: list[str] = []
+        for need in proc.needs:
+            if "|" in need:
+                alternatives = [workdir / n.strip() for n in need.split("|") if n.strip()]
+                if not any(path.exists() for path in alternatives):
+                    missing.append(" 或 ".join(str(workdir / n.strip()) for n in need.split("|") if n.strip()))
+            else:
+                if not (workdir / need).exists():
+                    missing.append(str(workdir / need))
+        if missing:
+            pretty = "\n".join(missing)
+            messagebox.showwarning(APP_NAME, f"缺少必要文件：\n{pretty}")
+            return
+
+        timestamp = _dt.datetime.now().strftime("%Y%m%d-%H%M")
+        report_dir = workdir / "reports" / timestamp / key
+        try:
+            report_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"创建报告目录失败：{exc}")
+            return
+        opts["report_dir"] = report_dir
+        opts["timestamp"] = timestamp
+
+        self._append_post_log(f"[{key}] 准备运行…")
+        self._set_postproc_running(key, True)
+        worker = PostprocWorker(self, key, opts)
+        self.post_worker = worker
+        worker.start()
+
+    def _on_postproc_success(self, key: str, result: PostResult, workdir: Path, opts: Dict[str, Any]):
+        self._set_postproc_running(key, False)
+        self.post_results[key] = result
+        report_dir = opts.get("report_dir")
+        if isinstance(report_dir, Path):
+            self.post_latest_reports[key] = report_dir
+        self._update_post_metrics(key, result)
+        self._draw_post_preview(key, result)
+        export_btn = self.post_export_buttons.get(key)
+        if export_btn:
+            export_btn.configure(state=tk.NORMAL)
+        self._append_post_log(f"[{key}] 完成。输出目录：{report_dir}")
+        for note in result.notes:
+            self._append_post_log(f"[{key}] {note}")
+
+    def _on_postproc_error(self, key: str, message: str):
+        self._set_postproc_running(key, False)
+        self._append_post_log(f"[{key}] 失败：{message}")
+
+    def _update_post_metrics(self, key: str, result: PostResult):
+        var = self.post_metric_vars.get(key)
+        if not var:
+            return
+        if key == "dos":
+            ef = result.metrics.get("E_F")
+            dos_ef = result.metrics.get("DOS(E_F)")
+            gap = result.metrics.get("gap")
+            is_metal = result.metrics.get("is_metal")
+            if ef is None or dos_ef is None or gap is None:
+                text = "数据不足"
+            else:
+                text = (
+                    f"E_F {ef:.3f} eV / DOS(E_F) {dos_ef:.3f} / "
+                    f"gap {gap:.3f} eV ({'金属' if is_metal and is_metal >= 0.5 else '非金属'})"
+                )
+            var.set(text)
+        elif key == "bands":
+            gap = result.metrics.get("gap")
+            if gap is None:
+                var.set("gap —")
+            else:
+                nature = "金属" if gap < 1e-4 else "半导体/绝缘体"
+                var.set(f"gap {gap:.3f} eV / {nature}")
+
+    def _draw_post_preview(self, key: str, result: PostResult):
+        fig = self.post_figures.get(key)
+        canvas = self.post_canvases.get(key)
+        if not fig or not canvas:
+            return
+        fig.clear()
+        ax = fig.add_subplot(111)
+        plot = result.extra.get("plot", {}) if result.extra else {}
+        style = plot.get("style", self.figure_style_var.get())
+        if key == "dos":
+            x = plot.get("x", [])
+            y = plot.get("y", [])
+            if x and y:
+                ax.plot(x, y, color="#1f77b4", lw=1.4)
+                ax.axvline(0.0, color="#d62728", ls="--", lw=1.0)
+            ax.set_xlabel("E - E$_F$ (eV)")
+            ax.set_ylabel("DOS")
+        elif key == "bands":
+            bands = plot.get("bands", [])
+            if bands:
+                for idx, row in enumerate(bands):
+                    xs = [idx] * len(row)
+                    ax.plot(xs, row, color="#1f77b4", lw=1.0)
+            ax.axhline(0.0, color="#d62728", ls="--", lw=1.0)
+            ax.set_ylabel("E - E$_F$ (eV)")
+            ax.set_xlabel("k-index")
+        apply_style(ax, style)
+        fig.tight_layout()
+        canvas.draw_idle()
+
+    def open_post_report(self, key: str):
+        report_dir = self.post_latest_reports.get(key)
+        if not report_dir:
+            messagebox.showinfo(APP_NAME, "尚无可导出的结果，请先运行一次。")
+            return
+        self._append_post_log(f"打开结果目录：{report_dir}")
+        try:
+            if sys.platform.startswith("darwin"):
+                subprocess.Popen(["open", str(report_dir)])
+            elif os.name == "nt":
+                os.startfile(str(report_dir))  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", str(report_dir)])
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"打开目录失败：{exc}")
+
     def plot_once_from_oszicar(self):
         proj = self.current_project_path()
         osz = proj / "OSZICAR"
