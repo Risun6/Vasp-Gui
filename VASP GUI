@@ -37,16 +37,11 @@ import json
 import textwrap
 import shutil
 import math
-import statistics
 import threading
 import subprocess
-import itertools
-import traceback
-from datetime import datetime
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Literal, Callable
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, Literal
 from pathlib import Path
-from xml.etree import ElementTree as ET
 
 try:
     import tkinter as tk
@@ -70,13 +65,6 @@ except Exception:
     HAS_TTKBOOTSTRAP = False
 
 try:
-    from azure.ttk import theme as azure_theme  # type: ignore
-    HAS_AZURE_THEME = True
-except Exception:
-    azure_theme = None  # type: ignore
-    HAS_AZURE_THEME = False
-
-try:
     import pymatgen  # type: ignore  # noqa: F401
     HAS_PYMATGEN = True
 except Exception:
@@ -87,7 +75,6 @@ try:
     import numpy as np  # 数值与线性代数
     HAS_NUMPY = True
 except Exception:
-    np = None  # type: ignore
     HAS_NUMPY = False
 
 try:
@@ -110,788 +97,6 @@ APP_VER = "0.1.0-MVP"
 CONFIG_DIR = Path.home() / ".config" / "vasp_gui"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
-POST_CACHE_DIRNAME = ".cache"
-
-
-@dataclass
-class PostResult:
-    """Standardised payload returned by a post-processing runner."""
-
-    metrics: Dict[str, float] = field(default_factory=dict)
-    figs: Dict[str, Path] = field(default_factory=dict)
-    tables: Dict[str, Path] = field(default_factory=dict)
-    notes: List[str] = field(default_factory=list)
-    payload: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class PostProc:
-    """Metadata describing an available post-processing routine."""
-
-    name: str
-    needs: List[str]
-    runner: Callable[[Path, Dict[str, Any]], PostResult]
-
-
-POSTPROCS: Dict[str, PostProc] = {}
-
-
-def register_postproc(key: str, proc: PostProc) -> None:
-    if key in POSTPROCS:
-        raise ValueError(f"postproc '{key}' 已注册")
-    POSTPROCS[key] = proc
-
-
-def _source_signature(paths: List[Path]) -> Dict[str, Tuple[int, int]]:
-    sig: Dict[str, Tuple[int, int]] = {}
-    for p in paths:
-        try:
-            st = p.stat()
-        except FileNotFoundError:
-            continue
-        sig[p.name] = (int(st.st_mtime_ns), int(st.st_size))
-    return sig
-
-
-def _cache_paths(workdir: Path, cache_name: str) -> tuple[Path, Path]:
-    cache_dir = workdir / POST_CACHE_DIRNAME
-    cache_dir.mkdir(exist_ok=True)
-    return cache_dir / f"{cache_name}.npz", cache_dir / f"{cache_name}.json"
-
-
-def load_cached_payload(
-    workdir: Path,
-    cache_name: str,
-    sources: List[Path],
-    loader: Callable[[], Dict[str, Any]],
-) -> Dict[str, Any]:
-    signature = _source_signature(sources)
-    if not HAS_NUMPY:
-        return loader()
-    data_path, meta_path = _cache_paths(workdir, cache_name)
-    if data_path.exists() and meta_path.exists():
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            if meta == signature:
-                with np.load(data_path, allow_pickle=True) as npz:  # type: ignore
-                    payload = npz["payload"].item()
-                    if isinstance(payload, dict):
-                        return payload
-        except Exception:
-            pass
-    payload = loader()
-    try:
-        if HAS_NUMPY:
-            np.savez_compressed(data_path, payload=np.array([payload], dtype=object))  # type: ignore
-            meta_path.write_text(json.dumps(signature), encoding="utf-8")
-    except Exception:
-        pass
-    return payload
-
-
-def ensure_reports_dir(workdir: Path) -> Path:
-    stamp = datetime.now().strftime("%Y%m%d-%H%M")
-    root = workdir / "reports" / stamp
-    idx = 0
-    while root.exists():
-        idx += 1
-        root = workdir / "reports" / f"{stamp}-{idx:02d}"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
-
-def read_fermi_from_outcar(workdir: Path) -> float | None:
-    outcar = workdir / "OUTCAR"
-    if not outcar.exists():
-        return None
-    try:
-        text = outcar.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return None
-    m = re.search(r"(?mi)E-fermi\s*:\s*([-\d.Ee+]+)", text)
-    if m:
-        try:
-            return float(m.group(1))
-        except Exception:
-            return None
-    return None
-
-
-def run_postproc(key: str, workdir: Path, opts: Optional[Dict[str, Any]] = None) -> PostResult:
-    if key not in POSTPROCS:
-        raise KeyError(f"未注册的后处理：{key}")
-    proc = POSTPROCS[key]
-    workdir = Path(workdir).expanduser()
-    if not workdir.exists():
-        raise FileNotFoundError(f"工作目录不存在：{workdir}")
-    opts = dict(opts or {})
-    needs = [workdir / n for n in proc.needs]
-    if proc.needs and not any(p.exists() for p in needs):
-        raise FileNotFoundError(
-            f"后处理 {proc.name} 所需文件缺失：{', '.join(proc.needs)}"
-        )
-    output_dir = ensure_reports_dir(workdir)
-    opts.setdefault("output_dir", output_dir)
-    try:
-        result = proc.runner(workdir, opts)
-    except Exception as exc:
-        notes = [f"运行失败：{exc}"]
-        tb = traceback.format_exc()
-        (output_dir / "error.log").write_text(tb, encoding="utf-8")
-        return PostResult(notes=notes)
-    if not isinstance(result.payload, dict):
-        result.payload = {"raw": result.payload}
-    result.payload.setdefault("output_dir", output_dir)
-    meta = {
-        "key": key,
-        "name": proc.name,
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "opts": opts,
-    }
-    try:
-        (output_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
-    return result
-
-
-def parse_vasprun_total_dos(workdir: Path) -> Dict[str, Any]:
-    xml_path = workdir / "vasprun.xml"
-    if not xml_path.exists():
-        raise FileNotFoundError("vasprun.xml 不存在")
-    energies: list[float] = []
-    densities: list[float] = []
-    efermi: float | None = None
-    try:
-        for event, elem in ET.iterparse(str(xml_path), events=("end",)):
-            if elem.tag == "i" and elem.attrib.get("name") == "efermi" and elem.text:
-                try:
-                    efermi = float(elem.text)
-                except Exception:
-                    pass
-            if elem.tag == "array" and elem.attrib.get("name") == "total":
-                spin_rows: list[list[list[float]]] = []
-                for set_elem in elem.findall("./set"):
-                    nested = set_elem.findall("./set")
-                    target_sets = nested if nested else [set_elem]
-                    for target in target_sets:
-                        rows: list[list[float]] = []
-                        for r in target.findall("r"):
-                            if r.text:
-                                try:
-                                    rows.append([float(x) for x in r.text.split()])
-                                except Exception:
-                                    continue
-                        if rows:
-                            spin_rows.append(rows)
-                if spin_rows:
-                    energies = [row[0] for row in spin_rows[0]]
-                    if len(spin_rows) >= 2:
-                        densities = [spin_rows[0][i][1] + spin_rows[1][i][1] for i in range(len(energies))]
-                    else:
-                        densities = [row[1] for row in spin_rows[0]]
-                elem.clear()
-    except Exception as exc:
-        raise RuntimeError(f"解析 vasprun.xml 失败：{exc}")
-    if not energies or not densities:
-        raise RuntimeError("未在 vasprun.xml 中找到 DOS 数据")
-    return {"energies": energies, "densities": densities, "fermi": efermi}
-
-
-def parse_doscar(workdir: Path, fallback_fermi: float | None = None) -> Dict[str, Any]:
-    doscar = workdir / "DOSCAR"
-    if not doscar.exists():
-        raise FileNotFoundError("DOSCAR 不存在")
-    try:
-        lines = doscar.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except Exception as exc:
-        raise RuntimeError(f"读取 DOSCAR 失败：{exc}")
-    if len(lines) < 6:
-        raise RuntimeError("DOSCAR 内容不足")
-    data: list[list[float]] = []
-    for ln in lines[5:]:
-        parts = ln.split()
-        if len(parts) < 3:
-            break
-        try:
-            data.append([float(x) for x in parts])
-        except Exception:
-            break
-    if not data:
-        raise RuntimeError("未解析到 DOS 数据")
-    energies = [row[0] for row in data]
-    if len(data[0]) >= 5:
-        densities = [row[1] + row[2] for row in data]
-    else:
-        densities = [row[1] for row in data]
-    fermi = fallback_fermi if fallback_fermi is not None else statistics.median(energies)
-    return {"energies": energies, "densities": densities, "fermi": fermi}
-
-
-def _interp_zero(xs: List[float], ys: List[float]) -> float:
-    if not xs or not ys:
-        return 0.0
-    # assume xs sorted
-    if xs[0] > 0:
-        return ys[0]
-    if xs[-1] < 0:
-        return ys[-1]
-    for i in range(1, len(xs)):
-        if xs[i] >= 0:
-            x0, x1 = xs[i - 1], xs[i]
-            y0, y1 = ys[i - 1], ys[i]
-            if x1 == x0:
-                return (y0 + y1) / 2
-            ratio = (0 - x0) / (x1 - x0)
-            return y0 + (y1 - y0) * ratio
-    return ys[-1]
-
-
-def proc_dos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
-    output_dir: Path = Path(opts["output_dir"])
-    threshold = float(opts.get("metal_threshold", 0.1))
-    style = opts.get("style", "AFM")
-
-    def loader() -> Dict[str, Any]:
-        if (workdir / "vasprun.xml").exists():
-            try:
-                return parse_vasprun_total_dos(workdir)
-            except Exception:
-                # fallback to DOSCAR below
-                pass
-        fermi_hint = read_fermi_from_outcar(workdir)
-        return parse_doscar(workdir, fallback_fermi=fermi_hint)
-
-    sources = [workdir / name for name in ["vasprun.xml", "DOSCAR"] if (workdir / name).exists()]
-    payload = load_cached_payload(workdir, "parsed_dos", sources, loader)
-    energies = payload.get("energies", [])
-    densities = payload.get("densities", [])
-    fermi = payload.get("fermi")
-    if fermi is None:
-        fermi = read_fermi_from_outcar(workdir) or 0.0
-    shifted = [e - fermi for e in energies]
-    dos_at_ef = _interp_zero(shifted, densities)
-    is_metal = dos_at_ef > threshold
-
-    fig = Figure(figsize=(6, 4), dpi=140)
-    ax = fig.add_subplot(111)
-    ax.plot(shifted, densities, linewidth=1.2)
-    ax.axvline(0.0, linestyle="--", linewidth=0.8)
-    ax.set_xlabel("Energy - $E_F$ (eV)")
-    ax.set_ylabel("DOS (states/eV)")
-    ax.set_title("Total DOS")
-    ax.grid(True, linestyle=":", linewidth=0.8)
-    apply_style(ax, style)
-
-    png = output_dir / "dos.png"
-    csv = output_dir / "dos.csv"
-    fig.savefig(png, bbox_inches="tight")
-    fig.savefig(output_dir / "dos.svg", bbox_inches="tight")
-    with csv.open("w", encoding="utf-8") as g:
-        g.write("E-EF,DOS\n")
-        for x, y in zip(shifted, densities):
-            g.write(f"{x},{y}\n")
-
-    notes = []
-    notes.append(f"E_F = {fermi:.4f} eV")
-    notes.append("金属" if is_metal else "半导体/绝缘体")
-    return PostResult(
-        metrics={"E_F": float(fermi), "DOS@EF": float(dos_at_ef)},
-        figs={"dos": png},
-        tables={"dos": csv},
-        notes=notes,
-        payload={
-            "x": shifted,
-            "y": densities,
-            "title": "Total DOS",
-            "ylabel": "DOS (states/eV)",
-        },
-    )
-
-
-def parse_vasprun_bands(workdir: Path) -> Dict[str, Any]:
-    xml_path = workdir / "vasprun.xml"
-    if not xml_path.exists():
-        raise FileNotFoundError("vasprun.xml 不存在")
-    kpoints: list[tuple[float, float, float]] = []
-    eigen_blocks: list[list[list[float]]] = []
-    efermi: float | None = None
-    try:
-        for event, elem in ET.iterparse(str(xml_path), events=("end",)):
-            if elem.tag == "i" and elem.attrib.get("name") == "efermi" and elem.text:
-                try:
-                    efermi = float(elem.text)
-                except Exception:
-                    pass
-            elif elem.tag == "varray" and elem.attrib.get("name") == "kpointlist":
-                pts: list[tuple[float, float, float]] = []
-                for v in elem.findall("v"):
-                    if not v.text:
-                        continue
-                    try:
-                        vals = [float(x) for x in v.text.split()[:3]]
-                        if len(vals) == 3:
-                            pts.append(tuple(vals))
-                    except Exception:
-                        continue
-                if pts:
-                    kpoints = pts
-                elem.clear()
-            elif elem.tag == "array" and elem.attrib.get("name") == "eigenvalues":
-                data_by_spin: list[list[list[list[float]]]] = []
-                for spin_set in elem.findall("./set"):
-                    k_sets = spin_set.findall("./set")
-                    targets = k_sets if k_sets else [spin_set]
-                    spin_data: list[list[list[float]]] = []
-                    for k_set in targets:
-                        rows: list[list[float]] = []
-                        for r in k_set.findall("r"):
-                            if not r.text:
-                                continue
-                            try:
-                                rows.append([float(x) for x in r.text.split()])
-                            except Exception:
-                                continue
-                        if rows:
-                            spin_data.append(rows)
-                    if spin_data:
-                        data_by_spin.append(spin_data)
-                if data_by_spin:
-                    # 使用第一个自旋分量；若有第二个，自旋占据取平均
-                    eigen_blocks = data_by_spin[0]
-                    if len(data_by_spin) >= 2:
-                        other = data_by_spin[1]
-                        for ik, rows in enumerate(eigen_blocks):
-                            if ik >= len(other):
-                                break
-                            other_rows = other[ik]
-                            for ib, row in enumerate(rows):
-                                if ib >= len(other_rows) or len(row) < 3 or len(other_rows[ib]) < 3:
-                                    continue
-                                row[2] = (row[2] + other_rows[ib][2]) / 2
-                elem.clear()
-    except Exception as exc:
-        raise RuntimeError(f"解析 vasprun.xml 失败：{exc}")
-    if not eigen_blocks:
-        raise RuntimeError("未在 vasprun.xml 中找到能带数据")
-    nbands = len(eigen_blocks[0])
-    nk = len(eigen_blocks)
-    bands = [[eigen_blocks[k][b][1] for k in range(nk)] for b in range(nbands)]
-    occs = [[eigen_blocks[k][b][2] if len(eigen_blocks[k][b]) > 2 else 0.0 for k in range(nk)] for b in range(nbands)]
-    return {"bands": bands, "occs": occs, "kpoints": kpoints, "fermi": efermi}
-
-
-def parse_eigenval(workdir: Path) -> Dict[str, Any]:
-    eig = workdir / "EIGENVAL"
-    if not eig.exists():
-        raise FileNotFoundError("EIGENVAL 不存在")
-    try:
-        text = eig.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except Exception as exc:
-        raise RuntimeError(f"读取 EIGENVAL 失败：{exc}")
-    if len(text) < 7:
-        raise RuntimeError("EIGENVAL 内容不足")
-    try:
-        header = text[5].split()
-        nk, nb = int(header[0]), int(header[1])
-    except Exception as exc:
-        raise RuntimeError(f"解析 EIGENVAL 头部失败：{exc}")
-    idx = 6
-    kpoints: list[tuple[float, float, float]] = []
-    bands = [[0.0] * nk for _ in range(nb)]
-    occs = [[0.0] * nk for _ in range(nb)]
-    for k in range(nk):
-        while idx < len(text) and not text[idx].strip():
-            idx += 1
-        if idx >= len(text):
-            break
-        try:
-            kx, ky, kz, _w = map(float, text[idx].split()[:4])
-        except Exception as exc:
-            raise RuntimeError(f"解析 EIGENVAL k 点失败：{exc}")
-        kpoints.append((kx, ky, kz))
-        idx += 1
-        for b in range(nb):
-            if idx >= len(text):
-                break
-            parts = text[idx].split()
-            if len(parts) < 3:
-                raise RuntimeError("EIGENVAL 带能列缺少数据")
-            bands[b][k] = float(parts[1])
-            occs[b][k] = float(parts[2])
-            idx += 1
-    return {"bands": bands, "occs": occs, "kpoints": kpoints, "fermi": read_fermi_from_outcar(workdir)}
-
-
-def proc_bands(workdir: Path, opts: Dict[str, Any]) -> PostResult:
-    output_dir: Path = Path(opts["output_dir"])
-    style = opts.get("style", "AFM")
-    occ_threshold = float(opts.get("occ_threshold", 0.5))
-
-    def loader() -> Dict[str, Any]:
-        if (workdir / "vasprun.xml").exists():
-            try:
-                return parse_vasprun_bands(workdir)
-            except Exception:
-                pass
-        return parse_eigenval(workdir)
-
-    sources = [workdir / name for name in ["vasprun.xml", "EIGENVAL"] if (workdir / name).exists()]
-    payload = load_cached_payload(workdir, "parsed_bands", sources, loader)
-    bands = payload.get("bands", [])
-    occs = payload.get("occs", [])
-    kpoints = payload.get("kpoints", [])
-    fermi = payload.get("fermi")
-    if fermi is None:
-        fermi = read_fermi_from_outcar(workdir) or 0.0
-    nb = len(bands)
-    if nb == 0:
-        raise RuntimeError("未解析到能带数据")
-    nk = len(bands[0])
-    if nk == 0:
-        raise RuntimeError("未解析到 k 点")
-    shifted = [[bands[b][k] - fermi for k in range(nk)] for b in range(nb)]
-
-    vb_level = -float("inf")
-    vb_k = -1
-    cb_level = float("inf")
-    cb_k = -1
-    for k in range(nk):
-        for b in range(nb):
-            occ = occs[b][k] if b < len(occs) and k < len(occs[b]) else 0.0
-            energy = shifted[b][k]
-            if occ >= occ_threshold and energy > vb_level:
-                vb_level = energy
-                vb_k = k
-            if occ < occ_threshold and energy < cb_level:
-                cb_level = energy
-                cb_k = k
-    gap = max(0.0, cb_level - vb_level)
-    is_metal = gap < 1e-3 or cb_level <= vb_level
-    direct = not is_metal and vb_k == cb_k
-
-    distances = [0.0]
-    if kpoints and len(kpoints) == nk:
-        for a, b in zip(kpoints[:-1], kpoints[1:]):
-            distances.append(distances[-1] + math.dist(a, b))
-    else:
-        for _ in range(1, nk):
-            distances.append(distances[-1] + 1.0)
-
-    fig = Figure(figsize=(6, 4), dpi=140)
-    ax = fig.add_subplot(111)
-    for band in shifted:
-        ax.plot(distances, band, linewidth=0.8)
-    ax.axhline(0.0, linestyle="--", linewidth=0.8)
-    ax.set_xlabel("k-path (arb.)")
-    ax.set_ylabel("Energy - $E_F$ (eV)")
-    ax.set_title("Band structure")
-    ax.grid(True, linestyle=":", linewidth=0.8)
-    apply_style(ax, style)
-
-    png = output_dir / "bands.png"
-    csv = output_dir / "bands.csv"
-    fig.savefig(png, bbox_inches="tight")
-    fig.savefig(output_dir / "bands.svg", bbox_inches="tight")
-    with csv.open("w", encoding="utf-8") as g:
-        header = ["k"] + [f"band{b+1}" for b in range(nb)]
-        g.write(",".join(header) + "\n")
-        for j in range(nk):
-            row = [f"{distances[j]}"] + [f"{shifted[b][j]}" for b in range(nb)]
-            g.write(",".join(row) + "\n")
-
-    metrics = {
-        "gap": float(gap),
-        "VBM": float(vb_level if vb_level != -float("inf") else float("nan")),
-        "CBM": float(cb_level if cb_level != float("inf") else float("nan")),
-    }
-    notes: list[str] = []
-    if is_metal:
-        notes.append("判定为金属（带隙≈0）")
-    else:
-        notes.append(f"带隙：{gap:.3f} eV")
-        notes.append("直接带隙" if direct else "间接带隙")
-    return PostResult(
-        metrics=metrics,
-        figs={"bands": png},
-        tables={"bands": csv},
-        notes=notes,
-        payload={
-            "x": distances,
-            "bands": shifted,
-            "title": "Band structure",
-            "ylabel": "Energy - $E_F$ (eV)",
-        },
-    )
-
-
-register_postproc(
-    "dos",
-    PostProc(
-        name="电子结构-DOS",
-        needs=["vasprun.xml", "DOSCAR"],
-        runner=proc_dos,
-    ),
-)
-
-register_postproc(
-    "bands",
-    PostProc(
-        name="电子结构-能带",
-        needs=["vasprun.xml", "EIGENVAL"],
-        runner=proc_bands,
-    ),
-)
-
-
-
-class AzureThemeManager:
-    """Create a bright Azure-inspired light theme for the app."""
-
-    PALETTES: Dict[str, Dict[str, str]] = {
-        "light": {
-            "window": "#f4f6fb",
-            "surface": "#f8faff",
-            "card": "#ffffff",
-            "border": "#d8e2f6",
-            "accent": "#1f6feb",
-            "accent_hover": "#1a56d6",
-            "text": "#0f172a",
-            "muted": "#6b7b8f",
-            "entry": "#ffffff",
-            "tree_even": "#ffffff",
-            "tree_odd": "#f3f6fc",
-            "select_fg": "#ffffff",
-        },
-    }
-
-    def __init__(self, root: tk.Misc):
-        self.root = root
-        self.style = ttk.Style(root)
-        self.current_mode = "light"
-        self.using_native_package = False
-        if HAS_AZURE_THEME and azure_theme is not None:
-            try:
-                if hasattr(azure_theme, "use_theme"):
-
-                    azure_theme.use_theme(root, "light")
-                    self.using_native_package = True
-                elif hasattr(azure_theme, "use_light_theme"):
-                    azure_theme.use_light_theme(root)
-                    self.using_native_package = True
-            except Exception:
-                self.using_native_package = False
-        if not self.using_native_package:
-            self._ensure_base_theme("light")
-        self.use("light")
-
-    def _ensure_base_theme(self, mode: Literal["light"] = "light"):
-        theme_name = "azure-light"
-        if theme_name in self.style.theme_names():
-            return
-        base = "clam" if "clam" in self.style.theme_names() else self.style.theme_use()
-        palette = self.PALETTES["light"]
-        self.style.theme_create(
-            theme_name,
-            parent=base,
-            settings={
-                "TNotebook": {
-                    "configure": {
-                        "tabmargins": (12, 6, 12, 0),
-                        "background": palette["surface"],
-                        "borderwidth": 0,
-                    }
-                },
-                "TNotebook.Tab": {
-                    "configure": {
-                        "padding": (18, 10),
-                        "background": palette["surface"],
-                        "foreground": palette["muted"],
-                    },
-                    "map": {
-                        "background": [("selected", palette["card"])],
-                        "foreground": [("selected", palette["text"])],
-                    },
-                },
-                "Horizontal.TScrollbar": {
-                    "configure": {
-                        "background": palette["card"],
-                        "troughcolor": palette["surface"],
-
-                        "bordercolor": palette["border"],
-                    }
-                },
-                "Vertical.TScrollbar": {
-                    "configure": {
-                        "background": palette["card"],
-                        "troughcolor": palette["surface"],
-
-                        "bordercolor": palette["border"],
-                    }
-                },
-            },
-        )
-
-    def use(self, mode: Literal["light"] = "light"):
-        self.current_mode = "light"
-        if self.using_native_package:
-            try:
-                if hasattr(azure_theme, "use_theme"):
-                    azure_theme.use_theme(self.root, "light")
-                elif hasattr(azure_theme, "use_light_theme"):
-                    azure_theme.use_light_theme(self.root)
-            except Exception:
-                self.using_native_package = False
-                self._ensure_base_theme("light")
-        if not self.using_native_package:
-            theme_name = "azure-light"
-            self.style.theme_use(theme_name)
-        palette = self.PALETTES["light"]
-        self.root.configure(background=palette["window"])
-        self._apply_shared_styles(palette)
-
-    def _apply_shared_styles(self, palette: Dict[str, str]):
-        accent = palette["accent"]
-        accent_hover = palette["accent_hover"]
-
-        self.style.configure("TFrame", background=palette["surface"])
-        self.style.configure("Page.TFrame", background=palette["surface"])
-        self.style.configure("Toolbar.TFrame", background=palette["window"], padding=(12, 10))
-        self.style.configure("Card.TFrame", background=palette["card"], relief="flat")
-        self.style.configure("TLabel", background=palette["surface"], foreground=palette["text"])
-        self.style.configure("Muted.TLabel", background=palette["surface"], foreground=palette["muted"])
-        self.style.configure("Header.TLabel", font=("Segoe UI Semibold", 12), background=palette["surface"], foreground=palette["text"])
-        self.style.configure("Caption.TLabel", font=("Segoe UI", 10), background=palette["surface"], foreground=palette["muted"])
-        self.style.configure("TLabelframe", background=palette["card"], borderwidth=1, relief="flat")
-        self.style.configure("TLabelframe.Label", background=palette["card"], foreground=palette["muted"], font=("Segoe UI", 10, "bold"))
-        self.style.configure("TSeparator", background=palette["border"], borderwidth=0)
-
-        self.style.configure(
-            "TButton",
-
-            background=accent,
-            foreground=palette["select_fg"],
-            borderwidth=0,
-            focusthickness=1,
-            focuscolor=accent,
-            padding=(12, 7),
-        )
-        self.style.map(
-            "TButton",
-            background=[("active", accent_hover), ("pressed", accent_hover)],
-            foreground=[("disabled", palette["muted"]), ("pressed", palette["select_fg"]), ("active", palette["select_fg"])],
-        )
-
-        self.style.configure(
-            "Accent.TButton",
-            background=accent,
-            foreground=palette["select_fg"],
-
-            padding=(14, 9),
-        )
-        self.style.map(
-            "Accent.TButton",
-            background=[("active", accent_hover), ("pressed", accent_hover)],
-        )
-
-        self.style.configure(
-            "TEntry",
-            fieldbackground=palette["entry"],
-            foreground=palette["text"],
-
-            bordercolor=palette["border"],
-            lightcolor=accent,
-            darkcolor=palette["border"],
-            padding=(10, 6),
-        )
-        self.style.map(
-            "TEntry",
-            bordercolor=[("focus", accent)],
-        )
-
-        self.style.configure(
-            "TCombobox",
-            fieldbackground=palette["entry"],
-            background=palette["entry"],
-            foreground=palette["text"],
-
-            bordercolor=palette["border"],
-            padding=(10, 6),
-        )
-        self.style.map(
-            "TCombobox",
-            fieldbackground=[("readonly", palette["entry"]), ("active", palette["entry"])],
-            foreground=[("readonly", palette["text"]), ("disabled", palette["muted"])],
-
-            bordercolor=[("focus", accent)],
-        )
-
-        self.style.configure(
-            "TCheckbutton",
-            background=palette["surface"],
-            foreground=palette["text"],
-        )
-        self.style.configure(
-            "TRadiobutton",
-            background=palette["surface"],
-            foreground=palette["text"],
-        )
-
-        self.style.configure(
-            "Treeview",
-
-            background=palette["card"],
-            fieldbackground=palette["card"],
-            foreground=palette["text"],
-            bordercolor=palette["border"],
-        )
-        self.style.configure(
-            "Treeview.Heading",
-            background=palette["surface"],
-            foreground=palette["muted"],
-            relief="flat",
-        )
-        self.style.map(
-
-            "Treeview",
-            background=[("selected", accent)],
-            foreground=[("selected", palette["select_fg"])],
-        )
-
-        self.root.option_add("*TCombobox*Listbox.background", palette["card"])
-        self.root.option_add("*TCombobox*Listbox.foreground", palette["text"])
-        self.root.option_add("*TCombobox*Listbox.selectBackground", accent)
-        self.root.option_add("*TCombobox*Listbox.selectForeground", palette["select_fg"])
-
-        self.style.configure(
-            "StatusAccent.TLabel",
-            font=("Segoe UI", 10, "bold"),
-            foreground=accent,
-            background=palette["surface"],
-        )
-
-
-    def style_text_widget(self, widget: tk.Text):
-        palette = self.PALETTES[self.current_mode]
-        prev_state = widget.cget("state")
-        if prev_state == tk.DISABLED:
-            widget.configure(state=tk.NORMAL)
-        widget.configure(
-
-            background=palette["surface"],
-            foreground=palette["text"],
-            insertbackground=palette["text"],
-            selectbackground=palette["accent"],
-            selectforeground=palette["select_fg"],
-            highlightthickness=1,
-            highlightbackground=palette["border"],
-            highlightcolor=palette["accent"],
-            bd=0,
-            relief=tk.FLAT,
-        )
-        if prev_state == tk.DISABLED:
-            widget.configure(foreground=palette["muted"])
-            widget.configure(state=tk.DISABLED)
 
 @dataclass
 class WizardProfile:
@@ -1460,31 +665,6 @@ class SystemStatsMonitor(threading.Thread):
         return monitor._collect_stats()
 
 
-class PostprocWorker(threading.Thread):
-    """后台执行后处理任务，完成后通过回调告知 GUI。"""
-
-    def __init__(
-        self,
-        key: str,
-        workdir: Path,
-        opts: Dict[str, Any],
-        on_finish: Callable[[str, PostResult | Exception], None],
-    ) -> None:
-        super().__init__(daemon=True)
-        self.key = key
-        self.workdir = Path(workdir)
-        self.opts = dict(opts)
-        self.on_finish = on_finish
-
-    def run(self) -> None:
-        try:
-            result = run_postproc(self.key, self.workdir, self.opts)
-        except Exception as exc:
-            self.on_finish("error", exc)
-        else:
-            self.on_finish("ok", result)
-
-
 class EnergyMonitor(threading.Thread):
     """后台线程：周期性解析 OSZICAR，提取 F/E0 能量，供主线程绘图。"""
     def __init__(self, workdir: Path, on_update):
@@ -1571,24 +751,20 @@ class VaspGUI(tk.Tk):
         super().__init__()
         self.title(f"{APP_NAME} v{APP_VER}")
         self.geometry("1200x800")
-        self.theme_manager = AzureThemeManager(self)
+        if HAS_TTKBOOTSTRAP and tb is not None:
+            try:
+                tb.Style("cosmo")
+            except Exception:
+                pass
 
         self.project_dir = Path.cwd()
         self.proc = None  # subprocess.Popen or None
         self.monitor = None  # EnergyMonitor
         self.sys_monitor = None  # SystemStatsMonitor
-        self.postproc_worker: PostprocWorker | None = None
-        self.post_history: list[dict[str, Any]] = []
-        self.post_last_result: PostResult | None = None
-        self.post_cap_var = tk.StringVar(value="")
-        self.post_status_var = tk.StringVar(value="待机")
         self.run_status_var = tk.StringVar(value="⚪ 未检测")
         self.figure_style_var = tk.StringVar(value="AFM")
         self.emit_report_var = tk.BooleanVar(value=True)
         self.run_suggestion_widgets: list[tk.Text] = []
-        self.themable_texts: list[tk.Text] = []
-        self.themable_canvases: list[tk.Canvas] = []
-
         self.overview_items = [
             ("__project__", "项目目录"),
             ("INCAR", "INCAR"),
@@ -1615,22 +791,17 @@ class VaspGUI(tk.Tk):
     # ------------------------- UI 构建 ----------------------------------
     def _build_ui(self):
         # 顶部工具栏
-        toolbar = ttk.Frame(self, style="Toolbar.TFrame")
+        toolbar = ttk.Frame(self)
         toolbar.pack(side=tk.TOP, fill=tk.X)
-
-        ttk.Label(toolbar, text=APP_NAME, style="Header.TLabel").pack(side=tk.LEFT, padx=(10, 24))
 
         ttk.Label(toolbar, text="项目目录:").pack(side=tk.LEFT, padx=6)
         self.project_var = tk.StringVar(value=str(self.project_dir))
         self.project_entry = ttk.Entry(toolbar, textvariable=self.project_var, width=80)
         self.project_entry.pack(side=tk.LEFT, padx=4)
-        ttk.Button(toolbar, text="选择…", command=self.choose_project, style="Accent.TButton").pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="新建项目", command=self.create_project, style="Accent.TButton").pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="选择…", command=self.choose_project).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="新建项目", command=self.create_project).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="首次向导", command=self.launch_first_time_wizard).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="创建示例项目", command=self.on_create_example_project).pack(side=tk.LEFT, padx=4)
-
-
-        ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X)
 
         # Notebook
         self.nb = ttk.Notebook(self)
@@ -1659,39 +830,18 @@ class VaspGUI(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    def _register_themable_text(self, widget: tk.Text):
-        if widget not in self.themable_texts:
-            self.themable_texts.append(widget)
-        self.theme_manager.style_text_widget(widget)
-
-    def _style_canvas(self, canvas: tk.Canvas):
-        palette = self.theme_manager.PALETTES[self.theme_manager.current_mode]
-        canvas.configure(
-            background=palette["surface"],
-            highlightbackground=palette["surface"],
-            highlightthickness=0,
-            borderwidth=0,
-        )
-
-    def _register_canvas(self, canvas: tk.Canvas):
-        if canvas not in self.themable_canvases:
-            self.themable_canvases.append(canvas)
-        self._style_canvas(canvas)
-
-
     # ------------------------- 页面：输入文件 -----------------------------
     def _build_inputs_page(self, parent):
-        frame = ttk.Frame(parent, style="Page.TFrame")
+        frame = ttk.Frame(parent)
 
         # 外层滚动容器，确保内容较多时仍可完整浏览
-        canvas = tk.Canvas(frame, highlightthickness=0, bd=0)
+        canvas = tk.Canvas(frame, highlightthickness=0)
         vscroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=canvas.yview)
         canvas.configure(yscrollcommand=vscroll.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vscroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self._register_canvas(canvas)
 
-        inner = ttk.Frame(canvas, style="Page.TFrame")
+        inner = ttk.Frame(canvas)
         inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
 
         def _update_scrollregion(event=None):
@@ -1734,11 +884,11 @@ class VaspGUI(tk.Tk):
         paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         # 左边：INCAR 模板
-        left = ttk.Frame(paned, padding=8, style="Card.TFrame")
+        left = ttk.Frame(paned, padding=8)
         paned.add(left, weight=1)
 
         ttk.Label(left, text="INCAR 模板与编辑").pack(anchor=tk.W)
-        temp_bar = ttk.Frame(left, style="Card.TFrame")
+        temp_bar = ttk.Frame(left)
         temp_bar.pack(fill=tk.X, pady=4)
         self.incar_template = tk.StringVar(value="relax")
         for key, txt in [
@@ -1751,7 +901,7 @@ class VaspGUI(tk.Tk):
         ttk.Button(temp_bar, text="加载模板到编辑器", command=self.load_incar_template).pack(side=tk.RIGHT)
 
         # INCAR 简单面板
-        simple_box = ttk.LabelFrame(left, text="INCAR 简单面板", padding=8)
+        simple_box = ttk.LabelFrame(left, text="INCAR 简单面板")
         simple_box.pack(fill=tk.X, pady=4)
         self.incar_simple_vars: dict[str, tk.StringVar] = {}
         simple_items = [
@@ -1766,7 +916,7 @@ class VaspGUI(tk.Tk):
         for idx, (key, label) in enumerate(simple_items):
             row = idx // 2
             col = idx % 2
-            frame_cell = ttk.Frame(simple_box, style="Card.TFrame")
+            frame_cell = ttk.Frame(simple_box)
             frame_cell.grid(row=row, column=col, sticky="ew", padx=4, pady=2)
             ttk.Label(frame_cell, text=label + ":").pack(side=tk.LEFT)
             var = tk.StringVar()
@@ -1775,30 +925,26 @@ class VaspGUI(tk.Tk):
             entry.pack(side=tk.LEFT, padx=4)
         for i in range(2):
             simple_box.grid_columnconfigure(i, weight=1)
-        btn_row = ttk.Frame(simple_box, style="Card.TFrame")
+        btn_row = ttk.Frame(simple_box)
         btn_row.grid(row=(len(simple_items)+1)//2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         ttk.Button(btn_row, text="从编辑器读取", command=self.refresh_incar_simple_panel).pack(side=tk.LEFT)
         ttk.Button(btn_row, text="写入到编辑器", command=self.apply_incar_simple_panel).pack(side=tk.LEFT, padx=6)
 
         self.incar_text = ScrolledText(left, height=20, undo=True, wrap="none")
         self.incar_text.pack(fill=tk.BOTH, expand=True)
-        self._register_themable_text(self.incar_text)
-
-        btns = ttk.Frame(left, style="Card.TFrame")
+        btns = ttk.Frame(left)
         btns.pack(fill=tk.X, pady=4)
         ttk.Button(btns, text="打开现有 INCAR", command=lambda: self.open_into_editor("INCAR", self.incar_text)).pack(side=tk.LEFT)
         ttk.Button(btns, text="保存到项目", command=lambda: self.save_from_editor("INCAR", self.incar_text)).pack(side=tk.LEFT, padx=6)
 
         # 右边：POSCAR & KPOINTS 编辑
-        right = ttk.Frame(paned, padding=8, style="Card.TFrame")
+        right = ttk.Frame(paned, padding=8)
         paned.add(right, weight=1)
 
         ttk.Label(right, text="POSCAR 编辑").pack(anchor=tk.W)
         self.poscar_text = ScrolledText(right, height=10, undo=True, wrap="none")
         self.poscar_text.pack(fill=tk.BOTH, expand=True)
-        self._register_themable_text(self.poscar_text)
-
-        row = ttk.Frame(right, style="Card.TFrame")
+        row = ttk.Frame(right)
         row.pack(fill=tk.X, pady=4)
         ttk.Button(row, text="打开 POSCAR", command=lambda: self.open_into_editor("POSCAR", self.poscar_text)).pack(side=tk.LEFT)
         ttk.Button(row, text="保存 POSCAR", command=lambda: self.save_from_editor("POSCAR", self.poscar_text)).pack(side=tk.LEFT, padx=6)
@@ -1809,9 +955,7 @@ class VaspGUI(tk.Tk):
         ttk.Label(right, text="KPOINTS 编辑（可在K 点生成页自动生成）").pack(anchor=tk.W)
         self.kpoints_text = ScrolledText(right, height=10, undo=True, wrap="none")
         self.kpoints_text.pack(fill=tk.BOTH, expand=True)
-        self._register_themable_text(self.kpoints_text)
-
-        row2 = ttk.Frame(right, style="Card.TFrame")
+        row2 = ttk.Frame(right)
         row2.pack(fill=tk.X, pady=4)
         ttk.Button(row2, text="打开 KPOINTS", command=lambda: self.open_into_editor("KPOINTS", self.kpoints_text)).pack(side=tk.LEFT)
         ttk.Button(row2, text="保存 KPOINTS", command=lambda: self.save_from_editor("KPOINTS", self.kpoints_text)).pack(side=tk.LEFT, padx=6)
@@ -2171,7 +1315,7 @@ class VaspGUI(tk.Tk):
 
     # ------------------------- 页面：POTCAR --------------------------------
     def _populate_potcar_section(self, container):
-        row1 = ttk.Frame(container, style="Card.TFrame")
+        row1 = ttk.Frame(container)
         row1.pack(fill=tk.X, padx=8, pady=8)
         ttk.Label(row1, text="赝势库根目录：").pack(side=tk.LEFT)
         self.pot_dir_var = tk.StringVar(value=str(Path.home() / "potcars"))
@@ -2179,19 +1323,18 @@ class VaspGUI(tk.Tk):
         ttk.Button(row1, text="选择…", command=self.choose_pot_dir).pack(side=tk.LEFT)
         ttk.Button(row1, text="探测赝势库", command=self.detect_pot_roots).pack(side=tk.LEFT, padx=6)
 
-        row2 = ttk.Frame(container, style="Card.TFrame")
+        row2 = ttk.Frame(container)
         row2.pack(fill=tk.X, padx=8, pady=4)
         ttk.Label(row2, text="从 POSCAR 自动解析元素并生成 POTCAR：").pack(side=tk.LEFT)
         ttk.Button(row2, text="生成 POTCAR", command=self.do_build_potcar).pack(side=tk.LEFT, padx=8)
 
         self.pot_msg = ScrolledText(container, height=12, wrap="word")
         self.pot_msg.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        self._register_themable_text(self.pot_msg)
 
         return container
 
     def _build_potcar_page(self, parent):
-        frame = ttk.Frame(parent, style="Page.TFrame")
+        frame = ttk.Frame(parent)
         self._populate_potcar_section(frame)
         return frame
 
@@ -2339,7 +1482,7 @@ class VaspGUI(tk.Tk):
 
     # ------------------------- 页面：KPOINTS -------------------------------
     def _populate_kpoints_section(self, container):
-        box = ttk.LabelFrame(container, text="Monkhorst-Pack 网格", padding=8)
+        box = ttk.LabelFrame(container, text="Monkhorst-Pack 网格")
         box.pack(fill=tk.X, padx=8, pady=8)
 
         self.k_nx = tk.IntVar(value=5)
@@ -2347,7 +1490,7 @@ class VaspGUI(tk.Tk):
         self.k_nz = tk.IntVar(value=5)
         self.k_gamma = tk.BooleanVar(value=True)
 
-        row = ttk.Frame(box, style="Card.TFrame")
+        row = ttk.Frame(box)
         row.pack(fill=tk.X, pady=4)
         ttk.Label(row, text="Nx").pack(side=tk.LEFT)
         ttk.Spinbox(row, from_=1, to=50, textvariable=self.k_nx, width=5).pack(side=tk.LEFT, padx=6)
@@ -2357,18 +1500,18 @@ class VaspGUI(tk.Tk):
         ttk.Spinbox(row, from_=1, to=50, textvariable=self.k_nz, width=5).pack(side=tk.LEFT, padx=6)
         ttk.Checkbutton(box, text="Gamma 中心", variable=self.k_gamma).pack(anchor=tk.W, padx=8)
 
-        btns = ttk.Frame(container, style="Card.TFrame")
+        btns = ttk.Frame(container)
         btns.pack(fill=tk.X, padx=8, pady=4)
         ttk.Button(btns, text="生成到编辑器", command=self.kpoints_to_editor).pack(side=tk.LEFT)
         ttk.Button(btns, text="保存到项目(KPOINTS)", command=self.kpoints_save).pack(side=tk.LEFT, padx=8)
 
-        tip = ttk.Label(container, text="提示：也可在 INCAR 使用 KSPACING，省去 KPOINTS（VASP 5.4.4+）", style="Caption.TLabel")
+        tip = ttk.Label(container, text="提示：也可在 INCAR 使用 KSPACING，省去 KPOINTS（VASP 5.4.4+）")
         tip.pack(anchor=tk.W, padx=12, pady=4)
 
         return container
 
     def _build_kpoints_page(self, parent):
-        frame = ttk.Frame(parent, style="Page.TFrame")
+        frame = ttk.Frame(parent)
         self._populate_kpoints_section(frame)
         return frame
 
@@ -2381,16 +1524,15 @@ class VaspGUI(tk.Tk):
         dialog.resizable(True, True)
         dialog.grab_set()
 
-        frame = ttk.Frame(dialog, padding=12, style="Card.TFrame")
+        frame = ttk.Frame(dialog, padding=12)
         frame.pack(fill=tk.BOTH, expand=True)
 
         text = ScrolledText(frame, wrap=tk.WORD, width=68, height=20)
         text.insert(tk.END, message)
         text.configure(state=tk.DISABLED)
         text.pack(fill=tk.BOTH, expand=True)
-        self.theme_manager.style_text_widget(text)
 
-        btn_row = ttk.Frame(frame, style="Card.TFrame")
+        btn_row = ttk.Frame(frame)
         btn_row.pack(fill=tk.X, pady=(12, 0))
         ttk.Button(btn_row, text="关闭", command=dialog.destroy).pack(side=tk.RIGHT)
 
@@ -2414,28 +1556,27 @@ class VaspGUI(tk.Tk):
 
     def _tw_add_section_heading(self, parent, caption: str, help_text: str,
                                 *, title: Optional[str] = None, pady=(8, 4)) -> ttk.Frame:
-        row = ttk.Frame(parent, style="Card.TFrame")
+        row = ttk.Frame(parent)
         row.pack(fill=tk.X, pady=pady)
-        ttk.Label(row, text=caption, style="Header.TLabel").pack(side=tk.LEFT)
+        ttk.Label(row, text=caption, font=("TkDefaultFont", 10, "bold")).pack(side=tk.LEFT)
         self._tw_add_help_button(row, title or caption, help_text)
         return row
     # === CODEX END: twist/shift helpers ===
 
     # === CODEX BEGIN: twist/shift page UI ===
     def _build_twistshift_page(self, parent):
-        frame = ttk.Frame(parent, style="Page.TFrame")
+        frame = ttk.Frame(parent)
 
         # 左栏：输入与控制（带滚动条）
-        left_container = ttk.Frame(frame, style="Card.TFrame")
+        left_container = ttk.Frame(frame)
         left_container.pack(side=tk.LEFT, fill=tk.Y)
         left_canvas = tk.Canvas(left_container, borderwidth=0, highlightthickness=0, width=420)
         left_scroll = ttk.Scrollbar(left_container, orient=tk.VERTICAL, command=left_canvas.yview)
         left_canvas.configure(yscrollcommand=left_scroll.set)
         left_canvas.pack(side=tk.LEFT, fill=tk.Y, expand=False)
         left_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self._register_canvas(left_canvas)
 
-        left = ttk.Frame(left_canvas, padding=8, style="Card.TFrame")
+        left = ttk.Frame(left_canvas, padding=8)
         left_window = left_canvas.create_window((0, 0), window=left, anchor="nw")
 
         def _sync_scrollregion(event):
@@ -2553,13 +1694,7 @@ class VaspGUI(tk.Tk):
         dim_frame.pack(fill=tk.X, pady=4)
         ttk.Checkbutton(dim_frame, text="启用扭转角扫描", variable=self.tw_enable_twist).pack(anchor=tk.W, padx=6, pady=2)
         ttk.Checkbutton(dim_frame, text="启用滑移网格扫描", variable=self.tw_enable_slide).pack(anchor=tk.W, padx=6, pady=2)
-        ttk.Label(
-            dim_frame,
-            text="可按需只做扭转或只做滑移，两者都开时则全量组合。",
-            wraplength=340,
-            justify=tk.LEFT,
-            style="Caption.TLabel",
-        ).pack(anchor=tk.W, padx=6, pady=(0, 4))
+        ttk.Label(dim_frame, text="可按需只做扭转或只做滑移，两者都开时则全量组合。", wraplength=340, justify=tk.LEFT, foreground="#555").pack(anchor=tk.W, padx=6, pady=(0, 4))
 
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
@@ -2612,8 +1747,7 @@ class VaspGUI(tk.Tk):
         self._tw_add_section_heading(left, "常见注意事项", help_notes, title="常见注意事项", pady=(0, 8))
 
         # 右栏：俯视预览
-        right = ttk.Frame(frame, padding=8, style="Card.TFrame")
-        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        right = ttk.Frame(frame, padding=8); right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
         self.fig_tw = Figure(figsize=(6.0,4.5), dpi=100)
         self.ax_tw = self.fig_tw.add_subplot(111)
         self.ax_tw.set_title("Top view preview")
@@ -3216,27 +2350,26 @@ class VaspGUI(tk.Tk):
 
     # ------------------------- 页面：流程助手 ------------------------------
     def _build_workflow_page(self, parent):
-        frame = ttk.Frame(parent, style="Page.TFrame")
+        frame = ttk.Frame(parent)
 
         intro = ttk.Label(
             frame,
             text="按照从上到下的步骤完成一次 VASP 计算，可点击按钮快速跳转到对应面板。",
             wraplength=900,
             justify=tk.LEFT,
-            style="Muted.TLabel",
         )
         intro.pack(fill=tk.X, padx=12, pady=8)
 
-        status_box = ttk.LabelFrame(frame, text="当前项目状态", padding=8)
+        status_box = ttk.LabelFrame(frame, text="当前项目状态")
         status_box.pack(fill=tk.BOTH, expand=False, padx=12, pady=6)
 
-        status_row = ttk.Frame(status_box, style="Card.TFrame")
+        status_row = ttk.Frame(status_box)
         status_row.pack(fill=tk.X, padx=8, pady=6)
         ttk.Label(status_row, text="运行状态：").pack(side=tk.LEFT)
         ttk.Label(status_row, textvariable=self.run_status_var).pack(side=tk.LEFT, padx=4)
         ttk.Button(status_row, text="刷新状态", command=self.refresh_run_status).pack(side=tk.RIGHT)
 
-        tree_frame = ttk.Frame(status_box, style="Card.TFrame")
+        tree_frame = ttk.Frame(status_box)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
         columns = ("name", "status", "detail")
         self.workflow_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=6)
@@ -3251,7 +2384,7 @@ class VaspGUI(tk.Tk):
         self.workflow_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        sugg = ttk.Frame(status_box, style="Card.TFrame")
+        sugg = ttk.Frame(status_box)
         sugg.pack(fill=tk.BOTH, expand=False, padx=8, pady=(0, 6))
         ttk.Label(sugg, text="运行建议：").pack(anchor=tk.W)
         wf_suggest = ScrolledText(sugg, height=4, wrap="word", state="disabled")
@@ -3317,26 +2450,25 @@ class VaspGUI(tk.Tk):
             ),
         ]
 
-        steps_frame = ttk.Frame(frame, style="Card.TFrame")
+        steps_frame = ttk.Frame(frame)
         steps_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
         steps_frame.grid_columnconfigure(0, weight=1)
         steps_frame.grid_columnconfigure(1, weight=1)
         for idx, (title, desc, buttons, page) in enumerate(steps):
             row, col = divmod(idx, 2)
-            box = ttk.LabelFrame(steps_frame, text=title, padding=8)
+            box = ttk.LabelFrame(steps_frame, text=title)
             box.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
             ttk.Label(box, text=desc, justify=tk.LEFT, wraplength=360).pack(anchor=tk.W, padx=8, pady=4)
-            row_frame = ttk.Frame(box, style="Card.TFrame")
+            row_frame = ttk.Frame(box)
             row_frame.pack(anchor=tk.W, padx=8, pady=4)
             for txt, cmd in buttons:
                 ttk.Button(row_frame, text=txt, command=cmd).pack(side=tk.LEFT, padx=4)
             ttk.Button(row_frame, text="打开此面板", command=lambda p=page: self.goto_tab(p)).pack(side=tk.LEFT, padx=8)
 
-        notes = ttk.LabelFrame(frame, text="流程备注 / 待办", padding=8)
+        notes = ttk.LabelFrame(frame, text="流程备注 / 待办")
         notes.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
         self.workflow_notes = ScrolledText(notes, height=8, wrap="word")
         self.workflow_notes.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-        self._register_themable_text(self.workflow_notes)
         self.workflow_notes.insert(
             tk.END,
             "可在此记录当前任务的特殊参数、检查列表或备注。内容不会自动保存。",
@@ -3423,11 +2555,11 @@ class VaspGUI(tk.Tk):
 
     # ------------------------- 页面：运行 / 提交 ----------------------------
     def _build_run_page(self, parent):
-        frame = ttk.Frame(parent, style="Page.TFrame")
+        frame = ttk.Frame(parent)
 
-        status = ttk.LabelFrame(frame, text="运行状态", padding=8)
+        status = ttk.LabelFrame(frame, text="运行状态")
         status.pack(fill=tk.X, padx=8, pady=6)
-        row = ttk.Frame(status, style="Card.TFrame")
+        row = ttk.Frame(status)
         row.pack(fill=tk.X, padx=6, pady=4)
         ttk.Label(row, text="当前状态：").pack(side=tk.LEFT)
         ttk.Label(row, textvariable=self.run_status_var).pack(side=tk.LEFT, padx=4)
@@ -3437,7 +2569,7 @@ class VaspGUI(tk.Tk):
         self._register_suggestion_widget(run_suggest)
 
         # 运行方式
-        row0 = ttk.LabelFrame(frame, text="运行方式", padding=8)
+        row0 = ttk.LabelFrame(frame, text="运行方式")
         row0.pack(fill=tk.X, padx=8, pady=8)
         self.run_mode = tk.StringVar(value="local")
         ttk.Radiobutton(row0, text="本地 mpirun", value="local", variable=self.run_mode).pack(side=tk.LEFT, padx=8)
@@ -3445,7 +2577,7 @@ class VaspGUI(tk.Tk):
         ttk.Radiobutton(row0, text="SLURM 集群", value="slurm", variable=self.run_mode).pack(side=tk.LEFT)
 
         # VASP 执行文件 & 核心数
-        row1 = ttk.LabelFrame(frame, text="VASP 执行配置", padding=8)
+        row1 = ttk.LabelFrame(frame, text="VASP 执行配置")
         row1.pack(fill=tk.X, padx=8, pady=4)
         ttk.Label(row1, text="VASP 命令").grid(row=0, column=0, sticky=tk.W, padx=6, pady=4)
         self.vasp_cmd = tk.StringVar(value="vasp_std")
@@ -3461,7 +2593,7 @@ class VaspGUI(tk.Tk):
         ttk.Spinbox(row1, from_=1, to=2048, textvariable=self.mpi_np, width=8).grid(row=1, column=1, sticky=tk.W)
 
         # SLURM 区域
-        row2 = ttk.LabelFrame(frame, text="SLURM 提交（仅在选择 SLURM 运行时使用）", padding=8)
+        row2 = ttk.LabelFrame(frame, text="SLURM 提交（仅在选择 SLURM 运行时使用）")
         row2.pack(fill=tk.X, padx=8, pady=4)
         self.slurm_part = tk.StringVar(value="normal")
         self.slurm_time = tk.StringVar(value="02:00:00")
@@ -3479,7 +2611,7 @@ class VaspGUI(tk.Tk):
         ttk.Label(row2, text="账号").grid(row=0, column=8, sticky=tk.W, padx=6)
         ttk.Entry(row2, textvariable=self.slurm_account, width=12).grid(row=0, column=9)
 
-        btns = ttk.Frame(frame, style="Card.TFrame")
+        btns = ttk.Frame(frame)
         btns.pack(fill=tk.X, padx=8, pady=8)
         ttk.Button(btns, text="生成运行脚本", command=self.write_job_script).pack(side=tk.LEFT)
         ttk.Button(btns, text="启动/提交", command=self.start_run).pack(side=tk.LEFT, padx=8)
@@ -3487,7 +2619,6 @@ class VaspGUI(tk.Tk):
 
         self.run_log = ScrolledText(frame, height=14, wrap="word")
         self.run_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        self._register_themable_text(self.run_log)
 
         return frame
 
@@ -3747,11 +2878,11 @@ nice -n 5 ionice -c2 -n4 \
 
     # ------------------------- 页面：监视 ----------------------------------
     def _build_monitor_page(self, parent):
-        frame = ttk.Frame(parent, style="Page.TFrame")
+        frame = ttk.Frame(parent)
 
-        status_box = ttk.LabelFrame(frame, text="运行状态概览", padding=8)
+        status_box = ttk.LabelFrame(frame, text="运行状态概览")
         status_box.pack(fill=tk.X, padx=8, pady=10)
-        row = ttk.Frame(status_box, style="Card.TFrame")
+        row = ttk.Frame(status_box)
         row.pack(fill=tk.X, padx=6, pady=8)
         ttk.Label(row, text="当前状态：").pack(side=tk.LEFT)
         ttk.Label(row, textvariable=self.run_status_var).pack(side=tk.LEFT, padx=4)
@@ -3760,7 +2891,7 @@ nice -n 5 ionice -c2 -n4 \
         monitor_suggest.pack(fill=tk.X, padx=6, pady=(2, 8))
         self._register_suggestion_widget(monitor_suggest)
 
-        top = ttk.Frame(frame, style="Card.TFrame")
+        top = ttk.Frame(frame)
         top.pack(fill=tk.X, padx=8, pady=6)
         ttk.Button(top, text="开始监视", command=self.start_monitor).pack(side=tk.LEFT)
         ttk.Button(top, text="停止监视", command=self.stop_monitor).pack(side=tk.LEFT, padx=6)
@@ -3780,23 +2911,21 @@ nice -n 5 ionice -c2 -n4 \
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         # ETA 显示
-        eta_row = ttk.Frame(frame, style="Card.TFrame")
+        eta_row = ttk.Frame(frame)
         eta_row.pack(fill=tk.X, padx=8, pady=(0, 4))
         ttk.Label(eta_row, text="预计剩余时间：").pack(side=tk.LEFT)
         self.eta_var = tk.StringVar(value="—")
-        self.eta_label = ttk.Label(eta_row, textvariable=self.eta_var, style="StatusAccent.TLabel")
+        self.eta_label = ttk.Label(eta_row, textvariable=self.eta_var, foreground="#2b8a3e")
         self.eta_label.pack(side=tk.LEFT, padx=6)
         ttk.Label(eta_row, text="(基于最近 SCF 平均耗时与 OSZICAR 迭代统计)").pack(side=tk.LEFT, padx=6)
 
         self.mon_info = ScrolledText(frame, height=6, wrap="word")
         self.mon_info.pack(fill=tk.BOTH, expand=False, padx=8, pady=4)
-        self._register_themable_text(self.mon_info)
 
-        sys_frame = ttk.LabelFrame(frame, text="系统状态：CPU / 进程 / 文件增长", padding=8)
+        sys_frame = ttk.LabelFrame(frame, text="系统状态：CPU / 进程 / 文件增长")
         sys_frame.pack(fill=tk.BOTH, expand=False, padx=8, pady=6)
         self.sys_info = ScrolledText(sys_frame, height=10, wrap="word")
         self.sys_info.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-        self._register_themable_text(self.sys_info)
 
         self.sys_info.insert(tk.END, "点击“开始监视”以获取实时系统信息。\n")
 
@@ -3954,266 +3083,16 @@ nice -n 5 ionice -c2 -n4 \
 
     # ------------------------- 页面：后处理 ---------------------------
     def _build_post_page(self, parent):
-        frame = ttk.Frame(parent, style="Page.TFrame")
-        self.post_buttons: dict[str, ttk.Button] = {}
-
-        header = ttk.Frame(frame, style="Card.TFrame")
-        header.pack(fill=tk.X, padx=8, pady=(8, 4))
-        ttk.Label(header, text="后处理能力概览", style="Header.TLabel").pack(anchor="w", padx=12, pady=(10, 2))
-        ttk.Label(header, textvariable=self.post_cap_var, style="Muted.TLabel").pack(anchor="w", padx=12)
-        ttk.Label(header, textvariable=self.post_status_var, style="StatusAccent.TLabel").pack(anchor="e", padx=12, pady=(0, 8))
-
-        nb = ttk.Notebook(frame)
-        nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-
-        tab_es = ttk.Frame(nb, style="Page.TFrame")
-        nb.add(tab_es, text="电子结构")
-
-        ctrl = ttk.Frame(tab_es, style="Card.TFrame")
-        ctrl.pack(fill=tk.X, padx=8, pady=(8, 4))
-        ttk.Label(ctrl, text="电子结构一键分析", style="Header.TLabel").pack(anchor="w", padx=12, pady=(10, 4))
-
-        btn_row = ttk.Frame(ctrl, style="Card.TFrame")
-        btn_row.pack(fill=tk.X, padx=12, pady=(0, 8))
-        btn_dos = ttk.Button(btn_row, text="计算 DOS", command=lambda: self._start_postproc("dos"))
-        btn_dos.pack(side=tk.LEFT, padx=(0, 8))
-        btn_bands = ttk.Button(btn_row, text="计算能带", command=lambda: self._start_postproc("bands"))
-        btn_bands.pack(side=tk.LEFT, padx=(0, 8))
-        export_btn = ttk.Button(btn_row, text="打开导出目录", command=self._open_post_output)
-        export_btn.pack(side=tk.LEFT)
-        self.post_buttons["dos"] = btn_dos
-        self.post_buttons["bands"] = btn_bands
-        self.post_buttons["export"] = export_btn
-
-        preview_card = ttk.Frame(tab_es, style="Card.TFrame")
-        preview_card.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-        ttk.Label(preview_card, text="预览", style="Caption.TLabel").pack(anchor="w", padx=12, pady=(8, 0))
-        self.post_preview_fig = Figure(figsize=(5.5, 3.6), dpi=120)
-        self.post_preview_ax = self.post_preview_fig.add_subplot(111)
-        self.post_preview_ax.text(0.5, 0.5, "运行后显示图形", ha="center", va="center")
-        apply_style(self.post_preview_ax, self.figure_style_var.get())
-        self.post_preview_canvas = FigureCanvasTkAgg(self.post_preview_fig, master=preview_card)
-        widget = self.post_preview_canvas.get_tk_widget()
-        widget.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 12))
-
-        metrics_card = ttk.Frame(tab_es, style="Card.TFrame")
-        metrics_card.pack(fill=tk.BOTH, expand=False, padx=8, pady=(0, 8))
-        ttk.Label(metrics_card, text="指标与备注", style="Caption.TLabel").pack(anchor="w", padx=12, pady=(8, 0))
-
-        metrics_body = ttk.Frame(metrics_card, style="Card.TFrame")
-        metrics_body.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 12))
-        self.post_metrics = ttk.Treeview(metrics_body, columns=("metric", "value"), show="headings", height=4)
-        self.post_metrics.heading("metric", text="指标")
-        self.post_metrics.heading("value", text="数值")
-        self.post_metrics.column("metric", width=140, anchor="w")
-        self.post_metrics.column("value", width=160, anchor="center")
-        self.post_metrics.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self.post_notes = ScrolledText(metrics_body, width=40, height=6, wrap="word")
-        self.post_notes.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(12, 0))
-        self._register_themable_text(self.post_notes)
-        self.post_notes.insert(tk.END, "等待任务…")
-        self.post_notes.configure(state=tk.DISABLED)
-
-        # 其它标签页占位，后续逐步实现
-        tab_conv = ttk.Frame(nb, style="Page.TFrame")
-        nb.add(tab_conv, text="收敛扫描")
-        ttk.Label(tab_conv, text="ENCUT / k 网格扫描将在后续版本补齐。", style="Muted.TLabel").pack(anchor="w", padx=16, pady=16)
-
-        tab_surface = ttk.Frame(nb, style="Page.TFrame")
-        nb.add(tab_surface, text="表面 / 吸附")
-        ttk.Label(tab_surface, text="表面能与吸附能配方正在建设中。", style="Muted.TLabel").pack(anchor="w", padx=16, pady=16)
-
-        tab_mech = ttk.Frame(nb, style="Page.TFrame")
-        nb.add(tab_mech, text="体模量 / AIMD")
-        ttk.Label(tab_mech, text="体模量、弹性与 AIMD 后处理即将上线。", style="Muted.TLabel").pack(anchor="w", padx=16, pady=16)
-
-        history_card = ttk.Frame(frame, style="Card.TFrame")
-        history_card.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
-        ttk.Label(history_card, text="任务历史", style="Caption.TLabel").pack(anchor="w", padx=12, pady=(8, 0))
-
-        history_body = ttk.Frame(history_card, style="Card.TFrame")
-        history_body.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 12))
-        self.post_history_tree = ttk.Treeview(history_body, columns=("time", "name", "summary"), show="headings", height=5)
-        self.post_history_tree.heading("time", text="时间")
-        self.post_history_tree.heading("name", text="任务")
-        self.post_history_tree.heading("summary", text="备注")
-        self.post_history_tree.column("time", width=140, anchor="center")
-        self.post_history_tree.column("name", width=160, anchor="w")
-        self.post_history_tree.column("summary", width=400, anchor="w")
-        self.post_history_tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
-
-        self.post_log = ScrolledText(history_body, width=40, wrap="word", height=8)
-        self.post_log.pack(fill=tk.BOTH, expand=True, side=tk.RIGHT, padx=(12, 0))
-        self._register_themable_text(self.post_log)
-        self.post_log.configure(state=tk.DISABLED)
-
-        self._refresh_post_capabilities()
-        self._set_post_buttons_state(False)
+        frame = ttk.Frame(parent)
+        row = ttk.Frame(frame)
+        row.pack(fill=tk.X, padx=8, pady=8)
+        ttk.Button(row, text="收敛曲线（OSZICAR）→ 图/CSV", command=self.export_convergence).pack(side=tk.LEFT)
+        ttk.Button(row, text="总 DOS（DOSCAR）→ 图/CSV", command=self.export_dos_total).pack(side=tk.LEFT, padx=8)
+        ttk.Button(row, text="能带（EIGENVAL）→ 图/CSV", command=self.export_bands).pack(side=tk.LEFT)
+        self.post_log = ScrolledText(frame, height=18, wrap="word")
+        self.post_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         return frame
 
-    def _refresh_post_capabilities(self) -> None:
-        caps = [
-            ("pymatgen", HAS_PYMATGEN),
-            ("seekpath", HAS_SEEKPATH),
-            ("numpy", HAS_NUMPY),
-        ]
-        summary = " / ".join(("✅ " if ok else "⛔ ") + name for name, ok in caps)
-        self.post_cap_var.set(summary)
-
-    def _set_post_buttons_state(self, running: bool) -> None:
-        for key, btn in self.post_buttons.items():
-            if not isinstance(btn, ttk.Button):
-                continue
-            if key == "export":
-                state = tk.DISABLED if running or not self.post_last_result else tk.NORMAL
-            else:
-                state = tk.DISABLED if running else tk.NORMAL
-            try:
-                btn.configure(state=state)
-            except Exception:
-                pass
-
-    def _start_postproc(self, key: str) -> None:
-        if self.postproc_worker and self.postproc_worker.is_alive():
-            messagebox.showinfo(APP_NAME, "正在执行后处理，请稍候…")
-            return
-        workdir = self.current_project_path()
-        if not workdir.exists():
-            messagebox.showwarning(APP_NAME, "当前项目目录不存在。")
-            return
-        if key not in POSTPROCS:
-            messagebox.showerror(APP_NAME, f"未找到后处理任务：{key}")
-            return
-        opts: Dict[str, Any] = {
-            "style": self.figure_style_var.get(),
-            "emit_report": self.emit_report_var.get(),
-        }
-        if key == "dos":
-            opts["metal_threshold"] = 0.1
-        if key == "bands":
-            opts["occ_threshold"] = 0.5
-
-        def _finish(status: str, payload: PostResult | Exception) -> None:
-            self.after(0, lambda: self._on_postproc_finished(status, payload, key))
-
-        self.postproc_worker = PostprocWorker(key, workdir, opts, _finish)
-        self.postproc_worker.start()
-        self._set_post_buttons_state(True)
-        self.post_status_var.set(f"运行中：{POSTPROCS[key].name}")
-        self._append_post_log(f"启动后处理：{POSTPROCS[key].name}\n")
-
-    def _on_postproc_finished(self, status: str, payload: PostResult | Exception, key: str) -> None:
-        self._set_post_buttons_state(False)
-        if status == "error" or isinstance(payload, Exception):
-            err = payload if isinstance(payload, Exception) else Exception("未知错误")
-            messagebox.showerror(APP_NAME, f"后处理失败：{err}")
-            self.post_status_var.set("执行失败")
-            self._append_post_log(f"后处理失败：{err}\n")
-            self.postproc_worker = None
-            return
-        result: PostResult = payload  # type: ignore[assignment]
-        self.postproc_worker = None
-        self.post_last_result = result
-        self.post_status_var.set(f"完成：{POSTPROCS[key].name}")
-        self._update_post_preview(result)
-        self._update_post_metrics(result)
-        self._append_post_history(key, result)
-        self._append_post_log("完成后处理。\n")
-        self._set_post_buttons_state(False)
-
-    def _append_post_log(self, msg: str) -> None:
-        try:
-            self.post_log.configure(state=tk.NORMAL)
-            self.post_log.insert(tk.END, msg)
-            self.post_log.see(tk.END)
-        finally:
-            self.post_log.configure(state=tk.DISABLED)
-
-    def _update_post_preview(self, result: PostResult) -> None:
-        ax = self.post_preview_ax
-        ax.clear()
-        payload = result.payload
-        title = payload.get("title") if isinstance(payload, dict) else None
-        if isinstance(payload, dict) and "y" in payload:
-            xs = payload.get("x", [])
-            ys = payload.get("y", [])
-            ax.plot(xs, ys, linewidth=1.2)
-            ax.set_xlabel("Energy - $E_F$ (eV)")
-            ax.set_ylabel(payload.get("ylabel", ""))
-        elif isinstance(payload, dict) and "bands" in payload:
-            xs = payload.get("x", [])
-            bands = payload.get("bands", [])
-            for band in bands:
-                ax.plot(xs, band, linewidth=0.8)
-            ax.set_xlabel("k-path (arb.)")
-            ax.set_ylabel(payload.get("ylabel", ""))
-        else:
-            ax.text(0.5, 0.5, "无可视化数据", ha="center", va="center")
-        if title:
-            ax.set_title(title)
-        ax.grid(True, linestyle=":", linewidth=0.8)
-        apply_style(ax, self.figure_style_var.get())
-        self.post_preview_canvas.draw_idle()
-
-    def _update_post_metrics(self, result: PostResult) -> None:
-        self.post_metrics.delete(*self.post_metrics.get_children())
-        for name, value in result.metrics.items():
-            self.post_metrics.insert("", tk.END, values=(name, self._format_metric(value)))
-        notes = result.notes or []
-        self.post_notes.configure(state=tk.NORMAL)
-        self.post_notes.delete("1.0", tk.END)
-        if notes:
-            for line in notes:
-                self.post_notes.insert(tk.END, f"• {line}\n")
-        else:
-            self.post_notes.insert(tk.END, "无备注。")
-        self.post_notes.configure(state=tk.DISABLED)
-
-    def _format_metric(self, value: Any) -> str:
-        if isinstance(value, (int, str)):
-            return str(value)
-        try:
-            return f"{float(value):.4f}"
-        except Exception:
-            return str(value)
-
-    def _append_post_history(self, key: str, result: PostResult) -> None:
-        stamp = datetime.now().strftime("%H:%M:%S")
-        notes_preview = "; ".join(result.notes[:2]) if result.notes else ""
-        name = POSTPROCS[key].name if key in POSTPROCS else key
-        output_dir = None
-        if isinstance(result.payload, dict):
-            output_dir = result.payload.get("output_dir")
-        self.post_history.append(
-            {
-                "time": stamp,
-                "key": key,
-                "name": name,
-                "notes": notes_preview,
-                "output": output_dir,
-            }
-        )
-        self.post_history_tree.insert("", 0, values=(stamp, name, notes_preview))
-
-    def _open_post_output(self) -> None:
-        path = None
-        if self.post_last_result and isinstance(self.post_last_result.payload, dict):
-            raw = self.post_last_result.payload.get("output_dir")
-            if raw:
-                path = Path(raw)
-        if not path or not path.exists():
-            messagebox.showinfo(APP_NAME, "暂未生成导出目录。")
-            return
-        try:
-            if sys.platform.startswith("darwin"):
-                subprocess.Popen(["open", str(path)])
-            elif os.name == "nt":
-                os.startfile(str(path))  # type: ignore[attr-defined]
-            else:
-                subprocess.Popen(["xdg-open", str(path)])
-        except Exception as exc:
-            messagebox.showerror(APP_NAME, f"打开目录失败：{exc}")
     def plot_once_from_oszicar(self):
         proj = self.current_project_path()
         osz = proj / "OSZICAR"
@@ -4355,7 +3234,6 @@ nice -n 5 ionice -c2 -n4 \
 
     def _register_suggestion_widget(self, widget: tk.Text):
         self.run_suggestion_widgets.append(widget)
-        self._register_themable_text(widget)
 
     def current_project_path(self) -> Path:
         val = self.project_var.get()
