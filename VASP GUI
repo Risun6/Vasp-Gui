@@ -2085,6 +2085,7 @@ class VaspGUI(tk.Tk):
             return
 
         # 任务组合
+
         if single or not twist_enabled:
             thetas = [theta_a]
         else:
