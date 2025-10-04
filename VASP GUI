@@ -409,6 +409,44 @@ def _smoothstep(x: float, k: float = 6.0) -> float:
     import math
     return 1.0 / (1.0 + math.exp(-k * x))
 
+def _build_demo_twist_results() -> list[dict[str, float]]:
+    """生成二维材料演示用的扭转/滑移扫参数据。"""
+    import math
+
+    thetas = [0.0, 2.0, 4.0, 6.0, 8.0]
+    ux_list = [0.00, 0.25, 0.50, 0.75]
+    uy_list = [0.00, 0.33, 0.66]
+
+    Eg0 = 1.55  # 近似 "MoS2-like" 双层带隙（演示用途）
+    results: list[dict[str, float]] = []
+    for th in thetas:
+        for ux in ux_list:
+            for uy in uy_list:
+                gap = (
+                    Eg0
+                    - 0.10 * (th / 8.0)  # 小角扭转轻微减隙
+                    + 0.12 * math.cos(math.pi * ux)
+                    + 0.10 * math.cos(math.pi * uy)
+                )
+                gap = max(0.85, gap)
+
+                Etot = -500.0 + 0.08 * th + 0.20 * ux + 0.18 * uy
+
+                results.append(
+                    {
+                        "theta": round(float(th), 6),
+                        "ux": round(float(ux), 6),
+                        "uy": round(float(uy), 6),
+                        "gap": round(float(gap), 6),
+                        "E": round(float(Etot), 6),
+                        "path": f"theta_{th:04.1f}_ux_{ux:04.2f}_uy_{uy:04.2f}",
+                        "note": "2D-demo-mos2",
+                    }
+                )
+
+    return results
+
+
 def _build_demo_si():
     import math
 
@@ -562,26 +600,7 @@ def _build_demo_si():
     pot_rel = [v - pot0 for v in pot]
 
     # ---------- 2D 扭转/滑移扫参（演示） ----------
-    thetas = [0.0, 2.0, 4.0, 6.0, 8.0]  # 小角更常见，数量适中
-    ux_list = [0.00, 0.25, 0.50, 0.75]
-    uy_list = [0.00, 0.33, 0.66]
-    twist_results = []
-    for th in thetas:
-        for ux in ux_list:
-            for uy in uy_list:
-                # 以基准半导体层合为例：小角加强层间耦合，带隙微降；滑移引入周期性调制
-                gap = 1.90 - 0.05 * (th / 8.0)                       + 0.12 * math.cos(math.pi * ux)                       + 0.10 * math.cos(math.pi * uy)
-                gap = max(0.45, gap)  # 不让它太小
-                Etot = -500.0 + 0.08 * th + 0.20 * ux + 0.18 * uy
-                twist_results.append({
-                    "theta": float(th),
-                    "ux": float(ux),
-                    "uy": float(uy),
-                    "gap": float(round(gap, 4)),
-                    "E": float(round(Etot, 4)),
-                    "path": f"theta_{th:.2f}_ux_{ux:.2f}_uy_{uy:.2f}",
-                    "note": "demo",
-                })
+    twist_results = _build_demo_twist_results()
 
     # ---------- 汇总成原有全局变量 ----------
     demo = {}
@@ -1675,34 +1694,60 @@ def proc_effective_mass(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     demo_payload = opts.get("demo_payload") if isinstance(opts.get("demo_payload"), dict) else None
 
     if demo_payload:
-        bands = demo_payload.get("bands") or []
-        occs = demo_payload.get("occupancies") or []
+        bands_raw = demo_payload.get("bands") or []
+        occs_raw = demo_payload.get("occupancies") or []
         try:
             fermi = float(demo_payload.get("fermi", 0.0))
         except Exception:
             fermi = 0.0
-        rel = [[float(e) - fermi for e in row] for row in bands]
-        distances = demo_payload.get("distances") or []
-        if distances:
+
+        rel = []
+        for row in bands_raw:
             try:
-                distances = [float(x) for x in distances]
+                rel.append([float(e) - fermi for e in row])
+            except Exception:
+                continue
+
+        occs = []
+        for row in occs_raw:
+            try:
+                occs.append([float(o) for o in row])
+            except Exception:
+                occs.append([])
+
+        distances: list[float] = []
+        raw_dist = demo_payload.get("distances") or []
+        if isinstance(raw_dist, (list, tuple)):
+            try:
+                distances = [float(x) for x in raw_dist]
             except Exception:
                 distances = []
-        if not distances and rel and rel[0]:
-            distances = list(range(len(rel[0])))
-        if not rel or not distances:
+
+        if not rel or not rel[0]:
             raise RuntimeError("演示数据缺少能带或路径信息，无法估算有效质量。")
 
-        nb = len(rel)
-        nk = len(rel[0])
+        nk = len(rel)
+        nb = len(rel[0])
+
+        if distances and len(distances) != nk:
+            if nb == len(distances):
+                rel = _transpose_band_table(rel)
+                occs = _transpose_band_table(occs) if occs else occs
+                nk = len(rel)
+                nb = len(rel[0]) if rel and rel[0] else 0
+            distances = [float(x) for x in distances[:nk]]
+        if not distances or len(distances) != nk:
+            distances = [float(i) for i in range(nk)]
+
         v_idx = (0, 0)
         c_idx = (0, 0)
         vbm_E = -1e9
         cbm_E = 1e9
-        for b in range(nb):
-            for k in range(nk):
-                energy = rel[b][k]
-                occupied = occs[b][k] if b < len(occs) and k < len(occs[b]) else (1.0 if energy < 0 else 0.0)
+        for k in range(nk):
+            occ_row = occs[k] if k < len(occs) else []
+            for b in range(nb):
+                energy = rel[k][b]
+                occupied = occ_row[b] if b < len(occ_row) else (1.0 if energy < 0 else 0.0)
                 if occupied > 0.5 and energy > vbm_E:
                     vbm_E = energy
                     v_idx = (b, k)
@@ -1710,16 +1755,32 @@ def proc_effective_mass(workdir: Path, opts: Dict[str, Any]) -> PostResult:
                     cbm_E = energy
                     c_idx = (b, k)
 
-        me_star = float(demo_payload.get("me_star", 0.0))
-        mh_star = float(demo_payload.get("mh_star", 0.0))
+        rel_by_band = _transpose_band_table(rel)
+        if not rel_by_band:
+            raise RuntimeError("演示数据缺少能带或路径信息，无法估算有效质量。")
+
+        def _safe_float(val: Any, default: float = 0.0) -> float:
+            try:
+                return float(val)
+            except Exception:
+                return default
+
+        me_star = _safe_float(demo_payload.get("me_star"), 0.0)
+        mh_star = _safe_float(demo_payload.get("mh_star"), 0.0)
 
         fig = Figure(figsize=(5.2, 3.4))
         ax = fig.add_subplot(111)
-        for row in rel:
-            ax.plot(distances, row, lw=0.7, alpha=0.6)
-        if distances:
-            ax.scatter([distances[v_idx[1]]], [rel[v_idx[0]][v_idx[1]]], s=28, label=f"VBM m*_h≈{mh_star:.2f} m_e")
-            ax.scatter([distances[c_idx[1]]], [rel[c_idx[0]][c_idx[1]]], s=28, label=f"CBM m*_e≈{me_star:.2f} m_e")
+        for series in rel_by_band:
+            if not series:
+                continue
+            length = min(len(series), len(distances))
+            if length <= 1:
+                continue
+            ax.plot(distances[:length], series[:length], lw=0.7, alpha=0.6)
+        if distances and v_idx[0] < len(rel_by_band) and v_idx[1] < len(distances) and v_idx[1] < len(rel_by_band[v_idx[0]]):
+            ax.scatter([distances[v_idx[1]]], [rel_by_band[v_idx[0]][v_idx[1]]], s=28, label=f"VBM m*_h≈{mh_star:.2f} m_e")
+        if distances and c_idx[0] < len(rel_by_band) and c_idx[1] < len(distances) and c_idx[1] < len(rel_by_band[c_idx[0]]):
+            ax.scatter([distances[c_idx[1]]], [rel_by_band[c_idx[0]][c_idx[1]]], s=28, label=f"CBM m*_e≈{me_star:.2f} m_e")
         ax.axhline(0.0, lw=1.0, ls="--")
         ax.set_ylabel("E - E$_F$ (eV)")
         apply_style(ax, style)
@@ -1786,21 +1847,50 @@ def proc_effective_mass(workdir: Path, opts: Dict[str, Any]) -> PostResult:
         else:
             distances = list(range(len(bands[0]))) if bands else []
 
-    if not bands or not bands[0]:
+    bands_clean = []
+    for row in bands:
+        try:
+            bands_clean.append([float(e) for e in row])
+        except Exception:
+            continue
+    occs_clean = []
+    for row in occs:
+        try:
+            occs_clean.append([float(o) for o in row])
+        except Exception:
+            occs_clean.append([])
+
+    if not bands_clean or not bands_clean[0]:
         raise RuntimeError("有效质量拟合失败：能带数据为空，请确认能带计算输出完整。")
 
-    rel = [[e - efermi for e in row] for row in bands]
-    nb = len(rel)
-    nk = len(rel[0])
+    if distances and len(distances) == len(bands_clean[0]) and len(distances) != len(bands_clean):
+        bands_k = _transpose_band_table(bands_clean)
+        occs_k = _transpose_band_table(occs_clean) if occs_clean else occs_clean
+    else:
+        bands_k = bands_clean
+        occs_k = occs_clean
+
+    nk = len(bands_k)
+    if nk == 0:
+        raise RuntimeError("有效质量拟合失败：能带数据为空，请确认能带计算输出完整。")
+
+    if distances:
+        distances = [float(x) for x in distances[:nk]]
+    if not distances or len(distances) != nk:
+        distances = [float(i) for i in range(nk)]
+
+    rel = [[val - efermi for val in row] for row in bands_k]
+    nb = len(rel[0]) if rel else 0
 
     v_idx = (0, 0)
     c_idx = (0, 0)
     vbm_E = -1e9
     cbm_E = 1e9
-    for b in range(nb):
-        for k in range(nk):
-            energy = rel[b][k]
-            occupied = occs[b][k] if b < len(occs) and k < len(occs[b]) else (1.0 if energy < 0 else 0.0)
+    for k in range(nk):
+        occ_row = occs_k[k] if k < len(occs_k) else []
+        for b in range(nb):
+            energy = rel[k][b]
+            occupied = occ_row[b] if b < len(occ_row) else (1.0 if energy < 0 else 0.0)
             if occupied > 0.5 and energy > vbm_E:
                 vbm_E = energy
                 v_idx = (b, k)
@@ -1808,12 +1898,22 @@ def proc_effective_mass(workdir: Path, opts: Dict[str, Any]) -> PostResult:
                 cbm_E = energy
                 c_idx = (b, k)
 
+    rel_by_band = _transpose_band_table(rel)
+    if not rel_by_band:
+        raise RuntimeError("有效质量拟合失败：能带数据为空，请确认能带计算输出完整。")
+
     def _fit_mass(idx: tuple[int, int]) -> tuple[float, list[float], list[float]]:
         band, k0 = idx
+        if band < 0 or band >= len(rel_by_band):
+            return float("nan"), [], []
+        series = rel_by_band[band]
+        if not series:
+            return float("nan"), [], []
+        k0 = max(0, min(k0, len(series) - 1, len(distances) - 1))
         lo = max(0, k0 - window)
-        hi = min(nk, k0 + window + 1)
+        hi = min(len(distances), len(series), k0 + window + 1)
         xs = _np.array(distances[lo:hi], dtype=float)
-        ys = _np.array([rel[band][k] for k in range(lo, hi)], dtype=float)
+        ys = _np.array(series[lo:hi], dtype=float)
         if len(xs) < 3:
             return float("nan"), xs.tolist(), ys.tolist()
         coeffs = _np.polyfit(xs, ys, 2)
@@ -1829,11 +1929,17 @@ def proc_effective_mass(workdir: Path, opts: Dict[str, Any]) -> PostResult:
 
     fig = Figure(figsize=(5.2, 3.4))
     ax = fig.add_subplot(111)
-    for row in rel:
-        ax.plot(distances, row, lw=0.7, alpha=0.6)
-    if distances:
-        ax.scatter([distances[v_idx[1]]], [rel[v_idx[0]][v_idx[1]]], s=28, label=f"VBM m*_h≈{mh_star:.2f} m_e")
-        ax.scatter([distances[c_idx[1]]], [rel[c_idx[0]][c_idx[1]]], s=28, label=f"CBM m*_e≈{me_star:.2f} m_e")
+    for series in rel_by_band:
+        if not series:
+            continue
+        length = min(len(series), len(distances))
+        if length <= 1:
+            continue
+        ax.plot(distances[:length], series[:length], lw=0.7, alpha=0.6)
+    if distances and v_idx[0] < len(rel_by_band) and v_idx[1] < len(distances) and v_idx[1] < len(rel_by_band[v_idx[0]]):
+        ax.scatter([distances[v_idx[1]]], [rel_by_band[v_idx[0]][v_idx[1]]], s=28, label=f"VBM m*_h≈{mh_star:.2f} m_e")
+    if distances and c_idx[0] < len(rel_by_band) and c_idx[1] < len(distances) and c_idx[1] < len(rel_by_band[c_idx[0]]):
+        ax.scatter([distances[c_idx[1]]], [rel_by_band[c_idx[0]][c_idx[1]]], s=28, label=f"CBM m*_e≈{me_star:.2f} m_e")
     ax.axhline(0.0, lw=1.0, ls="--")
     ax.set_ylabel("E - E$_F$ (eV)")
     apply_style(ax, style)
@@ -4096,46 +4202,8 @@ class VaspGUI(tk.Tk):
     # === Add to class VaspGUI: 2D twist/shift demo writer =======================
 
     def _tw_build_demo_results(self) -> list[dict]:
-        """
-        生成一套“MoS2-like 双层”演示数据：
-        - 角度 θ ∈ {0, 2, 4, 6, 8} deg（小角更常见）
-        - 滑移 (ux, uy) 在 [0,1)×[0,1) 上取 4×3 网格
-        - gap_eV：随小角略降、随滑移呈余弦调制；下限设为 0.85 eV（不金属化）
-        - E_eV：总能轻微变化（展示能量/稳定性排序用）
-        """
-        import math
-        thetas = [0.0, 2.0, 4.0, 6.0, 8.0]
-        ux_list = [0.00, 0.25, 0.50, 0.75]
-        uy_list = [0.00, 0.33, 0.66]
-
-        # MoS2 双层的“演示口径”：基线带隙 ~1.55 eV，扭转与堆垛（滑移）稍微调制
-        Eg0 = 1.55
-        results = []
-        for th in thetas:
-            for ux in ux_list:
-                for uy in uy_list:
-                    # 余弦调制模拟不同堆垛（AA'/AB 近似）、小角减隙
-                    gap = (
-                        Eg0
-                        - 0.10 * (th / 8.0)                         # 扭转小角略降
-                        + 0.12 * math.cos(math.pi * ux)             # 沿 a1 的调制
-                        + 0.10 * math.cos(math.pi * uy)             # 沿 a2 的调制
-                    )
-                    gap = max(0.85, gap)  # 不让它假性金属化，UI 更稳定
-
-                    # 总能随角度与滑移的轻微起伏，用来演示“最稳堆垛”
-                    Etot = -500.0 + 0.08 * th + 0.20 * ux + 0.18 * uy
-
-                    results.append({
-                        "theta": round(float(th), 6),
-                        "ux": round(float(ux), 6),
-                        "uy": round(float(uy), 6),
-                        "gap": round(float(gap), 6),
-                        "E": round(float(Etot), 6),
-                        "path": f"theta_{th:04.1f}_ux_{ux:04.2f}_uy_{uy:04.2f}",
-                        "note": "2D-demo-mos2",
-                    })
-        return results
+        """生成一套“MoS2-like 双层”演示数据。"""
+        return [dict(r) for r in _build_demo_twist_results()]
 
     def _tw_write_demo_results(self, out_dir):
         """
