@@ -142,8 +142,7 @@ def _read_kpoints_linemode(kpoints_path: Path) -> tuple[list[list[float]], list[
     return ks, labs
 
 
-APP_NAME = "VASP Linux 一体化GUI"
-APP_VER = "0.1.0-MVP"
+APP_NAME = "VASP GUI"
 
 # 配置文件路径（保存用户设置）
 CONFIG_DIR = Path.home() / ".config" / "vasp_gui"
@@ -1754,7 +1753,7 @@ class EnergyMonitor(threading.Thread):
 class VaspGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f"{APP_NAME} v{APP_VER}")
+        self.title(f"{APP_NAME}")
         self.geometry("1200x800")
         if HAS_TTKBOOTSTRAP and tb is not None:
             try:
