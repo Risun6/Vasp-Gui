@@ -105,36 +105,23 @@ CONFIG_DIR = Path.home() / ".config" / "vasp_gui"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 
+
 class AzureThemeManager:
-    """Create a modern Azure-like look without depending on external files."""
+    """Create a bright Azure-inspired light theme for the app."""
 
     PALETTES: Dict[str, Dict[str, str]] = {
-        "dark": {
-            "window": "#1c1f2b",
-            "surface": "#222538",
-            "card": "#282c40",
-            "border": "#343954",
-            "accent": "#3b82f6",
-            "accent_hover": "#639dff",
-            "text": "#f8f9ff",
-            "muted": "#a4aac4",
-            "entry": "#1f2132",
-            "tree_even": "#24283f",
-            "tree_odd": "#1f2334",
-            "select_fg": "#111320",
-        },
         "light": {
-            "window": "#eff4fb",
-            "surface": "#f7f9fd",
+            "window": "#f4f6fb",
+            "surface": "#f8faff",
             "card": "#ffffff",
-            "border": "#d6deeb",
-            "accent": "#2563eb",
-            "accent_hover": "#1d4ed8",
+            "border": "#d8e2f6",
+            "accent": "#1f6feb",
+            "accent_hover": "#1a56d6",
             "text": "#0f172a",
-            "muted": "#5f6b7a",
+            "muted": "#6b7b8f",
             "entry": "#ffffff",
             "tree_even": "#ffffff",
-            "tree_odd": "#f1f5fb",
+            "tree_odd": "#f3f6fc",
             "select_fg": "#ffffff",
         },
     }
@@ -142,29 +129,29 @@ class AzureThemeManager:
     def __init__(self, root: tk.Misc):
         self.root = root
         self.style = ttk.Style(root)
-        self.current_mode = "dark"
+        self.current_mode = "light"
         self.using_native_package = False
         if HAS_AZURE_THEME and azure_theme is not None:
             try:
                 if hasattr(azure_theme, "use_theme"):
-                    azure_theme.use_theme(root, "dark")
+
+                    azure_theme.use_theme(root, "light")
                     self.using_native_package = True
-                elif hasattr(azure_theme, "use_dark_theme"):
-                    azure_theme.use_dark_theme(root)
+                elif hasattr(azure_theme, "use_light_theme"):
+                    azure_theme.use_light_theme(root)
                     self.using_native_package = True
             except Exception:
                 self.using_native_package = False
         if not self.using_native_package:
-            self._ensure_base_theme("dark")
             self._ensure_base_theme("light")
-        self.use("dark")
+        self.use("light")
 
-    def _ensure_base_theme(self, mode: Literal["dark", "light"]):
-        theme_name = f"azure-{mode}"
+    def _ensure_base_theme(self, mode: Literal["light"] = "light"):
+        theme_name = "azure-light"
         if theme_name in self.style.theme_names():
             return
         base = "clam" if "clam" in self.style.theme_names() else self.style.theme_use()
-        palette = self.PALETTES[mode]
+        palette = self.PALETTES["light"]
         self.style.theme_create(
             theme_name,
             parent=base,
@@ -179,51 +166,50 @@ class AzureThemeManager:
                 "TNotebook.Tab": {
                     "configure": {
                         "padding": (18, 10),
-                        "background": palette["card"],
-                    }
+                        "background": palette["surface"],
+                        "foreground": palette["muted"],
+                    },
+                    "map": {
+                        "background": [("selected", palette["card"])],
+                        "foreground": [("selected", palette["text"])],
+                    },
                 },
                 "Horizontal.TScrollbar": {
                     "configure": {
                         "background": palette["card"],
                         "troughcolor": palette["surface"],
+
+                        "bordercolor": palette["border"],
                     }
                 },
                 "Vertical.TScrollbar": {
                     "configure": {
                         "background": palette["card"],
                         "troughcolor": palette["surface"],
+
+                        "bordercolor": palette["border"],
                     }
                 },
             },
         )
 
-    def use(self, mode: Literal["dark", "light"]):
-        if mode not in self.PALETTES:
-            mode = "dark"
-        self.current_mode = mode
+    def use(self, mode: Literal["light"] = "light"):
+        self.current_mode = "light"
         if self.using_native_package:
             try:
                 if hasattr(azure_theme, "use_theme"):
-                    azure_theme.use_theme(self.root, mode)
-                elif mode == "dark" and hasattr(azure_theme, "use_dark_theme"):
-                    azure_theme.use_dark_theme(self.root)
-                elif mode == "light" and hasattr(azure_theme, "use_light_theme"):
+                    azure_theme.use_theme(self.root, "light")
+                elif hasattr(azure_theme, "use_light_theme"):
                     azure_theme.use_light_theme(self.root)
             except Exception:
-                # 退回自定义主题
                 self.using_native_package = False
-                self._ensure_base_theme("dark")
                 self._ensure_base_theme("light")
         if not self.using_native_package:
-            theme_name = f"azure-{mode}"
+            theme_name = "azure-light"
             self.style.theme_use(theme_name)
-            palette = self.PALETTES[mode]
-            self.root.configure(background=palette["window"])
-            self._apply_shared_styles(palette)
-        else:
-            palette = self.PALETTES[mode]
-            self.root.configure(background=palette["window"])
-            self._apply_shared_styles(palette)
+        palette = self.PALETTES["light"]
+        self.root.configure(background=palette["window"])
+        self._apply_shared_styles(palette)
 
     def _apply_shared_styles(self, palette: Dict[str, str]):
         accent = palette["accent"]
@@ -243,14 +229,17 @@ class AzureThemeManager:
 
         self.style.configure(
             "TButton",
-            background=palette["card"],
-            foreground=palette["text"],
+
+            background=accent,
+            foreground=palette["select_fg"],
             borderwidth=0,
-            padding=(14, 8),
+            focusthickness=1,
+            focuscolor=accent,
+            padding=(12, 7),
         )
         self.style.map(
             "TButton",
-            background=[("active", accent_hover), ("pressed", accent)],
+            background=[("active", accent_hover), ("pressed", accent_hover)],
             foreground=[("disabled", palette["muted"]), ("pressed", palette["select_fg"]), ("active", palette["select_fg"])],
         )
 
@@ -258,7 +247,8 @@ class AzureThemeManager:
             "Accent.TButton",
             background=accent,
             foreground=palette["select_fg"],
-            padding=(16, 10),
+
+            padding=(14, 9),
         )
         self.style.map(
             "Accent.TButton",
@@ -269,20 +259,32 @@ class AzureThemeManager:
             "TEntry",
             fieldbackground=palette["entry"],
             foreground=palette["text"],
+
+            bordercolor=palette["border"],
+            lightcolor=accent,
+            darkcolor=palette["border"],
             padding=(10, 6),
         )
+        self.style.map(
+            "TEntry",
+            bordercolor=[("focus", accent)],
+        )
+
         self.style.configure(
             "TCombobox",
             fieldbackground=palette["entry"],
             background=palette["entry"],
             foreground=palette["text"],
+
+            bordercolor=palette["border"],
             padding=(10, 6),
         )
-
         self.style.map(
             "TCombobox",
             fieldbackground=[("readonly", palette["entry"]), ("active", palette["entry"])],
             foreground=[("readonly", palette["text"]), ("disabled", palette["muted"])],
+
+            bordercolor=[("focus", accent)],
         )
 
         self.style.configure(
@@ -298,29 +300,29 @@ class AzureThemeManager:
 
         self.style.configure(
             "Treeview",
-            background=palette["tree_even"],
-            fieldbackground=palette["tree_even"],
+
+            background=palette["card"],
+            fieldbackground=palette["card"],
             foreground=palette["text"],
             bordercolor=palette["border"],
-            rowheight=26,
+        )
+        self.style.configure(
+            "Treeview.Heading",
+            background=palette["surface"],
+            foreground=palette["muted"],
+            relief="flat",
         )
         self.style.map(
+
             "Treeview",
             background=[("selected", accent)],
             foreground=[("selected", palette["select_fg"])],
         )
 
-        self.style.configure(
-            "Treeview.Heading",
-            background=palette["card"],
-            foreground=palette["muted"],
-            relief="flat",
-        )
-        self.style.map(
-            "Treeview.Heading",
-            background=[("active", palette["accent_hover"]), ("pressed", accent)],
-            foreground=[("active", palette["select_fg"]), ("pressed", palette["select_fg"])],
-        )
+        self.root.option_add("*TCombobox*Listbox.background", palette["card"])
+        self.root.option_add("*TCombobox*Listbox.foreground", palette["text"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", accent)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", palette["select_fg"])
 
         self.style.configure(
             "StatusAccent.TLabel",
@@ -329,10 +331,6 @@ class AzureThemeManager:
             background=palette["surface"],
         )
 
-        self.root.option_add("*TCombobox*Listbox.background", palette["card"])
-        self.root.option_add("*TCombobox*Listbox.foreground", palette["text"])
-        self.root.option_add("*TCombobox*Listbox.selectBackground", accent)
-        self.root.option_add("*TCombobox*Listbox.selectForeground", palette["select_fg"])
 
     def style_text_widget(self, widget: tk.Text):
         palette = self.PALETTES[self.current_mode]
@@ -340,7 +338,8 @@ class AzureThemeManager:
         if prev_state == tk.DISABLED:
             widget.configure(state=tk.NORMAL)
         widget.configure(
-            background=palette["card"],
+
+            background=palette["surface"],
             foreground=palette["text"],
             insertbackground=palette["text"],
             selectbackground=palette["accent"],
@@ -1020,7 +1019,7 @@ class VaspGUI(tk.Tk):
         self.run_suggestion_widgets: list[tk.Text] = []
         self.themable_texts: list[tk.Text] = []
         self.themable_canvases: list[tk.Canvas] = []
-        self.theme_mode_var = tk.StringVar(value="深色")
+
         self.overview_items = [
             ("__project__", "项目目录"),
             ("INCAR", "INCAR"),
@@ -1061,16 +1060,6 @@ class VaspGUI(tk.Tk):
         ttk.Button(toolbar, text="首次向导", command=self.launch_first_time_wizard).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="创建示例项目", command=self.on_create_example_project).pack(side=tk.LEFT, padx=4)
 
-        ttk.Label(toolbar, text="主题:").pack(side=tk.LEFT, padx=(22, 4))
-        theme_selector = ttk.Combobox(
-            toolbar,
-            state="readonly",
-            width=6,
-            textvariable=self.theme_mode_var,
-            values=("深色", "浅色"),
-        )
-        theme_selector.pack(side=tk.LEFT, padx=(0, 6))
-        theme_selector.bind("<<ComboboxSelected>>", self.on_theme_change)
 
         ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X)
 
@@ -1120,19 +1109,6 @@ class VaspGUI(tk.Tk):
             self.themable_canvases.append(canvas)
         self._style_canvas(canvas)
 
-    def on_theme_change(self, *_):
-        mode = "dark" if self.theme_mode_var.get() == "深色" else "light"
-        self.theme_manager.use(mode)
-        for widget in list(self.themable_texts):
-            try:
-                self.theme_manager.style_text_widget(widget)
-            except Exception:
-                pass
-        for canvas in list(self.themable_canvases):
-            try:
-                self._style_canvas(canvas)
-            except Exception:
-                pass
 
     # ------------------------- 页面：输入文件 -----------------------------
     def _build_inputs_page(self, parent):
