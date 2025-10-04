@@ -1581,7 +1581,6 @@ class VaspGUI(tk.Tk):
 
             预览/生成时会将上层加到下层之上，层间距由“真空”与你后续设置共同决定。
 
-            更多细节可参阅用户手册中的结构准备章节。
         """).strip()
         ttk.Label(left, text=info1, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(4, 8))
 
@@ -1613,7 +1612,6 @@ class VaspGUI(tk.Tk):
 
             小贴士：莫尔超胞原子数 ~ 1/θ²（弧度），θ 很小时会“爆表”。面板下方“任务上限”就是用来兜底的。
 
-            容许应变的进一步讨论可参考用户手册中的容许应变章节。
         """).strip()
         ttk.Label(left, text=info2, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(4, 8))
 
@@ -1646,7 +1644,6 @@ class VaspGUI(tk.Tk):
             任务数中的角度个数：
             Nθ = floor((止 − 起)/步) + 1。
 
-            θ 列表的示例计算可参见使用指南中的附录。
         """).strip()
         ttk.Label(left, text=info3, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
 
@@ -1673,7 +1670,6 @@ class VaspGUI(tk.Tk):
 
             对六角晶格，(uₓ,uᵧ) 的对称等价点会被自动去重（若启用“等价裁剪”，否则就全保留以便做摩擦路径）。
 
-            5×5 网格的示例列表可在文档附录中查看。
         """).strip()
         ttk.Label(left, text=info4, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
 
@@ -1735,7 +1731,6 @@ class VaspGUI(tk.Tk):
             在每个任务目录抓取 OSZICAR/OUTCAR/EIGENVAL/DOSCAR，汇总为一张表：theta_deg, ux, uy, natoms, strain%, Etot_eV, dE_meV_per_atom, gap_PBE_eV, Efermi, conv_steps, status。
             这一步只做解析与统计；若你启用“自动运行”，它还能附带标记已完成/失败任务。
 
-            各按钮的职责如上所述，完整操作流程可参考用户指南。
         """).strip()
         ttk.Label(left, text=info6, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
 
@@ -1774,7 +1769,6 @@ class VaspGUI(tk.Tk):
 
             解析带隙：PBE 会低估；想更可信，请对代表点加做 HSE 或 scGW 小样本标定，在 CSV 后处理里做“多保真校正”。
 
-            更多命名规范与目录结构示例可在项目文档中查阅。
         """).strip()
         ttk.Label(left, text=info8, justify=tk.LEFT, wraplength=360, foreground="#555").pack(anchor=tk.W, pady=(0, 8))
 
