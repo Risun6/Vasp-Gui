@@ -2498,6 +2498,9 @@ class VaspGUI(tk.Tk):
         # === CODEX BEGIN: add twist/shift tab ===
         self.page_twist = self._build_twistshift_page(self.nb)
         self.nb.add(self.page_twist, text="二维材料·滑移/扭转")
+        # 结果演示页：用于快速加载 CSV/JSON 并绘制热图
+        self.page_twist_results = self._build_twistshift_results_page(self.nb)
+        self.nb.add(self.page_twist_results, text="二维材料·结果演示")
         # === CODEX END: add twist/shift tab ===
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -2532,6 +2535,11 @@ class VaspGUI(tk.Tk):
             if demo_poscar.exists():
                 self.tw_top_path.set(str(demo_poscar))
                 self.tw_bot_path.set(str(demo_poscar))
+        except Exception:
+            pass
+        try:
+            self.tw_dir.set(str(twist_dir))
+            self._tw_load_dir(twist_dir)
         except Exception:
             pass
         self.apply_run_status("🧪 演示模式", ["已加载内置示例数据，可直接体验全部后处理功能。"])
@@ -4095,15 +4103,38 @@ class VaspGUI(tk.Tk):
             rows.append(dict(path=sub.name, theta=theta, ux=ux, uy=uy, gap_eV=gap_eV, totalE=totalE, note=note))
 
         # 写 CSV
+        import csv
+
         csv_path = root / "results.csv"
-        with csv_path.open("w", encoding="utf-8") as f:
-            f.write("path,theta,ux,uy,gap_eV,totalE_eV,note\n")
+        with csv_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["theta", "ux", "uy", "gap", "E", "path", "note"])
             for r in rows:
-                def _fmt(v):
-                    if v is None: return ""
-                    if isinstance(v, float): return f"{v:.6f}"
-                    return str(v)
-                f.write(",".join([r["path"], _fmt(r["theta"]), _fmt(r["ux"]), _fmt(r["uy"]), _fmt(r["gap_eV"]), _fmt(r["totalE"]), (r["note"] or "").replace(",",";")]) + "\n")
+                theta = r.get("theta")
+                ux = r.get("ux")
+                uy = r.get("uy")
+                gap = r.get("gap_eV")
+                energy = r.get("totalE")
+                note = (r.get("note") or "").replace(",", ";").replace("\n", " ")
+
+                def _fmt_float(val):
+                    if val is None or (isinstance(val, float) and math.isnan(val)):
+                        return ""
+                    if isinstance(val, float):
+                        return f"{val:.6f}"
+                    return str(val)
+
+                writer.writerow(
+                    [
+                        _fmt_float(theta),
+                        _fmt_float(ux),
+                        _fmt_float(uy),
+                        _fmt_float(gap),
+                        _fmt_float(energy),
+                        r.get("path", ""),
+                        note,
+                    ]
+                )
 
         messagebox.showinfo(APP_NAME, f"已导出汇总：{csv_path}")
         self._tw_append_log(f"结果汇总完成：共 {len(rows)} 条记录，输出 {csv_path}")
@@ -4149,6 +4180,309 @@ class VaspGUI(tk.Tk):
             return (None, None)
     # === CODEX END: collect sweep results ===
 
+    # === 2D 滑移/扭转载：页面 + 演示数据 + 可视化（最小可用版） =====================
+
+    def _build_twistshift_results_page(self, parent):
+        """二维材料·滑移/扭转（演示/载入扫参）"""
+        frame = ttk.Frame(parent, padding=8)
+
+        # ---- 变量与状态 ----
+        if not hasattr(self, "tw_top_path"):
+            self.tw_top_path = tk.StringVar(value="")
+        if not hasattr(self, "tw_bot_path"):
+            self.tw_bot_path = tk.StringVar(value="")
+        self.tw_dir = tk.StringVar(value="")
+        self.tw_theta = tk.DoubleVar(value=0.0)
+        self.tw_ux = tk.DoubleVar(value=0.0)
+        self.tw_uy = tk.DoubleVar(value=0.0)
+        self.tw_results = []  # 全部结果
+        self.tw_filtered = []  # 过滤到某个 theta 的切片
+        self.tw_cbar = None  # 记录 colorbar 以便重绘时清理
+
+        # ---- 顶部：文件选择与动作 ----
+        top = ttk.Frame(frame)
+        top.pack(fill=tk.X)
+        ttk.Label(top, text="上层 POSCAR:").pack(side=tk.LEFT)
+        ttk.Entry(top, textvariable=self.tw_top_path, width=48).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="选择…", command=self._tw_choose_top).pack(side=tk.LEFT)
+
+        ttk.Label(top, text="  下层 POSCAR:").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Entry(top, textvariable=self.tw_bot_path, width=48).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="选择…", command=self._tw_choose_bot).pack(side=tk.LEFT)
+
+        # 第二行：扫参目录 + 快捷按钮
+        row2 = ttk.Frame(frame)
+        row2.pack(fill=tk.X, pady=(6, 2))
+        ttk.Label(row2, text="扫参目录:").pack(side=tk.LEFT)
+        ttk.Entry(row2, textvariable=self.tw_dir, width=64).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row2, text="选择目录…", command=self._tw_choose_dir).pack(side=tk.LEFT)
+        ttk.Button(row2, text="载入目录", command=lambda: self._tw_load_dir(self.tw_dir.get())).pack(side=tk.LEFT, padx=6)
+        ttk.Button(row2, text="写入演示数据并载入", command=self._tw_write_and_load_demo).pack(side=tk.LEFT, padx=6)
+
+        # 第三行：筛选与操作
+        row3 = ttk.Frame(frame)
+        row3.pack(fill=tk.X, pady=(2, 6))
+        ttk.Label(row3, text="θ(°)：").pack(side=tk.LEFT)
+        tk.Spinbox(row3, from_=0.0, to=30.0, increment=0.5, textvariable=self.tw_theta, width=6).pack(side=tk.LEFT)
+        ttk.Label(row3, text="  ux：").pack(side=tk.LEFT)
+        tk.Spinbox(row3, from_=0.0, to=1.0, increment=0.05, textvariable=self.tw_ux, width=6).pack(side=tk.LEFT)
+        ttk.Label(row3, text="  uy：").pack(side=tk.LEFT)
+        tk.Spinbox(row3, from_=0.0, to=1.0, increment=0.05, textvariable=self.tw_uy, width=6).pack(side=tk.LEFT)
+        ttk.Button(row3, text="按 θ 过滤并重绘", command=self._tw_refilter_and_redraw).pack(side=tk.LEFT, padx=8)
+        ttk.Button(row3, text="导出当前切片CSV", command=self._tw_export_slice_csv).pack(side=tk.LEFT, padx=4)
+        self.tw_info = ttk.Label(row3, text="—")
+        self.tw_info.pack(side=tk.LEFT, padx=8)
+
+        # ---- 主体左右：表格 + 图 ----
+        body = ttk.PanedWindow(frame, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # 左：结果表
+        left = ttk.Frame(body)
+        body.add(left, weight=1)
+        cols = ("theta", "ux", "uy", "gap", "E", "path")
+        self.tw_tree = ttk.Treeview(left, columns=cols, show="headings", height=16)
+        for c, w in zip(cols, (70, 60, 60, 70, 70, 240)):
+            self.tw_tree.heading(c, text=c)
+            self.tw_tree.column(c, width=w, anchor=tk.CENTER if c != "path" else tk.W)
+        self.tw_tree.pack(fill=tk.BOTH, expand=True)
+        self.tw_tree.bind("<<TreeviewSelect>>", self._on_tw_tree_select)
+
+        # 右：Matplotlib 区
+        right = ttk.Frame(body)
+        body.add(right, weight=1)
+        self.tw_fig = Figure(figsize=(5.6, 3.6))
+        self.tw_ax = self.tw_fig.add_subplot(111)
+        self.tw_canvas = FigureCanvasTkAgg(self.tw_fig, master=right)
+        self.tw_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        return frame
+
+    # --- 目录/文件选择 ---
+    def _tw_choose_top(self):
+        p = filedialog.askopenfilename(title="选择上层 POSCAR", filetypes=[("POSCAR", "POSCAR"), ("All", "*")])
+        if p:
+            self.tw_top_path.set(p)
+
+    def _tw_choose_bot(self):
+        p = filedialog.askopenfilename(title="选择下层 POSCAR", filetypes=[("POSCAR", "POSCAR"), ("All", "*")])
+        if p:
+            self.tw_bot_path.set(p)
+
+    def _tw_choose_dir(self):
+        d = filedialog.askdirectory(title="选择扫参目录")
+        if d:
+            self.tw_dir.set(d)
+            self._tw_load_dir(d)
+
+    # --- 写演示数据并载入 ---
+    def _tw_write_and_load_demo(self):
+        d = self.current_project_path() / "twist_sweep"
+        try:
+            csv_path = self._tw_write_demo_results(d)
+            self._tw_append_log(f"演示结果已写入 {csv_path}")
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"写入演示数据失败：{e}")
+            return
+        self.tw_dir.set(str(d))
+        self._tw_load_dir(d)
+
+    def _tw_write_demo_results(self, out_dir: Path) -> Path:
+        """把内置 DEMO_TWIST_RESULTS 写到 results.csv"""
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = out_dir / "results.csv"
+        with csv_path.open("w", encoding="utf-8") as f:
+            f.write("theta,ux,uy,gap,E,path\n")
+            for r in DEMO_TWIST_RESULTS:
+                f.write(f"{r['theta']},{r['ux']},{r['uy']},{r['gap']},{r['E']},{r['path']}\n")
+        readme = out_dir / "README.txt"
+        write_text(
+            readme,
+            "本目录为演示生成的二维材料扭转/滑移扫参结果（CSV）。\n列含义：theta(°), ux, uy, gap(eV), E(eV), path\n",
+        )
+        return csv_path
+
+    # --- 载入目录 ---
+    def _tw_load_dir(self, dpath: str | Path):
+        d = Path(dpath)
+        if not d.exists():
+            messagebox.showwarning(APP_NAME, f"目录不存在：{d}")
+            return
+        csv_path = d / "results.csv"
+        rows: list[dict] = []
+        if csv_path.exists():
+            try:
+                import csv
+
+                with csv_path.open("r", encoding="utf-8", errors="ignore") as f:
+                    reader = csv.DictReader(f)
+                    if reader.fieldnames is None:
+                        raise ValueError("CSV 缺少表头")
+                    for rec in reader:
+                        rows.append(self._tw_row_from_dict(rec))
+            except Exception as e:
+                messagebox.showerror(APP_NAME, f"读取 {csv_path} 失败：{e}")
+                return
+        else:
+            for jf in sorted(d.glob("*.json*")):
+                try:
+                    txt = jf.read_text(encoding="utf-8", errors="ignore").strip()
+                    if not txt:
+                        continue
+                    if txt.startswith("{"):
+                        data = json.loads(txt)
+                        rows.append(self._tw_row_from_dict(data))
+                    else:
+                        for line in txt.splitlines():
+                            line = line.strip()
+                            if not line:
+                                continue
+                            data = json.loads(line)
+                            rows.append(self._tw_row_from_dict(data))
+                except Exception:
+                    continue
+
+        rows = [r for r in rows if r]
+        if not rows:
+            messagebox.showwarning(APP_NAME, f"未在 {d} 发现可用的演示/扫参数据（results.csv 或 json/jsonl）。")
+            return
+
+        self.tw_results = rows
+        thetas = sorted({round(r["theta"], 6) for r in rows})
+        try:
+            current_theta = float(self.tw_theta.get())
+        except (tk.TclError, TypeError, ValueError):
+            current_theta = 0.0
+            self.tw_theta.set(current_theta)
+        chosen = self._tw_pick_nearest_theta(current_theta, thetas)
+        self.tw_theta.set(chosen)
+        self._tw_refilter_and_redraw()
+        self.tw_info.config(text=f"Loaded {len(rows)} records · theta slice {chosen:.2f}°")
+
+    def _tw_row_from_dict(self, d: dict) -> dict:
+        if not isinstance(d, dict):
+            return {}
+
+        def _first(keys: tuple[str, ...], default: float | str = 0.0):
+            for key in keys:
+                if key in d and d[key] not in ("", None):
+                    return d[key]
+            return default
+
+        try:
+            theta = float(_first(("theta", "theta_deg"), 0.0))
+            ux = float(_first(("ux",), 0.0))
+            uy = float(_first(("uy",), 0.0))
+            gap = float(_first(("gap", "gap_eV"), 0.0))
+            energy = float(_first(("E", "totalE", "totalE_eV"), 0.0))
+        except Exception:
+            return {}
+
+        path = str(_first(("path", "name"), ""))
+        return {"theta": theta, "ux": ux, "uy": uy, "gap": gap, "E": energy, "path": path}
+
+    def _tw_pick_nearest_theta(self, val: float, thetas: list[float]) -> float:
+        if not thetas:
+            return 0.0
+        return min(thetas, key=lambda t: abs(t - val))
+
+    # --- 过滤并重绘 ---
+    def _tw_refilter_and_redraw(self):
+        if not getattr(self, "tw_results", None):
+            return
+        try:
+            theta_val = float(self.tw_theta.get())
+        except (tk.TclError, TypeError, ValueError):
+            theta_val = 0.0
+            self.tw_theta.set(theta_val)
+        theta = round(theta_val, 6)
+        thetas = sorted({round(r["theta"], 6) for r in self.tw_results})
+        if theta not in thetas:
+            theta = self._tw_pick_nearest_theta(theta, thetas)
+            self.tw_theta.set(theta)
+        self.tw_filtered = [r for r in self.tw_results if round(r["theta"], 6) == theta]
+        self._tw_refresh_tree(self.tw_filtered)
+        self._tw_redraw_heatmap(self.tw_filtered)
+
+    def _tw_refresh_tree(self, rows: list[dict]):
+        if not hasattr(self, "tw_tree"):
+            return
+        self.tw_tree.delete(*self.tw_tree.get_children())
+        rows_sorted = sorted(rows, key=lambda r: (r["ux"], r["uy"]))
+        for r in rows_sorted:
+            self.tw_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    f"{r['theta']:.2f}",
+                    f"{r['ux']:.2f}",
+                    f"{r['uy']:.2f}",
+                    f"{r['gap']:.3f}",
+                    f"{r['E']:.3f}",
+                    r["path"],
+                ),
+            )
+
+    def _tw_redraw_heatmap(self, rows: list[dict]):
+        if not hasattr(self, "tw_ax"):
+            return
+        self.tw_ax.clear()
+        if not rows:
+            self.tw_ax.set_title("No data available")
+            self.tw_canvas.draw_idle()
+            return
+        xs = [r["ux"] for r in rows]
+        ys = [r["uy"] for r in rows]
+        cs = [r["gap"] for r in rows]
+        sc = self.tw_ax.scatter(xs, ys, c=cs)
+        self.tw_ax.set_xlabel("ux")
+        self.tw_ax.set_ylabel("uy")
+        self.tw_ax.set_title(f"Band gap heatmap (theta={self.tw_theta.get():.2f} deg)")
+        if self.tw_cbar is not None:
+            try:
+                self.tw_cbar.remove()
+            except Exception:
+                pass
+            self.tw_cbar = None
+        self.tw_cbar = self.tw_fig.colorbar(sc, ax=self.tw_ax, label="gap (eV)")
+        apply_style(self.tw_ax, _normalize_style(self.figure_style_var.get()))
+        self.tw_fig.tight_layout()
+        self.tw_canvas.draw_idle()
+
+    # --- 表格选择 ---
+    def _on_tw_tree_select(self, _evt=None):
+        sel = self.tw_tree.selection()
+        if not sel:
+            return
+        vals = self.tw_tree.item(sel[0], "values")
+        try:
+            self.tw_theta.set(float(vals[0]))
+            self.tw_ux.set(float(vals[1]))
+            self.tw_uy.set(float(vals[2]))
+        except Exception:
+            pass
+
+    # --- 导出当前切片 CSV ---
+    def _tw_export_slice_csv(self):
+        if not getattr(self, "tw_filtered", None):
+            messagebox.showwarning(APP_NAME, "当前 θ 切片为空。")
+            return
+        p = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+            title="导出当前θ切片为 CSV",
+        )
+        if not p:
+            return
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("theta,ux,uy,gap,E,path\n")
+            for r in self.tw_filtered:
+                f.write(f"{r['theta']},{r['ux']},{r['uy']},{r['gap']},{r['E']},{r['path']}\n")
+        messagebox.showinfo(APP_NAME, f"已导出：{p}")
+
+    # === 2D 滑移/扭转载：页面 + 演示数据 + 可视化（最小可用版） END ===============
+
     # === POST: twist/slide maps & curves =========================================
     def _tw_load_results_table(self, root: Optional[Path] = None) -> List[Dict[str, Any]]:
         """加载 twist_sweep/results.csv；若不存在先调用 _tw_collect_results() 生成。"""
@@ -4174,13 +4508,19 @@ class VaspGUI(tk.Tk):
                 reader = csv.DictReader(f)
                 for rec in reader:
                     try:
+                        gap_val = rec.get("gap")
+                        if gap_val in (None, ""):
+                            gap_val = rec.get("gap_eV")
+                        energy_val = rec.get("E")
+                        if energy_val in (None, ""):
+                            energy_val = rec.get("totalE_eV")
                         rows.append(
                             {
                                 "theta": float(rec.get("theta") or "nan"),
                                 "ux": float(rec.get("ux") or "nan"),
                                 "uy": float(rec.get("uy") or "nan"),
-                                "gap": float(rec.get("gap_eV") or "nan"),
-                                "E": float(rec.get("totalE_eV") or "nan"),
+                                "gap": float(gap_val or "nan"),
+                                "E": float(energy_val or "nan"),
                                 "path": rec.get("path", ""),
                                 "note": rec.get("note", ""),
                             }
@@ -4198,103 +4538,6 @@ class VaspGUI(tk.Tk):
             and (not math.isnan(r["uy"]))
         ]
         return rows
-
-    # === Add to class VaspGUI: 2D twist/shift demo writer =======================
-
-    def _tw_build_demo_results(self) -> list[dict]:
-        """生成一套“MoS2-like 双层”演示数据。"""
-        return [dict(r) for r in _build_demo_twist_results()]
-
-    def _tw_write_demo_results(self, out_dir):
-        """
-        在 out_dir 下写出：
-          - summary.csv （theta_deg, ux, uy, E_eV, gap_eV, path, note）
-          - meta.json   （角度/网格与口径信息）
-          - runs/<path>/result.json（每个工况一个小目录，便于你现有解析器遍历）
-        若全局已有 DEMO_TWIST_RESULTS 就复用；否则调用 _tw_build_demo_results() 生成。
-        """
-        import json, csv
-        out_dir = Path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        runs_dir = out_dir / "runs"
-        runs_dir.mkdir(parents=True, exist_ok=True)
-
-        # 复用已有全局数据（如果你之前定义了 DEMO_TWIST_RESULTS）
-        results: list[dict] = []
-        try:
-            results = [dict(r) for r in DEMO_TWIST_RESULTS]  # type: ignore # noqa
-        except Exception:
-            results = self._tw_build_demo_results()
-
-        # 写 summary.csv
-        csv_path = out_dir / "summary.csv"
-        with csv_path.open("w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["theta_deg", "ux", "uy", "E_eV", "gap_eV", "path", "note"])
-            for r in results:
-                w.writerow([r["theta"], r["ux"], r["uy"], r["E"], r["gap"], r["path"], r.get("note", "")])
-
-        # 写 meta.json（给 UI / 解析器一个“任务地图”）
-        thetas = sorted({float(r["theta"]) for r in results})
-        ux_vals = sorted({float(r["ux"]) for r in results})
-        uy_vals = sorted({float(r["uy"]) for r in results})
-        meta = {
-            "system": "bilayer MoS2 (demo-like)",
-            "comment": "演示用：小角轻微减隙；滑移余弦调制；总能微小起伏。非材料拟合。",
-            "angles_deg": thetas,
-            "ux_grid": ux_vals,
-            "uy_grid": uy_vals,
-            "fields": ["theta", "ux", "uy", "E", "gap", "path", "note"],
-            "units": {"E": "eV", "gap": "eV", "theta": "deg"},
-            "count": len(results),
-        }
-        (out_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        # 为每个工况建一个小目录并写 result.json（方便“逐工况查看/重算”）
-        for r in results:
-            d = runs_dir / r["path"]
-            d.mkdir(parents=True, exist_ok=True)
-            (d / "result.json").write_text(json.dumps(r, ensure_ascii=False, indent=2), encoding="utf-8")
-            # 轻量占位：给你现有脚本/按钮一个落点（不包含 VASP 可执行）
-            if not (d / "INCAR").exists():
-                (d / "INCAR").write_text(
-                    "# demo placeholder for INCAR (2D sweep)\n# 建议真实计算时开启：LDIPOL = .TRUE., IDIPOL = 3\n",
-                    encoding="utf-8",
-                )
-            if not (d / "KPOINTS").exists():
-                (d / "KPOINTS").write_text(
-                    "Automatic mesh\n0\nGamma\n1 1 1\n0 0 0\n",
-                    encoding="utf-8",
-                )
-            if not (d / "POSCAR").exists():
-                # 极简 2H-MoS2 单层占位（只为 UI 预览/拷贝路径；不用于科学计算）
-                (d / "POSCAR").write_text(
-                    "MoS2 monolayer (demo-only)\n1.0\n"
-                    "3.180000 0.000000 0.000000\n"
-                    "-1.590000 2.754000 0.000000\n"
-                    "0.000000 0.000000 20.000000\n"
-                    "Mo S\n"
-                    "1 2\n"
-                    "Direct\n"
-                    "0.333333 0.666667 0.500000\n"
-                    "0.333333 0.666667 0.580000\n"
-                    "0.333333 0.666667 0.420000\n",
-                    encoding="utf-8",
-                )
-
-        # 友好提示（在“监视/后处理”页能看到）
-        self.apply_run_status(
-            "🧪 二维材料演示就绪",
-            [
-                f"已生成 {len(results)} 个 (θ,ux,uy) 工况于 {out_dir}/",
-                "可直接“解析 sweep 结果 → CSV/热图”，或点开单个工况目录浏览占位文件。",
-            ],
-        )
-        return csv_path
-
-    # === END: 2D twist/shift demo writer =======================================
-
-
 
     def _tw_plot_gap_heatmap_btn(self):
         """按钮：用当前 θ（输入框 tw_theta_a）画 gap(u_x,u_y) 热图。"""
@@ -6384,8 +6627,7 @@ class FirstTimeWizard(tk.Toplevel):
             return default
 
 
-
-
 if __name__ == "__main__":
     app = VaspGUI()
     app.mainloop()
+
