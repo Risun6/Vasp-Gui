@@ -4227,6 +4227,7 @@ class VaspGUI(tk.Tk):
     # === END: 2D twist/shift demo writer =======================================
 
 
+
     def _tw_plot_gap_heatmap_btn(self):
         """按钮：用当前 θ（输入框 tw_theta_a）画 gap(u_x,u_y) 热图。"""
 
