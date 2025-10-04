@@ -419,7 +419,7 @@ DEMO_BAND_KPOINTS = [
     [0.0, 0.0, 0.0],
 ]
 DEMO_BAND_LABELS = ["Γ", "", "X", "", "M", "Γ"]
-DEMO_BAND_VALUES = [
+_DEMO_BAND_KPATH = [
     [-2.40, -0.65, 0.95, 2.70],
     [-2.32, -0.52, 0.90, 2.62],
     [-2.20, -0.40, 0.88, 2.55],
@@ -427,7 +427,15 @@ DEMO_BAND_VALUES = [
     [-2.26, -0.48, 1.05, 2.72],
     [-2.40, -0.65, 1.12, 2.88],
 ]
-DEMO_BAND_OCCS = [[1.0, 1.0, 0.0, 0.0] for _ in DEMO_BAND_VALUES]
+DEMO_BAND_VALUES = [list(row) for row in zip(*_DEMO_BAND_KPATH)]
+_demo_occ_full = [1.0] * len(DEMO_BAND_KPOINTS)
+_demo_occ_empty = [0.0] * len(DEMO_BAND_KPOINTS)
+DEMO_BAND_OCCS = [
+    _demo_occ_full.copy(),
+    _demo_occ_full.copy(),
+    _demo_occ_empty.copy(),
+    _demo_occ_empty.copy(),
+]
 DEMO_BAND_DISTANCES = [0.0, 0.52, 1.04, 1.63, 2.34, 3.05]
 
 DEMO_PLANAR_Z = [round(0.4 * i, 6) for i in range(60)]
@@ -2039,11 +2047,11 @@ class PostprocWorker(threading.Thread):
             result = proc.runner(workdir, self.opts)
         except FileNotFoundError as exc:
             err_msg = str(exc)
-            app.after(0, lambda err_msg=err_msg: app._on_postproc_error(self.key, err_msg))
+            app.after(0, app._on_postproc_error, self.key, err_msg)
             return
         except Exception as exc:
             err_msg = f"后处理异常：{exc}"
-            app.after(0, lambda err_msg=err_msg: app._on_postproc_error(self.key, err_msg))
+            app.after(0, app._on_postproc_error, self.key, err_msg)
             return
         app.after(0, lambda: app._on_postproc_success(self.key, result, workdir, self.opts))
 
