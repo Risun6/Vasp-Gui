@@ -1429,7 +1429,6 @@ def proc_planar_potential(workdir: Path, opts: Dict[str, Any]) -> PostResult:
 
 register_postproc(PostProc(name="pot_z", needs=["LOCPOT"], runner=proc_planar_potential))
 
-
 # ----------------------------- GUI 组件 ------------------------------------
 
 class SystemStatsMonitor(threading.Thread):
@@ -2753,6 +2752,7 @@ class VaspGUI(tk.Tk):
         ttk.Button(left, text="绘制 gap 热图（用当前 θ）", command=self._tw_plot_gap_heatmap_btn).pack(anchor=tk.W, pady=(4, 0))
         ttk.Button(left, text="绘制 gap–θ 曲线（min/mean/max）", command=self._tw_plot_gap_vs_theta_btn).pack(anchor=tk.W, pady=(4, 8))
 
+
         self._add_section_heading(left, "推荐默认值", help_defaults, title="计算与物理的默认值", pady=(8, 4))
         self._add_section_heading(left, "常见注意事项", help_notes, title="常见注意事项", pady=(0, 8))
 
@@ -3498,6 +3498,7 @@ class VaspGUI(tk.Tk):
                 grid[i, j] = g
 
         top = tk.Toplevel(self)
+
         top.title(f"Band gap heatmap @ θ={theta:.2f}°")
         fig = Figure(figsize=(6.2, 5.2), dpi=110)
         ax = fig.add_subplot(111)
@@ -3571,6 +3572,7 @@ class VaspGUI(tk.Tk):
         g_mean = np.array([np.mean(by_theta[t]) for t in thetas], dtype=float)
 
         top = tk.Toplevel(self)
+
         top.title("Band gap vs. twist angle (min/mean/max)")
         fig = Figure(figsize=(6.4, 4.6), dpi=110)
         ax = fig.add_subplot(111)
@@ -4407,6 +4409,7 @@ nice -n 5 ionice -c2 -n4 \
         """).strip()
         tasks_box = ttk.LabelFrame(left, text="任务勾选")
         tasks_box.pack(fill=tk.X, pady=6)
+
         self._add_section_heading(left, "可用后处理", help_tasks, title="可用后处理", pady=(0, 4))
         task_defs = [
             ("dos", "总 DOS"),
@@ -4444,6 +4447,7 @@ nice -n 5 ionice -c2 -n4 \
         """).strip()
         em_box = ttk.LabelFrame(left, text="拟合参数")
         em_box.pack(fill=tk.X, pady=6)
+
         self._add_section_heading(left, "m* 拟合", help_emass, title="有效质量 m*", pady=(0, 4))
         ttk.Label(em_box, text="窗口 ±k 点").pack(side=tk.LEFT)
         self._em_win = tk.IntVar(value=4)
@@ -4455,6 +4459,7 @@ nice -n 5 ionice -c2 -n4 \
             • 报告目录统一保存在项目 reports/ 下，可通过“打开报告文件夹”快速定位最新一次输出。
             • 日志窗口会记录每个任务的指标 metrics、备注 notes 以及潜在错误信息。
         """).strip()
+
         self._add_section_heading(left, "运行与导出", help_actions, title="运行与导出", pady=(8, 4))
         btns = ttk.Frame(left)
         btns.pack(fill=tk.X, pady=4)
@@ -4586,7 +4591,6 @@ nice -n 5 ionice -c2 -n4 \
         self.post_metrics.insert(tk.END, f"[{timestamp}] {text}\n")
         self.post_metrics.see(tk.END)
         self.post_metrics.configure(state=tk.DISABLED)
-
     def plot_once_from_oszicar(self):
         proj = self.current_project_path()
         osz = proj / "OSZICAR"
