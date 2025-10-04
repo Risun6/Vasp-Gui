@@ -184,7 +184,7 @@ class WizardProfile:
     use_slurm: bool
     np: int
     slurm: Dict[str, Any]
-    figure_style: Literal["AFM", "AM", "PRB"]
+    figure_style: Literal["AFM"]
     emit_report: bool
 
 
@@ -197,23 +197,144 @@ FIG_STYLES: Dict[str, Dict[str, Any]] = {
         "tick_len": 3,
         "box": True,
     },
-    "AM": {
-        "font": "Arial",
-        "size": {"title": 12, "label": 11, "tick": 10},
-        "linew": 1.4,
-        "tick_dir": "in",
-        "tick_len": 3,
-        "box": True,
-    },
-    "PRB": {
-        "font": "Helvetica",
-        "size": {"title": 13, "label": 11, "tick": 10},
-        "linew": 1.1,
-        "tick_dir": "in",
-        "tick_len": 3,
-        "box": False,
-    },
 }
+
+POST_FIG_DPI = 240
+
+
+def _normalize_style(style: str | None) -> str:
+    if style in FIG_STYLES:
+        return style  # type: ignore[return-value]
+    return "AFM"
+
+
+def _clone_2d_table(table: list[list[float]] | None) -> list[list[float]]:
+    if not table:
+        return []
+    return [list(row) for row in table]
+
+
+def _extract_kcoords(raw_kpts: list[Any] | None) -> list[list[float]]:
+    coords: list[list[float]] = []
+    if not raw_kpts:
+        return coords
+    for item in raw_kpts:
+        vec: Any = None
+        if isinstance(item, (list, tuple)):
+            if item and isinstance(item[0], (list, tuple)):
+                vec = item[0]
+            else:
+                vec = item
+        if vec is None:
+            continue
+        try:
+            triple = [float(vec[i]) for i in range(3)]
+        except Exception:
+            continue
+        coords.append(triple)
+    return coords
+
+
+def _coords_close(a: list[float], b: list[float], tol: float = 1e-6) -> bool:
+    if len(a) != len(b):
+        return False
+    return all(abs(x - y) <= tol for x, y in zip(a, b))
+
+
+def _align_band_lengths(
+    bands: list[list[float]],
+    occs: list[list[float]] | None,
+    coords: list[list[float]] | None,
+) -> tuple[list[list[float]], list[list[float]] | None, list[list[float]] | None]:
+    if coords and len(coords) != len(bands):
+        limit = min(len(coords), len(bands))
+        bands = bands[:limit]
+        if occs:
+            occs = occs[:limit]
+        coords = coords[:limit]
+    if occs and len(occs) != len(bands):
+        occs = occs[: len(bands)]
+    return bands, occs, coords
+
+
+def _trim_periodic_path(
+    coords: list[list[float]] | None,
+    bands: list[list[float]],
+    occs: list[list[float]] | None,
+) -> tuple[list[list[float]] | None, list[list[float]], list[list[float]] | None, bool]:
+    trimmed = False
+    if coords and bands and len(coords) == len(bands) and len(coords) > 1:
+        if _coords_close(coords[0], coords[-1]):
+            coords = coords[:-1]
+            bands = bands[:-1]
+            if occs:
+                occs = occs[:-1]
+            trimmed = True
+    return coords, bands, occs, trimmed
+
+
+def _transpose_band_table(table: list[list[float]]) -> list[list[float]]:
+    if not table:
+        return []
+    widths = [len(row) for row in table if row]
+    if not widths:
+        return []
+    nb = min(widths)
+    if nb <= 0:
+        return []
+    return [[row[i] for row in table if i < len(row)] for i in range(nb)]
+
+
+def _compute_kpath_positions(
+    coords: list[list[float]] | None,
+    recip: list[list[float]] | None = None,
+) -> list[float]:
+    if not coords:
+        return []
+    positions: list[float] = []
+    accum = 0.0
+    prev_vec: list[float] | None = None
+    use_recip = (
+        recip is not None
+        and len(recip) >= 3
+        and all(isinstance(row, (list, tuple)) and len(row) >= 3 for row in recip[:3])
+    )
+    for frac in coords:
+        if len(frac) < 3:
+            continue
+        if use_recip:
+            vec = [
+                frac[0] * float(recip[0][i])
+                + frac[1] * float(recip[1][i])
+                + frac[2] * float(recip[2][i])
+                for i in range(3)
+            ]
+        else:
+            vec = [float(frac[i]) for i in range(3)]
+        if prev_vec is not None:
+            delta = math.sqrt(sum((vec[i] - prev_vec[i]) ** 2 for i in range(3)))
+            if delta > 1e-9:
+                accum += delta
+        positions.append(accum)
+        prev_vec = vec
+    return positions
+
+
+def _split_segments_from_positions(positions: list[float]) -> list[tuple[int, int]]:
+    if len(positions) < 2:
+        return []
+    segments: list[tuple[int, int]] = []
+    start = 0
+    for idx in range(1, len(positions)):
+        if abs(positions[idx] - positions[idx - 1]) < 1e-9:
+            if idx - start > 1:
+                segments.append((start, idx))
+            start = idx
+    if len(positions) - start > 1:
+        segments.append((start, len(positions)))
+    if not segments:
+        segments.append((0, len(positions)))
+    return segments
 
 DEFAULT_POSCAR_TEMPLATE = """Si
 1.0
@@ -260,86 +381,6 @@ Gamma
 0 0 0
 """
 
-# === ETA helpers ===
-ETA_LOOP_RX = re.compile(r"LOOP:\s+cpu time\s+([0-9.eE+\-]+)\s*:\s*real time\s+([0-9.eE+\-]+)", re.IGNORECASE)
-ETA_LOOP_CPU_ONLY_RX = re.compile(r"LOOP:\s+cpu time\s+([0-9.eE+\-]+)", re.IGNORECASE)
-ETA_ITER_LINE_RX = re.compile(r"^\s*\d+\s+[-+]?[\d.eE]+\s")  # OSZICAR: "  N   E   dE ..."
-ETA_F_LINE_RX = re.compile(r"\bF=\s*([-+]?\d+\.\d+)")
-
-def _fmt_eta_seconds(sec: float | None) -> str:
-    if not sec or sec <= 0:
-        return "—"
-    sec = int(sec)
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    s = sec % 60
-    return (f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}")
-
-def _parse_incar_int(path: Path, key: str, default: int | None = None) -> int | None:
-    try:
-        txt = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return default
-    rx = re.compile(rf"^\s*{re.escape(key)}\s*=\s*([-+]?\d+)", re.IGNORECASE | re.MULTILINE)
-    m = rx.search(txt)
-    return int(m.group(1)) if m else default
-
-def _oszicar_stats(osz: Path) -> tuple[int, float | None]:
-    """返回 (已完成离子步数, 每离子步平均SCF迭代数)。"""
-    if not osz.exists():
-        return 0, None
-    steps_done = 0
-    iter_counts: list[int] = []
-    cur = 0
-    try:
-        for line in osz.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if ETA_ITER_LINE_RX.match(line):
-                cur += 1
-            elif ETA_F_LINE_RX.search(line):
-                steps_done += 1
-                if cur > 0:
-                    iter_counts.append(cur)
-                cur = 0
-    except Exception:
-        pass
-    avg_iter = (sum(iter_counts) / len(iter_counts)) if iter_counts else None
-    return steps_done, avg_iter
-
-def _vaspout_loop_times(vout: Path, take_last: int = 40) -> tuple[float | None, int]:
-    """解析 vasp.out 最近的 LOOP 行，返回(平均单次SCF耗时(秒), 已解析迭代数)。"""
-    if not vout.exists():
-        return None, 0
-    try:
-        lines = vout.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except Exception:
-        return None, 0
-    times: list[float] = []
-    for ln in reversed(lines):
-        m = ETA_LOOP_RX.search(ln)
-        if m:
-            # 优先 real time
-            try:
-                times.append(float(m.group(2)))
-            except Exception:
-                try:
-                    times.append(float(m.group(1)))
-                except Exception:
-                    pass
-        else:
-            m2 = ETA_LOOP_CPU_ONLY_RX.search(ln)
-            if m2:
-                try:
-                    times.append(float(m2.group(1)))
-                except Exception:
-                    pass
-        if len(times) >= take_last:
-            break
-    if not times:
-        return None, 0
-    # 使用中位数更稳，也可用均值
-    times_sorted = sorted(times)
-    mid = times_sorted[len(times_sorted)//2]
-    return (mid, len(times))
 
 
 # ----------------------------- 工具函数区 ----------------------------------
@@ -699,7 +740,7 @@ def _estimate_gap_from_dos(energies: list[float], dos: list[float], threshold: f
 
 
 def proc_dos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
-    style = opts.get("style", "AFM")
+    style = _normalize_style(opts.get("style"))
     threshold = float(opts.get("metal_threshold", 0.02))
     cache_key = "dos_total"
     files = [workdir / "vasprun.xml", workdir / "DOSCAR", workdir / "OUTCAR"]
@@ -747,7 +788,7 @@ def proc_dos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     apply_style(ax, style)
     fig.tight_layout()
     fig_path = figs_dir / "dos.png"
-    fig.savefig(fig_path, dpi=160)
+    fig.savefig(fig_path, dpi=POST_FIG_DPI)
 
     csv_path = tables_dir / "dos.csv"
     with csv_path.open("w", encoding="utf-8") as fh:
@@ -841,7 +882,7 @@ def _estimate_gap_from_bands(bands: list[list[float]], occs: list[list[float]], 
 
 
 def proc_bands(workdir: Path, opts: Dict[str, Any]) -> PostResult:
-    style = opts.get("style", "AFM")
+    style = _normalize_style(opts.get("style"))
     threshold = float(opts.get("metal_threshold", 0.02))
     cache_key = "bands"
     files = [workdir / "vasprun.xml", workdir / "EIGENVAL", workdir / "OUTCAR"]
@@ -859,49 +900,84 @@ def proc_bands(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     data = _load_cached(workdir, cache_key, files, _builder)
     if data is None:
         raise RuntimeError("无法解析能带数据。")
-    bands = data.get("bands", [])
-    occs = data.get("occupancies", [])
-    kpts = data.get("kpoints", [])
+    raw_bands = _clone_2d_table(data.get("bands"))
+    if not raw_bands:
+        raise RuntimeError("未能在 vasprun.xml/EIGENVAL 中解析到能带数据，请确认已完成能带计算。")
+    occs = _clone_2d_table(data.get("occupancies"))
+    coords = _extract_kcoords(data.get("kpoints"))
+    if not coords:
+        kp_file, _ = _read_kpoints_linemode(workdir / "KPOINTS")
+        coords = _extract_kcoords(kp_file)
+    bands, occs, coords = _align_band_lengths(raw_bands, occs, coords)
+    coords, bands, occs, trimmed = _trim_periodic_path(coords, bands, occs)
+
     fermi = _parse_fermi_from_outcar(workdir)
     if fermi is None and bands:
         flat = [e for energies in bands for e in energies]
         fermi = sum(flat) / len(flat)
 
+    gap, nature, vbm, cbm = _estimate_gap_from_bands(bands, occs or [], fermi)
+
     rel_bands = [[e - fermi for e in row] for row in bands]
-    gap, nature, vbm, cbm = _estimate_gap_from_bands(bands, occs, fermi)
+    positions = _compute_kpath_positions(coords)
+    if not positions:
+        positions = list(range(len(rel_bands)))
+    if len(positions) != len(rel_bands):
+        common = min(len(positions), len(rel_bands))
+        positions = positions[:common]
+        rel_bands = rel_bands[:common]
+        bands = bands[:common]
+        if occs:
+            occs = occs[:common]
+    segments = _split_segments_from_positions(positions)
+    band_series = _transpose_band_table(rel_bands)
+    if not band_series:
+        raise RuntimeError("能带数据为空，请确认已完成能带计算。")
 
     report_dir, figs_dir, tables_dir = _ensure_report_dirs(workdir, opts)
 
     fig = Figure(figsize=(5.0, 3.5))
     ax = fig.add_subplot(111)
-    x = []
-    xticks = []
-    pos = 0.0
-    for idx, row in enumerate(rel_bands):
-        xs = [pos] * len(row)
-        ax.plot(xs, row, color="#1f77b4", lw=1.0)
-        x.append(pos)
-        pos += 1.0
+    plotted = False
+    for series in band_series:
+        for start, end in segments:
+            xs = positions[start:end]
+            ys = series[start:end]
+            if len(xs) >= 2:
+                ax.plot(xs, ys, color="#1f77b4", lw=1.0)
+                plotted = True
+    if not plotted and positions and band_series:
+        ax.plot(positions, band_series[0], color="#1f77b4", lw=1.0)
+    if positions and min(positions) != max(positions):
+        ax.set_xlim(min(positions), max(positions))
     ax.axhline(0.0, color="#d62728", ls="--", lw=1.0)
     ax.set_ylabel("E - E$_F$ (eV)")
-    ax.set_xlabel("k-path index")
+    ax.set_xlabel("k-path distance (arb.)")
     apply_style(ax, style)
     fig.tight_layout()
     fig_path = figs_dir / "bands.png"
-    fig.savefig(fig_path, dpi=160)
+    fig.savefig(fig_path, dpi=POST_FIG_DPI)
 
     csv_path = tables_dir / "bands.csv"
     with csv_path.open("w", encoding="utf-8") as fh:
         fh.write("k_index,band_index,E-Ef (eV),occupation\n")
-        for kidx, (row, occ_row) in enumerate(zip(rel_bands, occs)):
-            for bidx, (val, occ) in enumerate(zip(row, occ_row), start=1):
+        for kidx, row in enumerate(rel_bands):
+            occ_row = occs[kidx] if occs and kidx < len(occs) else []
+            for bidx, val in enumerate(row, start=1):
+                occ = occ_row[bidx - 1] if bidx - 1 < len(occ_row) else 0.0
                 fh.write(f"{kidx},{bidx},{val:.6f},{occ:.3f}\n")
+
+    use_index_axis = not coords or all(abs(positions[i] - float(i)) < 1e-9 for i in range(len(positions)))
 
     notes = []
     if gap <= 1e-4:
         notes.append("能带结构显示体系为金属态。")
     else:
         notes.append(f"估算带隙约 {gap:.3f} eV（{nature}）。")
+    if trimmed:
+        notes.append("检测到重复路径端点，已仅保留一个周期的数据。")
+    if use_index_axis and positions:
+        notes.append("缺少 KPOINTS 路径信息，x 轴按路径索引绘制。")
 
     metrics = {
         "gap": float(gap),
@@ -926,7 +1002,7 @@ register_postproc(PostProc(name="bands", needs=["vasprun.xml|EIGENVAL"], runner=
 
 def proc_pdos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     """投影态密度图与数据导出。"""
-    style = opts.get("style", "AFM")
+    style = _normalize_style(opts.get("style"))
     group = (opts.get("group") or "element").lower()
     want_elems = opts.get("elements") or None
     want_orbs = [o.lower() for o in (opts.get("orbitals") or [])]
@@ -977,6 +1053,9 @@ def proc_pdos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     except Exception:
         gap_val = 0.0
 
+    if not curves:
+        raise RuntimeError("未在 vasprun.xml 中找到投影 DOS，请确认 INCAR 设置 LORBIT=11/12 并保留投影数据。")
+
     fig = Figure(figsize=(5.4, 3.3))
     ax = fig.add_subplot(111)
     ax.plot(energies, total, lw=1.6, label="total")
@@ -990,7 +1069,7 @@ def proc_pdos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     apply_style(ax, style)
     fig.tight_layout()
     fig_path = figs_dir / f"pdos_{group}.png"
-    fig.savefig(fig_path, dpi=180)
+    fig.savefig(fig_path, dpi=POST_FIG_DPI)
 
     csv_path = tables_dir / f"pdos_{group}.csv"
     with csv_path.open("w", encoding="utf-8") as fh:
@@ -1041,7 +1120,7 @@ def _fallback_reciprocal_from_poscar(poscar: Path) -> Optional[list[list[float]]
 
 
 def proc_bands_labeled(workdir: Path, opts: Dict[str, Any]) -> PostResult:
-    style = opts.get("style", "AFM")
+    style = _normalize_style(opts.get("style"))
     report_dir, figs_dir, tables_dir = _ensure_report_dirs(workdir, opts)
 
     kpts, labels = _read_kpoints_linemode(workdir / "KPOINTS")
@@ -1067,8 +1146,13 @@ def proc_bands_labeled(workdir: Path, opts: Dict[str, Any]) -> PostResult:
 
         fig = Figure(figsize=(5.6, 3.6))
         ax = fig.add_subplot(111)
-        for row in rel_bands:
-            ax.plot(distances, row, lw=1.0)
+        segments = _split_segments_from_positions(distances)
+        for series in rel_bands:
+            for start, end in segments:
+                xs = distances[start:end]
+                ys = series[start:end]
+                if len(xs) >= 2:
+                    ax.plot(xs, ys, lw=1.0)
         for pos in tick_pos:
             ax.axvline(pos, lw=0.6, ls=":", alpha=0.6)
         ax.axhline(0.0, lw=1.0, ls="--")
@@ -1078,7 +1162,7 @@ def proc_bands_labeled(workdir: Path, opts: Dict[str, Any]) -> PostResult:
         apply_style(ax, style)
         fig.tight_layout()
         fig_path = figs_dir / "bands_labeled.png"
-        fig.savefig(fig_path, dpi=180)
+        fig.savefig(fig_path, dpi=POST_FIG_DPI)
 
         csv_path = tables_dir / "bands_labeled.csv"
         with csv_path.open("w", encoding="utf-8") as fh:
@@ -1098,18 +1182,24 @@ def proc_bands_labeled(workdir: Path, opts: Dict[str, Any]) -> PostResult:
 
     data = _parse_eigenval(workdir)
     if data is None:
-        raise FileNotFoundError("缺少能带数据 (vasprun.xml 或 EIGENVAL)")
+        raise FileNotFoundError("缺少能带数据 (vasprun.xml 或 EIGENVAL)，请先完成能带计算。")
 
-    bands = data.get("bands", [])
-    occs = data.get("occupancies", [])
-    if not bands:
-        raise RuntimeError("EIGENVAL 中未解析到能带数据。")
+    raw_bands = _clone_2d_table(data.get("bands"))
+    if not raw_bands:
+        raise RuntimeError("EIGENVAL 中未解析到能带数据，请确认计算输出完整。")
+    occs = _clone_2d_table(data.get("occupancies"))
+    coords = kpts or _extract_kcoords(data.get("kpoints"))
+    bands, occs, coords = _align_band_lengths(raw_bands, occs, coords)
+    coords, bands, occs, trimmed = _trim_periodic_path(coords, bands, occs)
+    if labels:
+        labels = labels[: len(coords) if coords else len(bands)]
 
     fermi = _parse_fermi_from_outcar(workdir)
     if fermi is None:
         flat = [e for row in bands for e in row]
         fermi = sum(flat) / len(flat) if flat else 0.0
 
+    recip = None
     if HAS_PYMATGEN and (workdir / "POSCAR").exists():
         try:
             from pymatgen.core import Structure  # type: ignore
@@ -1118,40 +1208,46 @@ def proc_bands_labeled(workdir: Path, opts: Dict[str, Any]) -> PostResult:
             recip = structure.lattice.reciprocal_lattice_crystallographic.matrix
         except Exception:
             recip = None
-    else:
+    if recip is None:
         recip = _fallback_reciprocal_from_poscar(workdir / "POSCAR")
 
-    if recip is not None and HAS_NUMPY:
-        import numpy as _np
-
-        distances: list[float] = []
-        if not kpts:
-            kpts = [kp for kp, _ in data.get("kpoints", [])]
-        if kpts:
-            accum = 0.0
-            prev = None
-            for frac in kpts:
-                vec = _np.dot(frac, _np.array(recip))
-                if prev is None:
-                    prev = vec
-                dist = float(_np.linalg.norm(vec - prev))
-                accum += dist
-                distances.append(accum)
-                prev = vec
-        else:
-            distances = list(range(len(bands[0])))
-    else:
-        distances = list(range(len(bands[0])))
+    distances = _compute_kpath_positions(coords, recip)
+    if not distances:
+        distances = list(range(len(bands)))
+    if len(distances) != len(bands):
+        limit = min(len(distances), len(bands))
+        distances = distances[:limit]
+        bands = bands[:limit]
+        if occs:
+            occs = occs[:limit]
+        if labels:
+            labels = labels[:limit]
 
     rel_bands = [[e - fermi for e in row] for row in bands]
-    gap_val, nature, vabs, cabs = _estimate_gap_from_bands(bands, occs, fermi)
+    gap_val, nature, vabs, cabs = _estimate_gap_from_bands(bands, occs or [], fermi)
     vbm_rel = float(vabs - fermi)
     cbm_rel = float(cabs - fermi)
 
+    band_series = _transpose_band_table(rel_bands)
+    if not band_series:
+        raise RuntimeError("能带数据不足，无法生成路径图。")
+
+    segments = _split_segments_from_positions(distances)
+
     fig = Figure(figsize=(5.6, 3.6))
     ax = fig.add_subplot(111)
-    for row in rel_bands:
-        ax.plot(distances, row, lw=1.0)
+    plotted = False
+    for series in band_series:
+        for start, end in segments:
+            xs = distances[start:end]
+            ys = series[start:end]
+            if len(xs) >= 2:
+                ax.plot(xs, ys, lw=1.0)
+                plotted = True
+    if not plotted and distances and band_series:
+        ax.plot(distances, band_series[0], color="#1f77b4", lw=1.0)
+    if distances and min(distances) != max(distances):
+        ax.set_xlim(min(distances), max(distances))
     if labels:
         tick_pos: list[float] = []
         tick_lab: list[str] = []
@@ -1168,13 +1264,13 @@ def proc_bands_labeled(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     apply_style(ax, style)
     fig.tight_layout()
     fig_path = figs_dir / "bands_labeled.png"
-    fig.savefig(fig_path, dpi=180)
+    fig.savefig(fig_path, dpi=POST_FIG_DPI)
 
     csv_path = tables_dir / "bands_labeled.csv"
     with csv_path.open("w", encoding="utf-8") as fh:
         fh.write("distance,band_index,E-Ef (eV)\n")
-        for bidx, row in enumerate(rel_bands, start=1):
-            for dist, energy in zip(distances, row):
+        for bidx, series in enumerate(band_series, start=1):
+            for dist, energy in zip(distances, series):
                 fh.write(f"{dist:.6f},{bidx},{energy:.6f}\n")
 
     metrics = {
@@ -1186,6 +1282,10 @@ def proc_bands_labeled(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     notes = [
         "EIGENVAL 回退模式：若需精确路径建议使用非自洽能带计算并生成 vasprun.xml。",
     ]
+    if trimmed:
+        notes.append("检测到重复路径端点，已仅保留一个周期的数据。")
+    if not distances or distances == list(range(len(distances))):
+        notes.append("缺少晶格信息，x 轴按路径索引绘制。")
     return PostResult(metrics=metrics, figs={"bands_labeled": fig_path}, tables={"bands_labeled": csv_path}, notes=notes)
 
 
@@ -1198,7 +1298,7 @@ def proc_effective_mass(workdir: Path, opts: Dict[str, Any]) -> PostResult:
 
     import numpy as _np
 
-    style = opts.get("style", "AFM")
+    style = _normalize_style(opts.get("style"))
     window = max(int(opts.get("window_k", 4)), 2)
     report_dir, figs_dir, tables_dir = _ensure_report_dirs(workdir, opts)
 
@@ -1214,7 +1314,7 @@ def proc_effective_mass(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     else:
         data = _parse_eigenval(workdir)
         if data is None or not data.get("bands"):
-            raise FileNotFoundError("缺少能带数据 (vasprun.xml 或 EIGENVAL)")
+            raise FileNotFoundError("缺少能带数据 (vasprun.xml 或 EIGENVAL)，请先完成能带计算。")
         bands = data.get("bands", [])
         occs = data.get("occupancies", [])
         efermi = _parse_fermi_from_outcar(workdir) or 0.0
@@ -1246,7 +1346,7 @@ def proc_effective_mass(workdir: Path, opts: Dict[str, Any]) -> PostResult:
             distances = list(range(len(bands[0]))) if bands else []
 
     if not bands or not bands[0]:
-        raise RuntimeError("有效质量拟合失败：能带数据为空。")
+        raise RuntimeError("有效质量拟合失败：能带数据为空，请确认能带计算输出完整。")
 
     rel = [[e - efermi for e in row] for row in bands]
     nb = len(rel)
@@ -1299,7 +1399,7 @@ def proc_effective_mass(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     ax.legend(fontsize=9, frameon=False)
     fig.tight_layout()
     fig_path = figs_dir / "effective_mass.png"
-    fig.savefig(fig_path, dpi=180)
+    fig.savefig(fig_path, dpi=POST_FIG_DPI)
 
     csv_path = tables_dir / "effective_mass.csv"
     with csv_path.open("w", encoding="utf-8") as fh:
@@ -1386,7 +1486,7 @@ def proc_planar_potential(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     if not HAS_NUMPY:
         raise RuntimeError("需要 numpy 才能解析平面平均势，请安装 numpy。")
 
-    style = opts.get("style", "AFM")
+    style = _normalize_style(opts.get("style"))
     report_dir, figs_dir, tables_dir = _ensure_report_dirs(workdir, opts)
     locpot = workdir / "LOCPOT"
     if not locpot.exists():
@@ -1394,11 +1494,11 @@ def proc_planar_potential(workdir: Path, opts: Dict[str, Any]) -> PostResult:
 
     data = _parse_locpot_planar_z(locpot)
     if not data:
-        raise RuntimeError("解析 LOCPOT 失败或数据不完整。")
+        raise RuntimeError("解析 LOCPOT 失败或数据不完整，请确认计算输出了 LOCPOT/CHGCAR 并保持文件完整。")
     z, values = data
 
     if not values:
-        raise RuntimeError("LOCPOT 中未获得平面平均势数据。")
+        raise RuntimeError("LOCPOT 中未获得平面平均势数据，请检查 LOCPOT 是否写全。")
 
     baseline = values[0]
     rel = [v - baseline for v in values]
@@ -1411,7 +1511,7 @@ def proc_planar_potential(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     apply_style(ax, style)
     fig.tight_layout()
     fig_path = figs_dir / "planar_potential.png"
-    fig.savefig(fig_path, dpi=180)
+    fig.savefig(fig_path, dpi=POST_FIG_DPI)
 
     csv_path = tables_dir / "planar_potential.csv"
     with csv_path.open("w", encoding="utf-8") as fh:
@@ -2169,7 +2269,7 @@ class VaspGUI(tk.Tk):
         while candidate.exists():
             candidate = root / f"{name}_{idx:02d}"
             idx += 1
-        style = self.figure_style_var.get() or "AFM"
+        style = _normalize_style(self.figure_style_var.get())
         profile = WizardProfile(
             system_type="semiconductor",
             workflow="relax_scf_dos",
@@ -3512,7 +3612,7 @@ class VaspGUI(tk.Tk):
         ax.set_xlabel("u_x")
         ax.set_ylabel("u_y")
         ax.set_title(f"Band gap heatmap @ θ={theta:.2f}°  (N={int(np.isfinite(grid).sum())})")
-        apply_style(ax, self.figure_style_var.get() or "AFM")
+        apply_style(ax, _normalize_style(self.figure_style_var.get()))
         fig.tight_layout()
         canvas = FigureCanvasTkAgg(fig, master=top)
         canvas.draw()
@@ -3581,7 +3681,7 @@ class VaspGUI(tk.Tk):
         ax.set_ylabel("Band gap (eV)")
         ax.set_title("Band gap vs. twist angle\n(shaded band = variation across slide grid)")
         ax.legend()
-        apply_style(ax, self.figure_style_var.get() or "AFM")
+        apply_style(ax, _normalize_style(self.figure_style_var.get()))
         fig.tight_layout()
         canvas = FigureCanvasTkAgg(fig, master=top)
         canvas.draw()
@@ -4168,15 +4268,6 @@ nice -n 5 ionice -c2 -n4 \
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        # ETA 显示
-        eta_row = ttk.Frame(frame)
-        eta_row.pack(fill=tk.X, padx=8, pady=(0, 4))
-        ttk.Label(eta_row, text="预计剩余时间：").pack(side=tk.LEFT)
-        self.eta_var = tk.StringVar(value="—")
-        self.eta_label = ttk.Label(eta_row, textvariable=self.eta_var, foreground="#2b8a3e")
-        self.eta_label.pack(side=tk.LEFT, padx=6)
-        ttk.Label(eta_row, text="(基于最近 SCF 平均耗时与 OSZICAR 迭代统计)").pack(side=tk.LEFT, padx=6)
-
         self.mon_info = ScrolledText(frame, height=6, wrap="word")
         self.mon_info.pack(fill=tk.BOTH, expand=False, padx=8, pady=4)
 
@@ -4202,9 +4293,6 @@ nice -n 5 ionice -c2 -n4 \
         self.sys_info.delete("1.0", tk.END)
         self.sys_info.insert(tk.END, "系统监视线程已启动……\n")
         self.apply_run_status("🟡 正在监视…", ["系统监视线程已启动，等待数据更新。"])
-
-        # <<< 新增：初始化刷新一次 ETA >>>
-        self._update_eta()
 
     def stop_monitor(self):
         if self.monitor:
@@ -4242,9 +4330,6 @@ nice -n 5 ionice -c2 -n4 \
             if energies:
                 self.mon_info.insert(tk.END, f"最新步：{steps[-1]}, 能量：{energies[-1]:.6f} eV\n")
                 self.mon_info.see(tk.END)
-
-            # 顺手刷新 ETA
-            self._update_eta()
 
         self.after(0, _upd)
 
@@ -4289,55 +4374,7 @@ nice -n 5 ionice -c2 -n4 \
             self.sys_info.delete("1.0", tk.END)
             self.sys_info.insert(tk.END, "\n".join(lines) + "\n")
 
-            # <<< 新增：系统状态更新后也刷新 ETA（即便 OSZICAR 暂未增长，仍可用 vasp.out 的 LOOP） >>>
-            self._update_eta()
-
         self.after(0, _upd)
-
-    def _estimate_eta_text(self) -> str:
-        """综合 OSZICAR/vasp.out/INCAR 估算 ETA。优先针对几何优化 (NSW>0)。"""
-        proj = self.current_project_path()
-        osz = proj / "OSZICAR"
-        vout = proj / "vasp.out"
-        incar = proj / "INCAR"
-
-        # 解析步数配置
-        NSW = _parse_incar_int(incar, "NSW", None)
-        NELM = _parse_incar_int(incar, "NELM", 60)  # 若未给出，VASP 默认 60
-
-        # 统计 OSZICAR：已完成离子步、平均每步迭代数
-        steps_done, avg_iter = _oszicar_stats(osz)
-
-        # 统计 vasp.out：最近单次 SCF 的平均耗时（中位数更稳）
-        t_per_scf, seen_loops = _vaspout_loop_times(vout, take_last=40)
-
-        # 默认兜底
-        if avg_iter is None:
-            avg_iter = 8.0  # 常见数量级 6~15 之间
-        if t_per_scf is None:
-            return "—"
-
-        # 情况A：几何优化 (NSW>0)
-        if NSW and NSW > 0:
-            remain_steps = max(NSW - steps_done, 0)
-            eta_sec = remain_steps * avg_iter * t_per_scf
-            # 若刚开始，给个宽松区间
-            if steps_done <= 1:
-                eta_sec *= 1.3
-            return _fmt_eta_seconds(eta_sec)
-
-        # 情况B：静态或单步 (NSW<=0) → 用 NELM 估一个上界
-        # 估计已完成迭代数 = vasp.out LOOP 行数（近似）
-        done_iters = seen_loops
-        remain_iters = max((NELM or 60) - done_iters, 0)
-        eta_sec = remain_iters * t_per_scf
-        return _fmt_eta_seconds(eta_sec)
-
-    def _update_eta(self):
-        try:
-            self.eta_var.set(self._estimate_eta_text())
-        except Exception:
-            self.eta_var.set("—")
 
     # ------------------------- 页面：后处理 ---------------------------
     def _build_post_page(self, parent):
@@ -4390,7 +4427,13 @@ nice -n 5 ionice -c2 -n4 \
         row = ttk.Frame(left)
         row.pack(fill=tk.X, pady=2)
         ttk.Label(row, text="期刊风格").pack(side=tk.LEFT)
-        style_cb = ttk.Combobox(row, values=list(FIG_STYLES.keys()), textvariable=self.figure_style_var, width=10)
+        style_cb = ttk.Combobox(
+            row,
+            values=list(FIG_STYLES.keys()),
+            textvariable=self.figure_style_var,
+            width=10,
+            state="readonly",
+        )
         style_cb.pack(side=tk.LEFT, padx=6)
 
         row2 = ttk.Frame(left)
@@ -4464,6 +4507,7 @@ nice -n 5 ionice -c2 -n4 \
         btns.pack(fill=tk.X, pady=4)
         ttk.Button(btns, text="运行所选", command=self._run_selected_postprocs).pack(side=tk.LEFT)
         ttk.Button(btns, text="打开报告文件夹", command=self._open_latest_report_dir).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="关闭当前图页", command=self._close_current_post_tab).pack(side=tk.LEFT)
 
         log_frame = ttk.LabelFrame(left, text="运行日志")
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
@@ -4484,7 +4528,7 @@ nice -n 5 ionice -c2 -n4 \
         workdir = self.current_project_path()
         ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         report_dir = workdir / "reports" / f"post_{ts}"
-        style = self.figure_style_var.get() or "AFM"
+        style = _normalize_style(self.figure_style_var.get())
         metal_th = float(self.metal_threshold_var.get() or 0.02)
 
         queue: list[tuple[str, Dict[str, Any]]] = []
@@ -4544,6 +4588,15 @@ nice -n 5 ionice -c2 -n4 \
                 subprocess.Popen(["xdg-open", str(latest)])
         except Exception as exc:
             messagebox.showerror(APP_NAME, f"打开目录失败：{exc}")
+
+    def _close_current_post_tab(self):
+        if not hasattr(self, "post_fig_area"):
+            return
+        current = self.post_fig_area.select()
+        if not current:
+            messagebox.showinfo(APP_NAME, "当前没有需要关闭的图页。")
+            return
+        self.post_fig_area.forget(current)
 
     def _on_postproc_success(self, key: str, result: PostResult, workdir: Path, opts: Dict[str, Any]):
         self.post_results[key] = result
@@ -4662,7 +4715,7 @@ nice -n 5 ionice -c2 -n4 \
         self.pot_dir_var.set(data.get("pot_dir", self.pot_dir_var.get()))
         self.run_mode.set(data.get("run_mode", self.run_mode.get()))
         self.vasp_cmd.set(data.get("vasp_cmd", self.vasp_cmd.get()))
-        self.figure_style_var.set(data.get("figure_style", self.figure_style_var.get()))
+        self.figure_style_var.set(_normalize_style(data.get("figure_style")))
         self.emit_report_var.set(bool(data.get("emit_report", self.emit_report_var.get())))
         try:
             self.mpi_np.set(int(data.get("mpi_np", self.mpi_np.get())))
@@ -4705,7 +4758,7 @@ nice -n 5 ionice -c2 -n4 \
             "run_mode": self.run_mode.get(),
             "vasp_cmd": self.vasp_cmd.get(),
             "mpi_np": self._int_from_var(self.mpi_np, 8),
-            "figure_style": self.figure_style_var.get(),
+            "figure_style": _normalize_style(self.figure_style_var.get()),
             "emit_report": bool(self.emit_report_var.get()),
             "slurm_part": self.slurm_part.get(),
             "slurm_time": self.slurm_time.get(),
@@ -5579,7 +5632,7 @@ class FirstTimeWizard(tk.Toplevel):
             use_slurm=bool(self.use_slurm.get()),
             np=np_total,
             slurm=slurm_cfg,
-            figure_style=self.style_var.get() or "AFM",
+            figure_style=_normalize_style(self.style_var.get()),
             emit_report=bool(self.emit_report.get()),
         )
         self.result = profile
