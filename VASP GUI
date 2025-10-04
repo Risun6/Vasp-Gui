@@ -134,6 +134,7 @@ class AzureThemeManager:
         if HAS_AZURE_THEME and azure_theme is not None:
             try:
                 if hasattr(azure_theme, "use_theme"):
+
                     azure_theme.use_theme(root, "light")
                     self.using_native_package = True
                 elif hasattr(azure_theme, "use_light_theme"):
@@ -177,6 +178,7 @@ class AzureThemeManager:
                     "configure": {
                         "background": palette["card"],
                         "troughcolor": palette["surface"],
+
                         "bordercolor": palette["border"],
                     }
                 },
@@ -184,6 +186,7 @@ class AzureThemeManager:
                     "configure": {
                         "background": palette["card"],
                         "troughcolor": palette["surface"],
+
                         "bordercolor": palette["border"],
                     }
                 },
@@ -226,6 +229,7 @@ class AzureThemeManager:
 
         self.style.configure(
             "TButton",
+
             background=accent,
             foreground=palette["select_fg"],
             borderwidth=0,
@@ -243,6 +247,7 @@ class AzureThemeManager:
             "Accent.TButton",
             background=accent,
             foreground=palette["select_fg"],
+
             padding=(14, 9),
         )
         self.style.map(
@@ -254,6 +259,7 @@ class AzureThemeManager:
             "TEntry",
             fieldbackground=palette["entry"],
             foreground=palette["text"],
+
             bordercolor=palette["border"],
             lightcolor=accent,
             darkcolor=palette["border"],
@@ -269,6 +275,7 @@ class AzureThemeManager:
             fieldbackground=palette["entry"],
             background=palette["entry"],
             foreground=palette["text"],
+
             bordercolor=palette["border"],
             padding=(10, 6),
         )
@@ -276,6 +283,7 @@ class AzureThemeManager:
             "TCombobox",
             fieldbackground=[("readonly", palette["entry"]), ("active", palette["entry"])],
             foreground=[("readonly", palette["text"]), ("disabled", palette["muted"])],
+
             bordercolor=[("focus", accent)],
         )
 
@@ -292,6 +300,7 @@ class AzureThemeManager:
 
         self.style.configure(
             "Treeview",
+
             background=palette["card"],
             fieldbackground=palette["card"],
             foreground=palette["text"],
@@ -304,6 +313,7 @@ class AzureThemeManager:
             relief="flat",
         )
         self.style.map(
+
             "Treeview",
             background=[("selected", accent)],
             foreground=[("selected", palette["select_fg"])],
@@ -321,12 +331,14 @@ class AzureThemeManager:
             background=palette["surface"],
         )
 
+
     def style_text_widget(self, widget: tk.Text):
         palette = self.PALETTES[self.current_mode]
         prev_state = widget.cget("state")
         if prev_state == tk.DISABLED:
             widget.configure(state=tk.NORMAL)
         widget.configure(
+
             background=palette["surface"],
             foreground=palette["text"],
             insertbackground=palette["text"],
@@ -1007,6 +1019,7 @@ class VaspGUI(tk.Tk):
         self.run_suggestion_widgets: list[tk.Text] = []
         self.themable_texts: list[tk.Text] = []
         self.themable_canvases: list[tk.Canvas] = []
+
         self.overview_items = [
             ("__project__", "项目目录"),
             ("INCAR", "INCAR"),
@@ -1046,6 +1059,7 @@ class VaspGUI(tk.Tk):
         ttk.Button(toolbar, text="新建项目", command=self.create_project, style="Accent.TButton").pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="首次向导", command=self.launch_first_time_wizard).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="创建示例项目", command=self.on_create_example_project).pack(side=tk.LEFT, padx=4)
+
 
         ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X)
 
@@ -1094,6 +1108,7 @@ class VaspGUI(tk.Tk):
         if canvas not in self.themable_canvases:
             self.themable_canvases.append(canvas)
         self._style_canvas(canvas)
+
 
     # ------------------------- 页面：输入文件 -----------------------------
     def _build_inputs_page(self, parent):
