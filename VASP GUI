@@ -2938,6 +2938,8 @@ class FirstTimeWizard(tk.Toplevel):
         self.transient(master)
         self.grab_set()
         self.resizable(False, False)
+        # 适当扩大初始尺寸，避免表单内容被截断（尤其是第三步的精度设置）
+        self.geometry("720x540")
         self.protocol("WM_DELETE_WINDOW", self.on_cancel)
 
         self.system_type = tk.StringVar(value="semiconductor")
