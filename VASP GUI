@@ -39,8 +39,12 @@ import shutil
 import math
 import threading
 import subprocess
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Literal
+import hashlib
+import datetime as _dt
+import pickle
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple, Literal, Callable
 from pathlib import Path
 
 try:
@@ -96,6 +100,29 @@ APP_VER = "0.1.0-MVP"
 # 配置文件路径（保存用户设置）
 CONFIG_DIR = Path.home() / ".config" / "vasp_gui"
 CONFIG_PATH = CONFIG_DIR / "config.json"
+
+
+@dataclass
+class PostResult:
+    metrics: Dict[str, float]
+    figs: Dict[str, Path]
+    tables: Dict[str, Path]
+    notes: List[str]
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PostProc:
+    name: str
+    needs: List[str]
+    runner: Callable[[Path, Dict[str, Any]], PostResult]
+
+
+POSTPROCS: Dict[str, PostProc] = {}
+
+
+def register_postproc(proc: PostProc) -> None:
+    POSTPROCS[proc.name] = proc
 
 
 @dataclass
@@ -451,6 +478,413 @@ def apply_style(ax, style: str) -> None:
             ax.spines[spine].set_visible(False)
 
 
+def _fingerprint_files(files: list[Path]) -> str:
+    h = hashlib.sha1()
+    for path in files:
+        try:
+            st = path.stat()
+        except Exception:
+            continue
+        h.update(str(path).encode("utf-8", "ignore"))
+        h.update(str(st.st_size).encode())
+        h.update(str(int(st.st_mtime_ns)).encode())
+    return h.hexdigest()
+
+
+def _load_cached(workdir: Path, cache_key: str, files: list[Path], builder: Callable[[], Any]) -> Any:
+    cache_dir = workdir / ".cache"
+    fingerprint = _fingerprint_files(files)
+    meta_path = cache_dir / f"{cache_key}.json"
+    data_path = cache_dir / f"{cache_key}.pkl"
+    if cache_dir.exists() and meta_path.exists() and data_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+        if meta.get("fingerprint") == fingerprint:
+            try:
+                with data_path.open("rb") as fp:
+                    return pickle.load(fp)
+            except Exception:
+                pass
+    data = builder()
+    if data is None:
+        return None
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps({"fingerprint": fingerprint}, ensure_ascii=False), encoding="utf-8")
+        with data_path.open("wb") as fp:
+            pickle.dump(data, fp)
+    except Exception:
+        pass
+    return data
+
+
+def _parse_fermi_from_outcar(workdir: Path) -> Optional[float]:
+    outcar = workdir / "OUTCAR"
+    if not outcar.exists():
+        return None
+    tail: deque[str] = deque(maxlen=2000)
+    try:
+        with outcar.open("r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                tail.append(line)
+    except Exception:
+        return None
+    rx = re.compile(r"E-?fermi\s*[:=]\s*([-+0-9.eE]+)")
+    for line in reversed(tail):
+        m = rx.search(line)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                continue
+    return None
+
+
+def _parse_dos_vasprun(workdir: Path) -> Optional[dict[str, Any]]:
+    vasprun = workdir / "vasprun.xml"
+    if not vasprun.exists():
+        return None
+    try:
+        from xml.etree import ElementTree as ET
+    except Exception:
+        return None
+
+    energies: list[float] = []
+    dos: list[float] = []
+    integ: list[float] = []
+    efermi: Optional[float] = None
+
+    try:
+        context = ET.iterparse(str(vasprun), events=("end",))
+        for event, elem in context:
+            if elem.tag == "i" and elem.attrib.get("name") == "efermi" and elem.text:
+                try:
+                    efermi = float(elem.text)
+                except Exception:
+                    pass
+            if elem.tag == "set" and elem.attrib.get("comment", "").lower().startswith("spin 1"):
+                energies.clear()
+                dos.clear()
+                integ.clear()
+                for row in elem.findall("r"):
+                    text = row.text or ""
+                    parts = text.split()
+                    if len(parts) >= 3:
+                        try:
+                            energies.append(float(parts[0]))
+                            dos.append(float(parts[1]))
+                            integ.append(float(parts[2]))
+                        except Exception:
+                            continue
+                elem.clear()
+                break
+            elem.clear()
+    except Exception:
+        return None
+
+    if not energies:
+        return None
+    return {"energies": energies, "dos": dos, "integrated": integ, "fermi": efermi}
+
+
+def _parse_dos_doscar(workdir: Path) -> Optional[dict[str, Any]]:
+    doscar = workdir / "DOSCAR"
+    if not doscar.exists():
+        return None
+    try:
+        with doscar.open("r", encoding="utf-8", errors="ignore") as fh:
+            header = [next(fh) for _ in range(5)]
+            line = next(fh)
+            while line.strip() == "":
+                line = next(fh)
+            parts = line.split()
+            if len(parts) < 3:
+                return None
+            ngrid = int(parts[2])
+            efermi = float(parts[3]) if len(parts) > 3 else None
+            energies: list[float] = []
+            dos: list[float] = []
+            integ: list[float] = []
+            for _ in range(ngrid):
+                vals = next(fh).split()
+                if len(vals) < 3:
+                    continue
+                try:
+                    e = float(vals[0])
+                    up = float(vals[1])
+                    dn = float(vals[2])
+                    energies.append(e)
+                    if len(vals) >= 5:
+                        # spin polarized: up, down, integrated up, integrated down
+                        dos.append(up + dn)
+                        integ.append(float(vals[3]) + float(vals[4]))
+                    else:
+                        dos.append(up)
+                        integ.append(dn)
+                except Exception:
+                    continue
+    except Exception:
+        return None
+    return {"energies": energies, "dos": dos, "integrated": integ, "fermi": efermi}
+
+
+def _estimate_gap_from_dos(energies: list[float], dos: list[float], threshold: float) -> tuple[float, str]:
+    if not energies or not dos or len(energies) != len(dos):
+        return 0.0, "unknown"
+    pairs = sorted(zip(energies, dos), key=lambda x: x[0])
+    lower = [p for p in pairs if p[0] <= 0]
+    upper = [p for p in pairs if p[0] >= 0]
+    if not lower or not upper:
+        return 0.0, "unknown"
+    # find valence edge: energy closest to zero from below where DOS < threshold
+    val_states = [e for e, d in lower if abs(d) <= threshold]
+    cond_states = [e for e, d in upper if abs(d) <= threshold]
+    if not val_states or not cond_states:
+        return 0.0, "metal"
+    ev = max(val_states)
+    ec = min(cond_states)
+    gap = max(ec - ev, 0.0)
+    if gap <= 1e-4:
+        return 0.0, "metal"
+    return gap, "insulator"
+
+
+def proc_dos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
+    style = opts.get("style", "AFM")
+    threshold = float(opts.get("metal_threshold", 0.02))
+    cache_key = "dos_total"
+    files = [workdir / "vasprun.xml", workdir / "DOSCAR", workdir / "OUTCAR"]
+
+    def _builder():
+        data = _parse_dos_vasprun(workdir)
+        if data is None:
+            data = _parse_dos_doscar(workdir)
+        if data is None:
+            raise FileNotFoundError("缺少 DOS 数据文件 (vasprun.xml/DOSCAR)")
+        return data
+
+    data = _load_cached(workdir, cache_key, files, _builder)
+    if data is None:
+        raise RuntimeError("无法解析 DOS 数据。")
+
+    energies = data.get("energies", [])
+    dos = data.get("dos", [])
+    efermi = data.get("fermi")
+    if efermi is None:
+        outcar_fermi = _parse_fermi_from_outcar(workdir)
+        if outcar_fermi is not None:
+            efermi = outcar_fermi
+        elif energies:
+            efermi = (max(energies) + min(energies)) / 2
+        else:
+            efermi = 0.0
+    rel_energies = [e - efermi for e in energies]
+    dos_at_ef = 0.0
+    if rel_energies and dos:
+        # interpolate around zero
+        closest_idx = min(range(len(rel_energies)), key=lambda i: abs(rel_energies[i]))
+        dos_at_ef = float(dos[closest_idx])
+    gap, band_type = _estimate_gap_from_dos(rel_energies, dos, threshold)
+    is_metal = 1.0 if dos_at_ef > threshold else 0.0
+
+    report_dir = opts.get("report_dir")
+    figs_dir = report_dir / "figs"
+    tables_dir = report_dir / "tables"
+    figs_dir.mkdir(parents=True, exist_ok=True)
+    tables_dir.mkdir(parents=True, exist_ok=True)
+
+    fig = Figure(figsize=(5.0, 3.2))
+    ax = fig.add_subplot(111)
+    ax.plot(rel_energies, dos, color="#1f77b4", lw=1.4)
+    ax.axvline(0.0, color="#d62728", ls="--", lw=1.0)
+    ax.set_xlabel("E - E$_F$ (eV)")
+    ax.set_ylabel("DOS (states/eV)")
+    apply_style(ax, style)
+    fig.tight_layout()
+    fig_path = figs_dir / "dos.png"
+    fig.savefig(fig_path, dpi=160)
+
+    csv_path = tables_dir / "dos.csv"
+    with csv_path.open("w", encoding="utf-8") as fh:
+        fh.write("E-Ef (eV),DOS\n")
+        for e, d in zip(rel_energies, dos):
+            fh.write(f"{e:.6f},{d:.6f}\n")
+
+    notes = []
+    if band_type == "metal":
+        notes.append("DOS 显示体系为金属态（带隙≈0）。")
+    elif gap > 0:
+        notes.append(f"估算带隙 ~ {gap:.3f} eV。")
+
+    metrics = {
+        "E_F": float(efermi),
+        "DOS(E_F)": float(dos_at_ef),
+        "is_metal": float(is_metal),
+        "gap": float(gap),
+    }
+
+    return PostResult(
+        metrics=metrics,
+        figs={"dos": fig_path},
+        tables={"dos": csv_path},
+        notes=notes,
+        extra={"plot": {"x": rel_energies, "y": dos, "style": style}},
+    )
+
+
+def _parse_eigenval(workdir: Path) -> Optional[dict[str, Any]]:
+    eigenval = workdir / "EIGENVAL"
+    if not eigenval.exists():
+        return None
+    try:
+        with eigenval.open("r", encoding="utf-8", errors="ignore") as fh:
+            header = [next(fh) for _ in range(5)]
+            counts = next(fh)
+            while counts.strip() == "":
+                counts = next(fh)
+            nel, nk, nb = map(int, counts.split()[:3])
+            kpts: list[tuple[list[float], float]] = []
+            bands: list[list[float]] = []
+            occs: list[list[float]] = []
+            for ik in range(nk):
+                line = next(fh)
+                while line.strip() == "":
+                    line = next(fh)
+                parts = list(map(float, line.split()))
+                kcoord = parts[:3]
+                weight = parts[3] if len(parts) > 3 else 1.0 / nk
+                energies: list[float] = []
+                occ: list[float] = []
+                for ib in range(nb):
+                    vals = next(fh).split()
+                    if len(vals) < 3:
+                        continue
+                    energies.append(float(vals[1]))
+                    occ.append(float(vals[2]))
+                kpts.append((kcoord, weight))
+                bands.append(energies)
+                occs.append(occ)
+    except Exception:
+        return None
+    return {"kpoints": kpts, "bands": bands, "occupancies": occs}
+
+
+def _estimate_gap_from_bands(bands: list[list[float]], occs: list[list[float]], fermi: float) -> tuple[float, str, float, float]:
+    if not bands:
+        return 0.0, "unknown", fermi, fermi
+    vbm = -1e9
+    cbm = 1e9
+    direct_gap = 1e9
+    vb_k = cb_k = None
+    for kidx, (energies, occ) in enumerate(zip(bands, occs)):
+        v_local = max((e for e, o in zip(energies, occ) if o > 0.5), default=-1e9)
+        c_local = min((e for e, o in zip(energies, occ) if o < 0.5), default=1e9)
+        if v_local > vbm:
+            vbm = v_local
+            vb_k = kidx
+        if c_local < cbm:
+            cbm = c_local
+            cb_k = kidx
+        gap_k = max(c_local - v_local, 0.0)
+        if gap_k < direct_gap:
+            direct_gap = gap_k
+    gap = max(cbm - vbm, 0.0)
+    if gap <= 1e-4:
+        return 0.0, "metal", vbm, cbm
+    nature = "direct" if vb_k == cb_k and direct_gap <= gap + 1e-3 else "indirect"
+    return gap, nature, vbm, cbm
+
+
+def proc_bands(workdir: Path, opts: Dict[str, Any]) -> PostResult:
+    style = opts.get("style", "AFM")
+    threshold = float(opts.get("metal_threshold", 0.02))
+    cache_key = "bands"
+    files = [workdir / "vasprun.xml", workdir / "EIGENVAL", workdir / "OUTCAR"]
+
+    def _builder():
+        data = _parse_dos_vasprun(workdir)
+        if data and data.get("energies"):
+            # vasprun already parsed for dos; but band requires dedicated parse
+            pass
+        bands_data = _parse_eigenval(workdir)
+        if bands_data is None:
+            raise FileNotFoundError("缺少能带数据 (vasprun.xml/EIGENVAL)")
+        return bands_data
+
+    data = _load_cached(workdir, cache_key, files, _builder)
+    if data is None:
+        raise RuntimeError("无法解析能带数据。")
+    bands = data.get("bands", [])
+    occs = data.get("occupancies", [])
+    kpts = data.get("kpoints", [])
+    fermi = _parse_fermi_from_outcar(workdir)
+    if fermi is None and bands:
+        flat = [e for energies in bands for e in energies]
+        fermi = sum(flat) / len(flat)
+
+    rel_bands = [[e - fermi for e in row] for row in bands]
+    gap, nature, vbm, cbm = _estimate_gap_from_bands(bands, occs, fermi)
+
+    report_dir = opts.get("report_dir")
+    figs_dir = report_dir / "figs"
+    tables_dir = report_dir / "tables"
+    figs_dir.mkdir(parents=True, exist_ok=True)
+    tables_dir.mkdir(parents=True, exist_ok=True)
+
+    fig = Figure(figsize=(5.0, 3.5))
+    ax = fig.add_subplot(111)
+    x = []
+    xticks = []
+    pos = 0.0
+    for idx, row in enumerate(rel_bands):
+        xs = [pos] * len(row)
+        ax.plot(xs, row, color="#1f77b4", lw=1.0)
+        x.append(pos)
+        pos += 1.0
+    ax.axhline(0.0, color="#d62728", ls="--", lw=1.0)
+    ax.set_ylabel("E - E$_F$ (eV)")
+    ax.set_xlabel("k-path index")
+    apply_style(ax, style)
+    fig.tight_layout()
+    fig_path = figs_dir / "bands.png"
+    fig.savefig(fig_path, dpi=160)
+
+    csv_path = tables_dir / "bands.csv"
+    with csv_path.open("w", encoding="utf-8") as fh:
+        fh.write("k_index,band_index,E-Ef (eV),occupation\n")
+        for kidx, (row, occ_row) in enumerate(zip(rel_bands, occs)):
+            for bidx, (val, occ) in enumerate(zip(row, occ_row), start=1):
+                fh.write(f"{kidx},{bidx},{val:.6f},{occ:.3f}\n")
+
+    notes = []
+    if gap <= 1e-4:
+        notes.append("能带结构显示体系为金属态。")
+    else:
+        notes.append(f"估算带隙约 {gap:.3f} eV（{nature}）。")
+
+    metrics = {
+        "gap": float(gap),
+        "vbm": float(vbm - fermi if vbm != -1e9 else 0.0),
+        "cbm": float(cbm - fermi if cbm != 1e9 else 0.0),
+        "is_metal": 1.0 if gap <= threshold else 0.0,
+        "fermi": float(fermi),
+    }
+
+    return PostResult(
+        metrics=metrics,
+        figs={"bands": fig_path},
+        tables={"bands": csv_path},
+        notes=notes,
+        extra={"plot": {"bands": rel_bands, "style": style}},
+    )
+
+
+register_postproc(PostProc(name="dos", needs=["vasprun.xml|DOSCAR"], runner=proc_dos))
+register_postproc(PostProc(name="bands", needs=["vasprun.xml|EIGENVAL"], runner=proc_bands))
+
+
 # ----------------------------- GUI 组件 ------------------------------------
 
 class SystemStatsMonitor(threading.Thread):
@@ -665,6 +1099,33 @@ class SystemStatsMonitor(threading.Thread):
         return monitor._collect_stats()
 
 
+class PostprocWorker(threading.Thread):
+    """后台线程：统一调度后处理任务。"""
+
+    def __init__(self, app: "VaspGUI", key: str, opts: Dict[str, Any]):
+        super().__init__(daemon=True)
+        self.app = app
+        self.key = key
+        self.opts = opts
+
+    def run(self):
+        app = self.app
+        proc = POSTPROCS.get(self.key)
+        workdir: Path = self.opts.get("workdir", app.current_project_path())
+        if not proc:
+            app.after(0, lambda: app._on_postproc_error(self.key, "未注册的后处理任务"))
+            return
+        try:
+            result = proc.runner(workdir, self.opts)
+        except FileNotFoundError as exc:
+            app.after(0, lambda: app._on_postproc_error(self.key, str(exc)))
+            return
+        except Exception as exc:
+            app.after(0, lambda: app._on_postproc_error(self.key, f"后处理异常：{exc}"))
+            return
+        app.after(0, lambda: app._on_postproc_success(self.key, result, workdir, self.opts))
+
+
 class EnergyMonitor(threading.Thread):
     """后台线程：周期性解析 OSZICAR，提取 F/E0 能量，供主线程绘图。"""
     def __init__(self, workdir: Path, on_update):
@@ -765,6 +1226,14 @@ class VaspGUI(tk.Tk):
         self.figure_style_var = tk.StringVar(value="AFM")
         self.emit_report_var = tk.BooleanVar(value=True)
         self.run_suggestion_widgets: list[tk.Text] = []
+        self.post_results: dict[str, PostResult] = {}
+        self.post_run_buttons: dict[str, ttk.Button] = {}
+        self.post_export_buttons: dict[str, ttk.Button] = {}
+        self.post_metric_vars: dict[str, tk.StringVar] = {}
+        self.post_canvases: dict[str, FigureCanvasTkAgg] = {}
+        self.post_figures: dict[str, Figure] = {}
+        self.post_latest_reports: dict[str, Path] = {}
+        self.post_worker: Optional[PostprocWorker] = None
         self.overview_items = [
             ("__project__", "项目目录"),
             ("INCAR", "INCAR"),
@@ -3084,14 +3553,248 @@ nice -n 5 ionice -c2 -n4 \
     # ------------------------- 页面：后处理 ---------------------------
     def _build_post_page(self, parent):
         frame = ttk.Frame(parent)
-        row = ttk.Frame(frame)
-        row.pack(fill=tk.X, padx=8, pady=8)
-        ttk.Button(row, text="收敛曲线（OSZICAR）→ 图/CSV", command=self.export_convergence).pack(side=tk.LEFT)
-        ttk.Button(row, text="总 DOS（DOSCAR）→ 图/CSV", command=self.export_dos_total).pack(side=tk.LEFT, padx=8)
-        ttk.Button(row, text="能带（EIGENVAL）→ 图/CSV", command=self.export_bands).pack(side=tk.LEFT)
-        self.post_log = ScrolledText(frame, height=18, wrap="word")
-        self.post_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        env = ttk.Frame(frame)
+        env.pack(fill=tk.X, padx=8, pady=(10, 4))
+        self.post_env_var = tk.StringVar()
+        ttk.Label(env, text="环境能力：").pack(side=tk.LEFT)
+        ttk.Label(env, textvariable=self.post_env_var, foreground="#1f4f7f").pack(side=tk.LEFT)
+        self._refresh_post_env_capability()
+
+        notebook_frame = ttk.Frame(frame)
+        notebook_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        # 电子结构卡片
+        elec = ttk.LabelFrame(notebook_frame, text="电子结构：DOS / 能带")
+        elec.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        ttk.Label(
+            elec,
+            text="解析 vasprun.xml / DOSCAR / EIGENVAL，生成态密度与能带图并估算带隙。",
+        ).pack(anchor=tk.W, padx=6, pady=(4, 2))
+
+        dos_box = ttk.LabelFrame(elec, text="总态密度 (DOS)")
+        dos_box.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        dos_ctrl = ttk.Frame(dos_box)
+        dos_ctrl.pack(fill=tk.X, pady=2)
+        dos_btn = ttk.Button(dos_ctrl, text="计算 DOS", command=lambda: self.run_postproc("dos", {}))
+        dos_btn.pack(side=tk.LEFT)
+        self.post_run_buttons["dos"] = dos_btn
+        dos_export = ttk.Button(
+            dos_ctrl,
+            text="导出",
+            command=lambda: self.open_post_report("dos"),
+            state=tk.DISABLED,
+        )
+        dos_export.pack(side=tk.LEFT, padx=6)
+        self.post_export_buttons["dos"] = dos_export
+        dos_metrics = tk.StringVar(value="E_F — / DOS(E_F) — / gap —")
+        self.post_metric_vars["dos"] = dos_metrics
+        ttk.Label(dos_ctrl, textvariable=dos_metrics).pack(side=tk.RIGHT)
+
+        dos_fig = Figure(figsize=(4.2, 2.6))
+        self.post_figures["dos"] = dos_fig
+        dos_canvas = FigureCanvasTkAgg(dos_fig, master=dos_box)
+        self.post_canvases["dos"] = dos_canvas
+        dos_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, pady=4)
+
+        bands_box = ttk.LabelFrame(elec, text="能带 (Bands)")
+        bands_box.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        bands_ctrl = ttk.Frame(bands_box)
+        bands_ctrl.pack(fill=tk.X, pady=2)
+        bands_btn = ttk.Button(bands_ctrl, text="计算能带", command=lambda: self.run_postproc("bands", {}))
+        bands_btn.pack(side=tk.LEFT)
+        self.post_run_buttons["bands"] = bands_btn
+        bands_export = ttk.Button(
+            bands_ctrl,
+            text="导出",
+            command=lambda: self.open_post_report("bands"),
+            state=tk.DISABLED,
+        )
+        bands_export.pack(side=tk.LEFT, padx=6)
+        self.post_export_buttons["bands"] = bands_export
+        bands_metrics = tk.StringVar(value="gap — / 类型 —")
+        self.post_metric_vars["bands"] = bands_metrics
+        ttk.Label(bands_ctrl, textvariable=bands_metrics).pack(side=tk.RIGHT)
+
+        bands_fig = Figure(figsize=(4.2, 2.6))
+        self.post_figures["bands"] = bands_fig
+        bands_canvas = FigureCanvasTkAgg(bands_fig, master=bands_box)
+        self.post_canvases["bands"] = bands_canvas
+        bands_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, pady=4)
+
+        placeholders = [
+            "收敛扫描（ENCUT / k 网格）",
+            "表面 & 吸附能配方化",
+            "体模量 / 弹性 & AIMD",
+        ]
+        for title in placeholders:
+            box = ttk.LabelFrame(notebook_frame, text=title)
+            box.pack(fill=tk.X, padx=4, pady=4)
+            ttk.Label(box, text="功能开发中，敬请期待。", foreground="#888").pack(anchor=tk.W, padx=8, pady=6)
+
+        self.post_log = ScrolledText(frame, height=12, wrap="word")
+        self.post_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 10))
+        self.post_log.insert(tk.END, "后处理日志将在此显示运行状态和备注。\n")
+
         return frame
+
+    def _refresh_post_env_capability(self):
+        badges: list[str] = []
+        badges.append("✅ seekpath" if HAS_SEEKPATH else "⛔︎ seekpath")
+        badges.append("✅ pymatgen" if HAS_PYMATGEN else "⛔︎ pymatgen")
+        badges.append("✅ numpy" if HAS_NUMPY else "⛔︎ numpy")
+        self.post_env_var.set(" / ".join(badges))
+
+    def _append_post_log(self, text: str):
+        if not hasattr(self, "post_log"):
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        try:
+            self.post_log.insert(tk.END, f"[{timestamp}] {text}\n")
+            self.post_log.see(tk.END)
+        except Exception:
+            pass
+
+    def _set_postproc_running(self, key: str, running: bool):
+        btn = self.post_run_buttons.get(key)
+        if btn:
+            btn.configure(state=tk.DISABLED if running else tk.NORMAL)
+        export_btn = self.post_export_buttons.get(key)
+        if export_btn and running:
+            export_btn.configure(state=tk.DISABLED)
+
+    def run_postproc(self, key: str, extra_opts: Optional[Dict[str, Any]] = None):
+        proc = POSTPROCS.get(key)
+        if not proc:
+            messagebox.showerror(APP_NAME, f"未注册的后处理任务：{key}")
+            return
+        workdir = self.current_project_path()
+        opts: Dict[str, Any] = dict(extra_opts or {})
+        opts.setdefault("style", self.figure_style_var.get())
+        opts.setdefault("metal_threshold", 0.02)
+        opts["workdir"] = workdir
+
+        missing: list[str] = []
+        for need in proc.needs:
+            if "|" in need:
+                alternatives = [workdir / n.strip() for n in need.split("|") if n.strip()]
+                if not any(path.exists() for path in alternatives):
+                    missing.append(" 或 ".join(str(workdir / n.strip()) for n in need.split("|") if n.strip()))
+            else:
+                if not (workdir / need).exists():
+                    missing.append(str(workdir / need))
+        if missing:
+            pretty = "\n".join(missing)
+            messagebox.showwarning(APP_NAME, f"缺少必要文件：\n{pretty}")
+            return
+
+        timestamp = _dt.datetime.now().strftime("%Y%m%d-%H%M")
+        report_dir = workdir / "reports" / timestamp / key
+        try:
+            report_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"创建报告目录失败：{exc}")
+            return
+        opts["report_dir"] = report_dir
+        opts["timestamp"] = timestamp
+
+        self._append_post_log(f"[{key}] 准备运行…")
+        self._set_postproc_running(key, True)
+        worker = PostprocWorker(self, key, opts)
+        self.post_worker = worker
+        worker.start()
+
+    def _on_postproc_success(self, key: str, result: PostResult, workdir: Path, opts: Dict[str, Any]):
+        self._set_postproc_running(key, False)
+        self.post_results[key] = result
+        report_dir = opts.get("report_dir")
+        if isinstance(report_dir, Path):
+            self.post_latest_reports[key] = report_dir
+        self._update_post_metrics(key, result)
+        self._draw_post_preview(key, result)
+        export_btn = self.post_export_buttons.get(key)
+        if export_btn:
+            export_btn.configure(state=tk.NORMAL)
+        self._append_post_log(f"[{key}] 完成。输出目录：{report_dir}")
+        for note in result.notes:
+            self._append_post_log(f"[{key}] {note}")
+
+    def _on_postproc_error(self, key: str, message: str):
+        self._set_postproc_running(key, False)
+        self._append_post_log(f"[{key}] 失败：{message}")
+
+    def _update_post_metrics(self, key: str, result: PostResult):
+        var = self.post_metric_vars.get(key)
+        if not var:
+            return
+        if key == "dos":
+            ef = result.metrics.get("E_F")
+            dos_ef = result.metrics.get("DOS(E_F)")
+            gap = result.metrics.get("gap")
+            is_metal = result.metrics.get("is_metal")
+            if ef is None or dos_ef is None or gap is None:
+                text = "数据不足"
+            else:
+                text = (
+                    f"E_F {ef:.3f} eV / DOS(E_F) {dos_ef:.3f} / "
+                    f"gap {gap:.3f} eV ({'金属' if is_metal and is_metal >= 0.5 else '非金属'})"
+                )
+            var.set(text)
+        elif key == "bands":
+            gap = result.metrics.get("gap")
+            if gap is None:
+                var.set("gap —")
+            else:
+                nature = "金属" if gap < 1e-4 else "半导体/绝缘体"
+                var.set(f"gap {gap:.3f} eV / {nature}")
+
+    def _draw_post_preview(self, key: str, result: PostResult):
+        fig = self.post_figures.get(key)
+        canvas = self.post_canvases.get(key)
+        if not fig or not canvas:
+            return
+        fig.clear()
+        ax = fig.add_subplot(111)
+        plot = result.extra.get("plot", {}) if result.extra else {}
+        style = plot.get("style", self.figure_style_var.get())
+        if key == "dos":
+            x = plot.get("x", [])
+            y = plot.get("y", [])
+            if x and y:
+                ax.plot(x, y, color="#1f77b4", lw=1.4)
+                ax.axvline(0.0, color="#d62728", ls="--", lw=1.0)
+            ax.set_xlabel("E - E$_F$ (eV)")
+            ax.set_ylabel("DOS")
+        elif key == "bands":
+            bands = plot.get("bands", [])
+            if bands:
+                for idx, row in enumerate(bands):
+                    xs = [idx] * len(row)
+                    ax.plot(xs, row, color="#1f77b4", lw=1.0)
+            ax.axhline(0.0, color="#d62728", ls="--", lw=1.0)
+            ax.set_ylabel("E - E$_F$ (eV)")
+            ax.set_xlabel("k-index")
+        apply_style(ax, style)
+        fig.tight_layout()
+        canvas.draw_idle()
+
+    def open_post_report(self, key: str):
+        report_dir = self.post_latest_reports.get(key)
+        if not report_dir:
+            messagebox.showinfo(APP_NAME, "尚无可导出的结果，请先运行一次。")
+            return
+        self._append_post_log(f"打开结果目录：{report_dir}")
+        try:
+            if sys.platform.startswith("darwin"):
+                subprocess.Popen(["open", str(report_dir)])
+            elif os.name == "nt":
+                os.startfile(str(report_dir))  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", str(report_dir)])
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"打开目录失败：{exc}")
 
     def plot_once_from_oszicar(self):
         proj = self.current_project_path()
@@ -3119,8 +3822,7 @@ nice -n 5 ionice -c2 -n4 \
             return
         # 复用监视页画布
         self.on_energy_update(steps, energies)
-        self.post_log.insert(tk.END, f"一次性绘制完成，点数：{len(steps)}\n")
-        self.post_log.see(tk.END)
+        self._append_post_log(f"[oszicar] 一次性绘制完成，点数：{len(steps)}")
 
     def extract_final_energy(self):
         proj = self.current_project_path()
@@ -3144,8 +3846,7 @@ nice -n 5 ionice -c2 -n4 \
         if last_e is None:
             messagebox.showwarning(APP_NAME, "未解析到能量。")
         else:
-            self.post_log.insert(tk.END, f"最终能量（最后一步）：{last_e:.6f} eV\n")
-            self.post_log.see(tk.END)
+            self._append_post_log(f"[oszicar] 最终能量（最后一步）：{last_e:.6f} eV")
 
     # ------------------------- 配置读写（保存用户设置） ---------------------
     def load_config(self):
