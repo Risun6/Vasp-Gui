@@ -4216,6 +4216,7 @@ class VaspGUI(tk.Tk):
         ttk.Label(row2, text="扫参目录:").pack(side=tk.LEFT)
         ttk.Entry(row2, textvariable=self.tw_dir, width=64).pack(side=tk.LEFT, padx=4)
         ttk.Button(row2, text="选择目录…", command=self._tw_choose_dir).pack(side=tk.LEFT)
+
         ttk.Button(row2, text="载入目录", command=lambda: self._tw_load_dir(self.tw_dir.get())).pack(
             side=tk.LEFT, padx=6
         )
