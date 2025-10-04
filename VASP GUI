@@ -655,8 +655,6 @@ class VaspGUI(tk.Tk):
         self.nb.pack(fill=tk.BOTH, expand=True)
 
         self.page_inputs = self._build_inputs_page(self.nb)
-        self.page_potcar = self._build_potcar_page(self.nb)
-        self.page_kpoints = self._build_kpoints_page(self.nb)
 
         # 先把 workflow 会引用到的页面都建好
         self.page_run = self._build_run_page(self.nb)
@@ -666,9 +664,7 @@ class VaspGUI(tk.Tk):
         # 最后再建 workflow（里面会引用上面三个）
         self.page_workflow = self._build_workflow_page(self.nb)
 
-        self.nb.add(self.page_inputs, text="输入文件")
-        self.nb.add(self.page_potcar, text="POTCAR 赝势")
-        self.nb.add(self.page_kpoints, text="K 点生成")
+        self.nb.add(self.page_inputs, text="输入 / POTCAR / K 点")
         self.nb.add(self.page_workflow, text="流程助手")
         self.nb.add(self.page_run, text="运行 / 提交")
         self.nb.add(self.page_monitor, text="监视")
@@ -700,6 +696,36 @@ class VaspGUI(tk.Tk):
             ttk.Radiobutton(temp_bar, text=txt, value=key, variable=self.incar_template, command=self.load_incar_template).pack(side=tk.LEFT)
         ttk.Button(temp_bar, text="加载模板到编辑器", command=self.load_incar_template).pack(side=tk.RIGHT)
 
+        # INCAR 简单面板
+        simple_box = ttk.LabelFrame(left, text="INCAR 简单面板")
+        simple_box.pack(fill=tk.X, pady=4)
+        self.incar_simple_vars: dict[str, tk.StringVar] = {}
+        simple_items = [
+            ("ENCUT", "ENCUT (eV)"),
+            ("EDIFF", "EDIFF"),
+            ("EDIFFG", "EDIFFG"),
+            ("ISMEAR", "ISMEAR"),
+            ("SIGMA", "SIGMA"),
+            ("KSPACING", "KSPACING"),
+            ("NSW", "NSW"),
+        ]
+        for idx, (key, label) in enumerate(simple_items):
+            row = idx // 2
+            col = idx % 2
+            frame_cell = ttk.Frame(simple_box)
+            frame_cell.grid(row=row, column=col, sticky="ew", padx=4, pady=2)
+            ttk.Label(frame_cell, text=label + ":").pack(side=tk.LEFT)
+            var = tk.StringVar()
+            self.incar_simple_vars[key] = var
+            entry = ttk.Entry(frame_cell, textvariable=var, width=12)
+            entry.pack(side=tk.LEFT, padx=4)
+        for i in range(2):
+            simple_box.grid_columnconfigure(i, weight=1)
+        btn_row = ttk.Frame(simple_box)
+        btn_row.grid(row=(len(simple_items)+1)//2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Button(btn_row, text="从编辑器读取", command=self.refresh_incar_simple_panel).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="写入到编辑器", command=self.apply_incar_simple_panel).pack(side=tk.LEFT, padx=6)
+
         self.incar_text = ScrolledText(left, height=20, undo=True, wrap="none")
         self.incar_text.pack(fill=tk.BOTH, expand=True)
         btns = ttk.Frame(left)
@@ -730,8 +756,21 @@ class VaspGUI(tk.Tk):
         ttk.Button(row2, text="打开 KPOINTS", command=lambda: self.open_into_editor("KPOINTS", self.kpoints_text)).pack(side=tk.LEFT)
         ttk.Button(row2, text="保存 KPOINTS", command=lambda: self.save_from_editor("KPOINTS", self.kpoints_text)).pack(side=tk.LEFT, padx=6)
 
-        # 默认加载模板
+        ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=8, pady=6)
+
+        potcar_box = ttk.LabelFrame(frame, text="POTCAR 赝势")
+        potcar_box.pack(fill=tk.BOTH, expand=False, padx=8, pady=4)
+        self._populate_potcar_section(potcar_box)
+
+        ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=8, pady=6)
+
+        kpoints_box = ttk.LabelFrame(frame, text="K 点生成")
+        kpoints_box.pack(fill=tk.BOTH, expand=False, padx=8, pady=4)
+        self._populate_kpoints_section(kpoints_box)
+
+        # 默认加载模板并同步简单面板
         self.load_incar_template()
+        self.refresh_incar_simple_panel()
         return frame
 
     def load_incar_template(self):
@@ -752,6 +791,66 @@ class VaspGUI(tk.Tk):
         }
         self.incar_text.delete("1.0", tk.END)
         self.incar_text.insert("1.0", presets.get(tpl, presets["relax"]))
+        self.refresh_incar_simple_panel()
+
+    def refresh_incar_simple_panel(self):
+        if not hasattr(self, "incar_simple_vars"):
+            return
+        text = self.incar_text.get("1.0", tk.END)
+        values: dict[str, str] = {}
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            m = re.match(r"([A-Za-z0-9_+-]+)\s*=\s*(.+)", stripped)
+            if m:
+                key = m.group(1).upper()
+                values[key] = m.group(2).strip()
+        for key, var in self.incar_simple_vars.items():
+            var.set(values.get(key, ""))
+
+    def apply_incar_simple_panel(self):
+        if not hasattr(self, "incar_simple_vars"):
+            return
+        updates = {}
+        for key, var in self.incar_simple_vars.items():
+            val = var.get().strip()
+            updates[key] = val
+        text = self.incar_text.get("1.0", tk.END)
+        new_text = self._update_incar_text(text, updates)
+        self.incar_text.delete("1.0", tk.END)
+        self.incar_text.insert("1.0", new_text)
+        self.refresh_incar_simple_panel()
+
+    @staticmethod
+    def _update_incar_text(text: str, updates: dict[str, str]) -> str:
+        keys = {k.upper(): v for k, v in updates.items()}
+        lines = text.splitlines()
+        new_lines: list[str] = []
+        handled: set[str] = set()
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                new_lines.append(line)
+                continue
+            m = re.match(r"([A-Za-z0-9_+-]+)\s*=", stripped)
+            if m:
+                key = m.group(1).upper()
+                if key in keys:
+                    val = keys[key]
+                    if val:
+                        new_lines.append(f"{key} = {val}")
+                    handled.add(key)
+                    continue
+            new_lines.append(line)
+        for key, val in keys.items():
+            if not val or key in handled:
+                continue
+            new_lines.append(f"{key} = {val}")
+        result = "\n".join(new_lines)
+        if result and not result.endswith("\n"):
+            result += "\n"
+        return result
 
     def open_into_editor(self, name: str, editor: tk.Text):
         proj = self.current_project_path()
@@ -774,6 +873,8 @@ class VaspGUI(tk.Tk):
             s = read_text(path)
             editor.delete("1.0", tk.END)
             editor.insert("1.0", s)
+            if editor is getattr(self, "incar_text", None):
+                self.refresh_incar_simple_panel()
         except Exception as e:
             messagebox.showerror(APP_NAME, f"读取失败：{e}")
 
@@ -797,10 +898,8 @@ class VaspGUI(tk.Tk):
             messagebox.showwarning(APP_NAME, "未解析到元素，请检查第6/7行。")
 
     # ------------------------- 页面：POTCAR --------------------------------
-    def _build_potcar_page(self, parent):
-        frame = ttk.Frame(parent)
-
-        row1 = ttk.Frame(frame)
+    def _populate_potcar_section(self, container):
+        row1 = ttk.Frame(container)
         row1.pack(fill=tk.X, padx=8, pady=8)
         ttk.Label(row1, text="赝势库根目录：").pack(side=tk.LEFT)
         self.pot_dir_var = tk.StringVar(value=str(Path.home() / "potcars"))
@@ -808,14 +907,19 @@ class VaspGUI(tk.Tk):
         ttk.Button(row1, text="选择…", command=self.choose_pot_dir).pack(side=tk.LEFT)
         ttk.Button(row1, text="探测赝势库", command=self.detect_pot_roots).pack(side=tk.LEFT, padx=6)
 
-        row2 = ttk.Frame(frame)
+        row2 = ttk.Frame(container)
         row2.pack(fill=tk.X, padx=8, pady=4)
         ttk.Label(row2, text="从 POSCAR 自动解析元素并生成 POTCAR：").pack(side=tk.LEFT)
         ttk.Button(row2, text="生成 POTCAR", command=self.do_build_potcar).pack(side=tk.LEFT, padx=8)
 
-        self.pot_msg = ScrolledText(frame, height=18, wrap="word")
+        self.pot_msg = ScrolledText(container, height=12, wrap="word")
         self.pot_msg.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
+        return container
+
+    def _build_potcar_page(self, parent):
+        frame = ttk.Frame(parent)
+        self._populate_potcar_section(frame)
         return frame
 
     def choose_pot_dir(self):
@@ -961,9 +1065,8 @@ class VaspGUI(tk.Tk):
         return cands[:limit]
 
     # ------------------------- 页面：KPOINTS -------------------------------
-    def _build_kpoints_page(self, parent):
-        frame = ttk.Frame(parent)
-        box = ttk.LabelFrame(frame, text="Monkhorst-Pack 网格")
+    def _populate_kpoints_section(self, container):
+        box = ttk.LabelFrame(container, text="Monkhorst-Pack 网格")
         box.pack(fill=tk.X, padx=8, pady=8)
 
         self.k_nx = tk.IntVar(value=5)
@@ -981,14 +1084,19 @@ class VaspGUI(tk.Tk):
         ttk.Spinbox(row, from_=1, to=50, textvariable=self.k_nz, width=5).pack(side=tk.LEFT, padx=6)
         ttk.Checkbutton(box, text="Gamma 中心", variable=self.k_gamma).pack(anchor=tk.W, padx=8)
 
-        btns = ttk.Frame(frame)
+        btns = ttk.Frame(container)
         btns.pack(fill=tk.X, padx=8, pady=4)
         ttk.Button(btns, text="生成到编辑器", command=self.kpoints_to_editor).pack(side=tk.LEFT)
         ttk.Button(btns, text="保存到项目(KPOINTS)", command=self.kpoints_save).pack(side=tk.LEFT, padx=8)
 
-        tip = ttk.Label(frame, text="提示：也可在 INCAR 使用 KSPACING，省去 KPOINTS（VASP 5.4.4+）")
+        tip = ttk.Label(container, text="提示：也可在 INCAR 使用 KSPACING，省去 KPOINTS（VASP 5.4.4+）")
         tip.pack(anchor=tk.W, padx=12, pady=4)
 
+        return container
+
+    def _build_kpoints_page(self, parent):
+        frame = ttk.Frame(parent)
+        self._populate_kpoints_section(frame)
         return frame
 
     # ------------------------- 页面：流程助手 ------------------------------
@@ -1049,8 +1157,8 @@ class VaspGUI(tk.Tk):
                 "② 编辑输入文件",
                 "填写 INCAR、POSCAR、KPOINTS 等输入，确保必要信息完整。",
                 [
-                    ("跳转到输入页", lambda: self.goto_tab(self.page_inputs)),
-                    ("跳转到 K 点生成", lambda: self.goto_tab(self.page_kpoints)),
+                    ("跳转到输入面板", lambda: self.goto_tab(self.page_inputs)),
+                    ("跳转到 K 点设置", lambda: self.goto_tab(self.page_inputs)),
                 ],
                 self.page_inputs,
             ),
@@ -1058,10 +1166,10 @@ class VaspGUI(tk.Tk):
                 "③ 准备 POTCAR",
                 "解析 POSCAR 元素并在 POTCAR 面板一键拼接所需赝势。",
                 [
-                    ("跳转到 POTCAR", lambda: self.goto_tab(self.page_potcar)),
+                    ("跳转到 POTCAR", lambda: self.goto_tab(self.page_inputs)),
                     ("解析元素", self.show_poscar_elements),
                 ],
-                self.page_potcar,
+                self.page_inputs,
             ),
             (
                 "④ 配置运行方式",
