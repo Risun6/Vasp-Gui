@@ -1429,7 +1429,6 @@ def proc_planar_potential(workdir: Path, opts: Dict[str, Any]) -> PostResult:
 
 register_postproc(PostProc(name="pot_z", needs=["LOCPOT"], runner=proc_planar_potential))
 
-
 # ----------------------------- GUI 组件 ------------------------------------
 
 class SystemStatsMonitor(threading.Thread):
@@ -4542,6 +4541,7 @@ nice -n 5 ionice -c2 -n4 \
         self.post_metrics.insert(tk.END, f"[{timestamp}] {text}\n")
         self.post_metrics.see(tk.END)
         self.post_metrics.configure(state=tk.DISABLED)
+
 
     def plot_once_from_oszicar(self):
         proj = self.current_project_path()
