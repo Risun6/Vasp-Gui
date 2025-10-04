@@ -4350,10 +4350,16 @@ class VaspGUI(tk.Tk):
 
         self.tw_results = rows
         thetas = sorted({round(r["theta"], 6) for r in rows})
-        chosen = self._tw_pick_nearest_theta(float(self.tw_theta.get()), thetas)
+
+        try:
+            current_theta = float(self.tw_theta.get())
+        except (tk.TclError, TypeError, ValueError):
+            current_theta = 0.0
+            self.tw_theta.set(current_theta)
+        chosen = self._tw_pick_nearest_theta(current_theta, thetas)
         self.tw_theta.set(chosen)
         self._tw_refilter_and_redraw()
-        self.tw_info.config(text=f"载入 {len(rows)} 条；θ切片 {chosen:.2f}°")
+        self.tw_info.config(text=f"Loaded {len(rows)} records · theta slice {chosen:.2f}°")
 
     def _tw_row_from_dict(self, d: dict) -> dict:
         if not isinstance(d, dict):
@@ -4386,7 +4392,13 @@ class VaspGUI(tk.Tk):
     def _tw_refilter_and_redraw(self):
         if not getattr(self, "tw_results", None):
             return
-        theta = round(float(self.tw_theta.get()), 6)
+
+        try:
+            theta_val = float(self.tw_theta.get())
+        except (tk.TclError, TypeError, ValueError):
+            theta_val = 0.0
+            self.tw_theta.set(theta_val)
+        theta = round(theta_val, 6)
         thetas = sorted({round(r["theta"], 6) for r in self.tw_results})
         if theta not in thetas:
             theta = self._tw_pick_nearest_theta(theta, thetas)
@@ -4419,7 +4431,8 @@ class VaspGUI(tk.Tk):
             return
         self.tw_ax.clear()
         if not rows:
-            self.tw_ax.set_title("无数据")
+
+            self.tw_ax.set_title("No data available")
             self.tw_canvas.draw_idle()
             return
         xs = [r["ux"] for r in rows]
@@ -4428,7 +4441,7 @@ class VaspGUI(tk.Tk):
         sc = self.tw_ax.scatter(xs, ys, c=cs)
         self.tw_ax.set_xlabel("ux")
         self.tw_ax.set_ylabel("uy")
-        self.tw_ax.set_title(f"带隙 heatmap（θ={self.tw_theta.get():.2f}°）")
+        self.tw_ax.set_title(f"Band gap heatmap (theta={self.tw_theta.get():.2f} deg)")
         if self.tw_cbar is not None:
             try:
                 self.tw_cbar.remove()
