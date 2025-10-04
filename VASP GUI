@@ -75,6 +75,12 @@ try:
     HAS_NUMPY = True
 except Exception:
     HAS_NUMPY = False
+
+try:
+    from pymatgen.analysis.interfaces.zsl import ZSLGenerator  # type: ignore
+    HAS_ZSL = True
+except Exception:
+    HAS_ZSL = False
 # === CODEX END: imports for twist/shift page ===
 
 try:
@@ -1648,6 +1654,103 @@ class VaspGUI(tk.Tk):
         self.ax_tw.set_title(f"θ={tdeg:.3f}°, u=({ux:.3f},{uy:.3f}), atoms={len(st)}")
         self.canvas_tw.draw_idle()
 
+    def _tw_find_match(self, A_top_rot, A_bot, allow_strain: float, search_limit: int):
+        """返回最优匹配 dict(n1,m1,n2,m2,s,resid,area,atoms)。"""
+        import numpy as np
+
+        best: Optional[Dict[str, float]] = None
+        # 优先使用 ZSL（若可用），失败则自动回退
+        if HAS_ZSL:
+            try:
+                zsl = ZSLGenerator(
+                    max_area_ratio=(1.0 + allow_strain),
+                    max_misfit=allow_strain,
+                    max_angle_diff=allow_strain * 10.0,
+                )
+
+                def to3(mat):
+                    return np.array(
+                        [
+                            [mat[0, 0], mat[0, 1], 0.0],
+                            [mat[1, 0], mat[1, 1], 0.0],
+                            [0.0, 0.0, 1.0],
+                        ],
+                        dtype=float,
+                    )
+
+                matches = zsl.get_zsl_matches(to3(A_top_rot), to3(A_bot), max_search=search_limit)
+                for m in matches:
+                    S1 = np.array(m.get("matrix_1"), dtype=float)[:2, :2]
+                    S2 = np.array(m.get("matrix_2"), dtype=float)[:2, :2]
+                    # 当前构建流程只支持对角超胞，若出现非对角项则跳过
+                    if not np.allclose(S1, np.diag(np.diag(S1))) or not np.allclose(
+                        S2, np.diag(np.diag(S2))
+                    ):
+                        continue
+                    S1 = np.diag(np.diag(S1)).astype(int)
+                    S2 = np.diag(np.diag(S2)).astype(int)
+                    T = A_top_rot @ S1
+                    B = A_bot @ S2
+                    denom = float(np.trace(T.T @ T))
+                    if denom <= 0:
+                        continue
+                    s_star = float(np.trace(T.T @ B) / denom)
+                    resid = np.linalg.norm(B - s_star * T, ord="fro") / max(
+                        1.0, np.linalg.norm(B, ord="fro")
+                    )
+                    area = abs(float(np.linalg.det(B)))
+                    cand = dict(
+                        n1=int(S1[0, 0]),
+                        m1=int(S1[1, 1]),
+                        n2=int(S2[0, 0]),
+                        m2=int(S2[1, 1]),
+                        s=s_star,
+                        resid=resid,
+                        area=area,
+                        atoms=-1,
+                    )
+                    if best is None or (resid, area) < (best["resid"], best["area"]):
+                        best = cand
+                if best is not None:
+                    return best
+            except Exception:
+                pass
+
+        # 回退到对角穷举
+        best = None
+        for n1 in range(1, search_limit + 1):
+            for m1 in range(1, search_limit + 1):
+                T = A_top_rot @ np.array([[n1, 0], [0, m1]], dtype=int)
+                denom = float(np.trace(T.T @ T))
+                if denom <= 0:
+                    continue
+                for n2 in range(1, search_limit + 1):
+                    for m2 in range(1, search_limit + 1):
+                        B = A_bot @ np.array([[n2, 0], [0, m2]], dtype=int)
+                        s_star = float(np.trace(T.T @ B) / denom)
+                        if not (1.0 - allow_strain <= s_star <= 1.0 + allow_strain):
+                            continue
+                        resid = np.linalg.norm(B - s_star * T, ord="fro") / max(
+                            1.0, np.linalg.norm(B, ord="fro")
+                        )
+                        area = abs(float(np.linalg.det(B)))
+                        cand = dict(
+                            n1=n1,
+                            m1=m1,
+                            n2=n2,
+                            m2=m2,
+                            s=s_star,
+                            resid=resid,
+                            area=area,
+                            atoms=-1,
+                        )
+                        if best is None or (resid, area) < (best["resid"], best["area"]):
+                            best = cand
+        return best
+
+    def _estimate_atoms(self, st_top, st_bot, best):
+        return len(st_top) * (best["n1"] * best["m1"]) + len(st_bot) * (best["n2"] * best["m2"])
+
     def _tw_build_structure(self, top_path: Path, bot_path: Path,
                             theta_deg: float, ux: float, uy: float,
                             vacuum: float, allow_strain: float,
@@ -1677,35 +1780,18 @@ class VaspGUI(tk.Tk):
                        [np.sin(th),  np.cos(th)]], dtype=float)
         A_top_rot = Rz @ A_top  # (2,2)
 
-        # 穷举对角超胞 diag(n,m)（简单稳健），允许上层等比例微应变 s ∈ [1-ε,1+ε]
-        def diag(n, m):
-            return np.array([[n,0],[0,m]], dtype=int)
-
-        best = None
-        for n1 in range(1, search_limit+1):
-            for m1 in range(1, search_limit+1):
-                T = A_top_rot @ diag(n1, m1)  # 上层超胞 in-plane
-                for n2 in range(1, search_limit+1):
-                    for m2 in range(1, search_limit+1):
-                        B = A_bot @ diag(n2, m2)  # 下层超胞 in-plane
-                        # 允许 top 做等比例 s 以靠近 B
-                        # s* = argmin ||B - s*T||_F
-                        s_star = float(np.trace(T.T @ B) / np.trace(T.T @ T))
-                        if not (1.0 - allow_strain <= s_star <= 1.0 + allow_strain):
-                            continue
-                        resid = np.linalg.norm(B - s_star*T, ord="fro") / max(1.0, np.linalg.norm(B, ord="fro"))
-                        area = abs(np.linalg.det(B))
-                        atom_est = len(st_top) * (n1*m1) + len(st_bot) * (n2*m2)
-                        key = (resid, area, atom_est)
-                        cand = dict(n1=n1, m1=m1, n2=n2, m2=m2, s=s_star, resid=resid, area=area, atoms=atom_est)
-                        if best is None or key < (best["resid"], best["area"], best["atoms"]):
-                            best = cand
+        best = self._tw_find_match(A_top_rot, A_bot, allow_strain, search_limit)
 
         if best is None:
             raise RuntimeError("在给定容许应变与搜索限内未找到可接受的对角超胞匹配。")
-        # 过大则提示用户
-        if best["atoms"] > 2000:
-            raise RuntimeError(f"匹配到的超胞过大（≈{best['atoms']} 原子），请放宽步长或减小 search_limit。")
+
+        atom_est = self._estimate_atoms(st_top, st_bot, best)
+        best["atoms"] = atom_est
+        gamma_limit = int(self.tw_gamma_atom_threshold.get()) if hasattr(self, "tw_gamma_atom_threshold") else 500
+        if atom_est > gamma_limit * 8:
+            raise RuntimeError(
+                f"预计原子数≈{atom_est}，过大；请调大步长或缩小角度/网格。"
+            )
 
         # 构造下层超胞
         S_bot = np.eye(3, dtype=int)
@@ -1776,6 +1862,47 @@ class VaspGUI(tk.Tk):
     # === CODEX END: twist/shift geometry core ===
 
     # === CODEX BEGIN: generate twist/shift tasks ===
+    def _tw_canonical_registry(self, ux: float, uy: float, lattice2x2):
+        """规约 (ux, uy) 到具有代表性的等价点以减少重复。"""
+        try:
+            import numpy as _np
+            import math as _math
+        except Exception:
+            return (float(ux % 1.0), float(uy % 1.0))
+
+        vec_a = _np.asarray(lattice2x2)[:, 0]
+        vec_b = _np.asarray(lattice2x2)[:, 1]
+        if vec_a.shape[0] != 2 or vec_b.shape[0] != 2:
+            return (float(ux % 1.0), float(uy % 1.0))
+
+        a_len = _np.linalg.norm(vec_a)
+        b_len = _np.linalg.norm(vec_b)
+        if a_len == 0 or b_len == 0:
+            return (float(ux % 1.0), float(uy % 1.0))
+
+        cosang = _np.clip(_np.dot(vec_a, vec_b) / (a_len * b_len), -1.0, 1.0)
+        ang = _math.degrees(_math.acos(cosang))
+
+        ux_mod = float(ux % 1.0)
+        uy_mod = float(uy % 1.0)
+
+        def _rotate_candidates(order):
+            cands = []
+            for k in range(order):
+                th = 2 * _math.pi * k / order
+                rot = _np.array([[_math.cos(th), -_math.sin(th)], [_math.sin(th), _math.cos(th)]])
+                u = (rot @ _np.array([ux_mod, uy_mod])) % 1.0
+                cands.append((float(u[0]), float(u[1])))
+            return min(cands)
+
+        if abs(a_len - b_len) / max(a_len, b_len) < 0.02:
+            if abs(ang - 60.0) < 2.0:
+                return _rotate_candidates(6)
+            if abs(ang - 90.0) < 2.0:
+                return _rotate_candidates(4)
+
+        return (ux_mod, uy_mod)
+
     def _tw_generate(self, single: bool):
         """生成单例或批量遍历任务目录与 POSCAR/INCAR。"""
         try:
@@ -1799,9 +1926,37 @@ class VaspGUI(tk.Tk):
 
         # 任务组合
         thetas = [theta_a] if single else self._tw_linspace(theta_a, theta_b, step=theta_step)
-        uxs = [0.0] if single else [i/ux_steps for i in range(ux_steps)]
-        uys = [0.0] if single else [j/uy_steps for j in range(uy_steps)]
-        combos = [(th, ux, uy) for th in thetas for ux in uxs for uy in uys]
+        if single:
+            uxs = [0.0]
+            uys = [0.0]
+        else:
+            uxs = [i / ux_steps for i in range(ux_steps)] if ux_steps > 0 else [0.0]
+            uys = [j / uy_steps for j in range(uy_steps)] if uy_steps > 0 else [0.0]
+
+        lattice2x2 = None
+        if not single and HAS_PYMATGEN and HAS_NUMPY:
+            try:
+                from pymatgen.core import Structure as _Structure
+
+                st_bot_sample = _Structure.from_file(str(bot_p))
+                lattice2x2 = np.array(st_bot_sample.lattice.matrix[:2, :2])
+            except Exception:
+                lattice2x2 = None
+
+        combos = []
+        seen = set()
+        for th in thetas:
+            for ux in uxs:
+                for uy in uys:
+                    if lattice2x2 is not None:
+                        cu = self._tw_canonical_registry(ux, uy, lattice2x2)
+                    else:
+                        cu = (float(ux % 1.0), float(uy % 1.0))
+                    key = (round(th, 6), round(cu[0], 6), round(cu[1], 6))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    combos.append((th, float(cu[0]), float(cu[1])))
 
         if len(combos) > max_tasks:
             messagebox.showwarning(APP_NAME, f"任务数 {len(combos)} > 上限 {max_tasks}，请降低分辨率或步长")
