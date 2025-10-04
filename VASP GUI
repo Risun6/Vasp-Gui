@@ -35,8 +35,11 @@ import re
 import time
 import json
 import shutil
+import math
 import threading
 import subprocess
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, Literal
 from pathlib import Path
 
 try:
@@ -53,12 +56,120 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
+try:
+    import ttkbootstrap as tb
+    HAS_TTKBOOTSTRAP = True
+except Exception:
+    tb = None
+    HAS_TTKBOOTSTRAP = False
+
+try:
+    import pymatgen  # type: ignore  # noqa: F401
+    HAS_PYMATGEN = True
+except Exception:
+    HAS_PYMATGEN = False
+
+try:
+    import seekpath  # type: ignore  # noqa: F401
+    HAS_SEEKPATH = True
+except Exception:
+    HAS_SEEKPATH = False
+
 APP_NAME = "VASP Linux 一体化GUI"
 APP_VER = "0.1.0-MVP"
 
 # 配置文件路径（保存用户设置）
 CONFIG_DIR = Path.home() / ".config" / "vasp_gui"
 CONFIG_PATH = CONFIG_DIR / "config.json"
+
+
+@dataclass
+class WizardProfile:
+    system_type: Literal["metal", "semiconductor", "insulator"]
+    workflow: Literal["relax_scf_dos", "relax_scf_bands", "scf_dos"]
+    encut_strategy: Literal["auto", "manual"]
+    encut_value: Optional[int]
+    k_mode: Literal["kspacing", "kpoints"]
+    kspacing: Optional[float]
+    kgrid: Optional[Tuple[int, int, int]]
+    use_slurm: bool
+    np: int
+    slurm: Dict[str, Any]
+    figure_style: Literal["AFM", "AM", "PRB"]
+    emit_report: bool
+
+
+FIG_STYLES: Dict[str, Dict[str, Any]] = {
+    "AFM": {
+        "font": "Times New Roman",
+        "size": {"title": 12, "label": 11, "tick": 10},
+        "linew": 1.2,
+        "tick_dir": "in",
+        "tick_len": 3,
+        "box": True,
+    },
+    "AM": {
+        "font": "Arial",
+        "size": {"title": 12, "label": 11, "tick": 10},
+        "linew": 1.4,
+        "tick_dir": "in",
+        "tick_len": 3,
+        "box": True,
+    },
+    "PRB": {
+        "font": "Helvetica",
+        "size": {"title": 13, "label": 11, "tick": 10},
+        "linew": 1.1,
+        "tick_dir": "in",
+        "tick_len": 3,
+        "box": False,
+    },
+}
+
+DEFAULT_POSCAR_TEMPLATE = """Si
+1.0
+5.430000 0.000000 0.000000
+0.000000 5.430000 0.000000
+0.000000 0.000000 5.430000
+Si
+1
+Direct
+0.000000 0.000000 0.000000
+"""
+
+EXAMPLE_SI_POSCAR = """Si example (diamond)
+1.0
+0.000000 2.715000 2.715000
+2.715000 0.000000 2.715000
+2.715000 2.715000 0.000000
+Si
+2
+Direct
+0.000000 0.000000 0.000000
+0.250000 0.250000 0.250000
+"""
+
+EXAMPLE_SI_INCAR = """# 示例项目默认 INCAR
+SYSTEM = example_Si
+ENCUT = 520
+PREC  = Accurate
+EDIFF = 1e-6
+IBRION = 2
+ISIF   = 3
+NSW    = 60
+ISMEAR = 0
+SIGMA  = 0.05
+LREAL  = Auto
+LWAVE  = .FALSE.
+LCHARG = .TRUE.
+"""
+
+EXAMPLE_SI_KPOINTS = """Automatic mesh
+0
+Gamma
+6 6 6
+0 0 0
+"""
 
 # === ETA helpers ===
 ETA_LOOP_RX = re.compile(r"LOOP:\s+cpu time\s+([0-9.eE+\-]+)\s*:\s*real time\s+([0-9.eE+\-]+)", re.IGNORECASE)
@@ -300,6 +411,30 @@ def gen_kpoints_monkhorst(nx: int, ny: int, nz: int, gamma_center: bool) -> str:
         "0 0 0",
     ]
     return "\n".join(lines) + "\n"
+
+
+def apply_style(ax, style: str) -> None:
+    """Apply a lightweight journal style preset to a Matplotlib axis."""
+    cfg = FIG_STYLES.get(style, FIG_STYLES["AFM"])
+    font = cfg.get("font", "Arial")
+    size_cfg = cfg.get("size", {})
+    for label in ax.get_xticklabels():
+        label.set_fontfamily(font)
+        label.set_fontsize(size_cfg.get("tick", 10))
+    for label in ax.get_yticklabels():
+        label.set_fontfamily(font)
+        label.set_fontsize(size_cfg.get("tick", 10))
+    ax.tick_params(direction=cfg.get("tick_dir", "in"), length=cfg.get("tick_len", 3))
+    ax.set_title(ax.get_title(), fontfamily=font, fontsize=size_cfg.get("title", 12))
+    ax.set_xlabel(ax.get_xlabel(), fontfamily=font, fontsize=size_cfg.get("label", 11))
+    ax.set_ylabel(ax.get_ylabel(), fontfamily=font, fontsize=size_cfg.get("label", 11))
+    for spine in ax.spines.values():
+        spine.set_linewidth(cfg.get("linew", 1.2))
+        spine.set_visible(True)
+    if not cfg.get("box", True):
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+
 
 # ----------------------------- GUI 组件 ------------------------------------
 
@@ -601,17 +736,19 @@ class VaspGUI(tk.Tk):
         super().__init__()
         self.title(f"{APP_NAME} v{APP_VER}")
         self.geometry("1200x800")
-        try:
-            import ttkbootstrap as tb  # 可选美化
-            tb.Style("cosmo")
-        except Exception:
-            pass
+        if HAS_TTKBOOTSTRAP and tb is not None:
+            try:
+                tb.Style("cosmo")
+            except Exception:
+                pass
 
         self.project_dir = Path.cwd()
         self.proc = None  # subprocess.Popen or None
         self.monitor = None  # EnergyMonitor
         self.sys_monitor = None  # SystemStatsMonitor
         self.run_status_var = tk.StringVar(value="⚪ 未检测")
+        self.figure_style_var = tk.StringVar(value="AFM")
+        self.emit_report_var = tk.BooleanVar(value=True)
         self.run_suggestion_widgets: list[tk.Text] = []
         self.overview_items = [
             ("__project__", "项目目录"),
@@ -648,7 +785,8 @@ class VaspGUI(tk.Tk):
         self.project_entry.pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="选择…", command=self.choose_project).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="新建项目", command=self.create_project).pack(side=tk.LEFT, padx=4)
-        ttk.Button(toolbar, text="一键读取项目", command=self.import_project_files).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="首次向导", command=self.launch_first_time_wizard).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="创建示例项目", command=self.on_create_example_project).pack(side=tk.LEFT, padx=4)
 
         # Notebook
         self.nb = ttk.Notebook(self)
@@ -897,6 +1035,218 @@ class VaspGUI(tk.Tk):
         if result and not result.endswith("\n"):
             result += "\n"
         return result
+
+    def launch_first_time_wizard(self):
+        profile = self.run_first_time_wizard()
+        if profile:
+            self.apply_profile_to_project(profile)
+
+    def run_first_time_wizard(self) -> WizardProfile | None:
+        dialog = FirstTimeWizard(self)
+        self.wait_window(dialog)
+        return getattr(dialog, "result", None)
+
+    def apply_profile_to_project(self, profile: WizardProfile, project_path: Path | None = None) -> None:
+        proj = self.current_project_path() if project_path is None else Path(project_path)
+        try:
+            proj = proj.expanduser()
+        except Exception:
+            proj = Path(proj)
+        proj.mkdir(parents=True, exist_ok=True)
+        self._ensure_project_scaffold(proj)
+
+        smear_defaults = {"metal": (1, 0.2), "semiconductor": (0, 0.05), "insulator": (0, 0.05)}
+        isme, sigma = smear_defaults.get(profile.system_type, (0, 0.05))
+        encut_value = profile.encut_value or 520
+        encut_comment = ""
+        if profile.encut_strategy == "auto" and profile.encut_value is None:
+            encut_comment = "# ENCUT ≈ 1.3×ENMAX_max，已使用默认值 520"
+
+        incar_lines = [
+            "# === Generated by wizard ===",
+            f"# Workflow: {profile.workflow}",
+        ]
+        if encut_comment:
+            incar_lines.append(encut_comment)
+        incar_lines.extend([
+            f"SYSTEM = {proj.name}",
+            f"ENCUT = {encut_value}",
+            "PREC  = Accurate",
+            "EDIFF = 1e-6",
+        ])
+        if profile.workflow.startswith("relax"):
+            incar_lines.extend(["IBRION = 2", "ISIF   = 3", "NSW    = 80"])
+        else:
+            incar_lines.extend(["IBRION = -1", "NSW    = 0"])
+        incar_lines.extend([
+            f"ISMEAR = {isme}",
+            f"SIGMA  = {sigma}",
+            "LREAL  = Auto",
+            "LWAVE  = .FALSE.",
+            "LCHARG = .TRUE.",
+        ])
+
+        if profile.k_mode == "kspacing":
+            kspacing = profile.kspacing or 0.22
+            incar_lines.append(f"KSPACING = {kspacing}")
+            kpoints_text = (
+                f"# 使用 KSPACING = {kspacing}\n"
+                "# 若需 Monkhorst 网格请替换为标准 KPOINTS 文件\n"
+            )
+        else:
+            grid = profile.kgrid or (6, 6, 6)
+            kpoints_text = gen_kpoints_monkhorst(grid[0], grid[1], grid[2], True)
+
+        write_text(proj / "INCAR", "\n".join(filter(None, incar_lines)) + "\n")
+        if not (proj / "POSCAR").exists():
+            write_text(proj / "POSCAR", DEFAULT_POSCAR_TEMPLATE)
+        write_text(proj / "KPOINTS", kpoints_text)
+
+        self.figure_style_var.set(profile.figure_style)
+        self.emit_report_var.set(bool(profile.emit_report))
+        try:
+            self.mpi_np.set(int(profile.np))
+        except Exception:
+            pass
+
+        self.run_mode.set("slurm" if profile.use_slurm else "local")
+        slurm_cfg = profile.slurm or {}
+        self.slurm_part.set(slurm_cfg.get("partition", self.slurm_part.get()))
+        self.slurm_time.set(slurm_cfg.get("time", self.slurm_time.get()))
+        try:
+            self.slurm_nodes.set(int(slurm_cfg.get("nodes", self.slurm_nodes.get())))
+        except Exception:
+            pass
+        try:
+            ntasks = int(slurm_cfg.get("ntasks", profile.np))
+            self.slurm_ntasks.set(ntasks)
+        except Exception:
+            pass
+        self.slurm_account.set(slurm_cfg.get("account", self.slurm_account.get()))
+
+        self.last_wizard_profile = profile
+        self.set_project(proj)
+        try:
+            self.write_job_script()
+        except Exception:
+            pass
+        try:
+            self.save_config()
+        except Exception:
+            pass
+
+    def create_example_project(self, name: str = "example_Si") -> Path:
+        root = Path.home() / "vasp_gui_projects"
+        root.mkdir(parents=True, exist_ok=True)
+        candidate = root / name
+        idx = 1
+        while candidate.exists():
+            candidate = root / f"{name}_{idx:02d}"
+            idx += 1
+        style = self.figure_style_var.get() or "AFM"
+        profile = WizardProfile(
+            system_type="semiconductor",
+            workflow="relax_scf_dos",
+            encut_strategy="auto",
+            encut_value=None,
+            k_mode="kpoints",
+            kspacing=None,
+            kgrid=(6, 6, 6),
+            use_slurm=False,
+            np=max(1, self._int_from_var(self.mpi_np, 8)),
+            slurm={},
+            figure_style=style,
+            emit_report=True,
+        )
+        self.apply_profile_to_project(profile, project_path=candidate)
+        write_text(candidate / "POSCAR", EXAMPLE_SI_POSCAR)
+        write_text(candidate / "INCAR", EXAMPLE_SI_INCAR)
+        write_text(candidate / "KPOINTS", EXAMPLE_SI_KPOINTS)
+        self.load_project_inputs()
+        self._create_example_figures(candidate, style)
+        return candidate
+
+    def on_create_example_project(self):
+        try:
+            path = self.create_example_project()
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"示例项目创建失败：{exc}")
+            return
+        messagebox.showinfo(APP_NAME, f"示例项目已创建：{path}")
+
+    def _create_example_figures(self, proj: Path, style: str) -> None:
+        fig_dir = proj / "figures"
+        plots_dir = proj / "plots"
+        fig_dir.mkdir(parents=True, exist_ok=True)
+        plots_dir.mkdir(parents=True, exist_ok=True)
+
+        energies = [i * 0.1 for i in range(-40, 41)]
+        dos_vals = [max(0.0, 6.0 * math.exp(-((e) / 0.9) ** 2) - 0.15) for e in energies]
+        fig = Figure(figsize=(4.0, 3.0), dpi=150)
+        ax = fig.add_subplot(111)
+        lw = FIG_STYLES.get(style, FIG_STYLES["AFM"]).get("linew", 1.2)
+        ax.plot(energies, dos_vals, color="#1f77b4", linewidth=lw)
+        ax.axvline(0.0, color="#444444", linestyle="--", linewidth=0.9)
+        ax.set_xlabel("Energy (eV)")
+        ax.set_ylabel("Total DOS (states/eV)")
+        ax.set_title("Example DOS")
+        apply_style(ax, style)
+        fig.tight_layout()
+        dos_png = fig_dir / "dos_demo.png"
+        dos_svg = fig_dir / "dos_demo.svg"
+        fig.savefig(dos_png, dpi=300)
+        fig.savefig(dos_svg)
+        with (fig_dir / "dos_demo.csv").open("w", encoding="utf-8") as f:
+            f.write("energy_eV,total_dos\n")
+            for e, d in zip(energies, dos_vals):
+                f.write(f"{e:.3f},{d:.6f}\n")
+
+        k_points = [i / 10 for i in range(11)]
+        valence = [-0.5 + 0.25 * math.cos(math.pi * x) for x in k_points]
+        conduction = [0.5 + 0.35 * math.cos(math.pi * x) for x in k_points]
+        gap = min(conduction) - max(valence)
+        fig2 = Figure(figsize=(4.0, 3.0), dpi=150)
+        ax2 = fig2.add_subplot(111)
+        ax2.plot(k_points, valence, color="#d62728", linewidth=lw)
+        ax2.plot(k_points, conduction, color="#2ca02c", linewidth=lw)
+        ax2.fill_between(k_points, valence, conduction, where=[c > v for c, v in zip(conduction, valence)], color="#cccccc", alpha=0.3)
+        ax2.set_xlabel("k-path (arb.)")
+        ax2.set_ylabel("Energy (eV)")
+        ax2.set_title("Example Bands")
+        ax2.text(0.02, 0.9, f"Gap ≈ {gap:.2f} eV", transform=ax2.transAxes)
+        ax2.axhline(0.0, color="#444444", linestyle="--", linewidth=0.9)
+        apply_style(ax2, style)
+        fig2.tight_layout()
+        band_png = fig_dir / "bands_demo.png"
+        band_svg = fig_dir / "bands_demo.svg"
+        fig2.savefig(band_png, dpi=300)
+        fig2.savefig(band_svg)
+        with (fig_dir / "bands_demo.csv").open("w", encoding="utf-8") as f:
+            f.write("k_index,valence_eV,conduction_eV\n")
+            for idx, (k, v, c) in enumerate(zip(k_points, valence, conduction)):
+                f.write(f"{idx},{v:.6f},{c:.6f}\n")
+
+        try:
+            shutil.copyfile(dos_png, plots_dir / dos_png.name)
+        except Exception:
+            pass
+        try:
+            shutil.copyfile(band_png, plots_dir / band_png.name)
+        except Exception:
+            pass
+
+        manifest = {"figures": [
+            {"name": "dos_demo", "files": {"png": dos_png.name, "svg": dos_svg.name, "csv": "dos_demo.csv"}},
+            {"name": "bands_demo", "files": {"png": band_png.name, "svg": band_svg.name, "csv": "bands_demo.csv"}},
+        ]}
+        (fig_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _ensure_project_scaffold(self, proj: Path) -> None:
+        for name in ("plots", "snapshots", "figures", "reports"):
+            try:
+                (proj / name).mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
 
     def open_into_editor(self, name: str, editor: tk.Text):
         proj = self.current_project_path()
@@ -1964,6 +2314,8 @@ nice -n 5 ionice -c2 -n4 \
         self.pot_dir_var.set(data.get("pot_dir", self.pot_dir_var.get()))
         self.run_mode.set(data.get("run_mode", self.run_mode.get()))
         self.vasp_cmd.set(data.get("vasp_cmd", self.vasp_cmd.get()))
+        self.figure_style_var.set(data.get("figure_style", self.figure_style_var.get()))
+        self.emit_report_var.set(bool(data.get("emit_report", self.emit_report_var.get())))
         try:
             self.mpi_np.set(int(data.get("mpi_np", self.mpi_np.get())))
         except Exception:
@@ -2005,6 +2357,8 @@ nice -n 5 ionice -c2 -n4 \
             "run_mode": self.run_mode.get(),
             "vasp_cmd": self.vasp_cmd.get(),
             "mpi_np": self._int_from_var(self.mpi_np, 8),
+            "figure_style": self.figure_style_var.get(),
+            "emit_report": bool(self.emit_report_var.get()),
             "slurm_part": self.slurm_part.get(),
             "slurm_time": self.slurm_time.get(),
             "slurm_nodes": self._int_from_var(self.slurm_nodes, 1),
@@ -2574,6 +2928,284 @@ nice -n 5 ionice -c2 -n4 \
             pass
         self.destroy()
         self._stop_following_log()
+
+
+class FirstTimeWizard(tk.Toplevel):
+    def __init__(self, master: VaspGUI):
+        super().__init__(master)
+        self.result: WizardProfile | None = None
+        self.title("首次使用向导")
+        self.transient(master)
+        self.grab_set()
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self.on_cancel)
+
+        self.system_type = tk.StringVar(value="semiconductor")
+        self.workflow = tk.StringVar(value="relax_scf_dos")
+        self.encut_mode = tk.StringVar(value="auto")
+        self.encut_value = tk.StringVar(value="520")
+        self.k_mode = tk.StringVar(value="kspacing")
+        self.kspacing = tk.StringVar(value="0.22")
+        self.kgrid = [tk.IntVar(value=6), tk.IntVar(value=6), tk.IntVar(value=6)]
+        self.use_slurm = tk.BooleanVar(value=False)
+        self.np_var = tk.StringVar(value=str(max(1, master._int_from_var(master.mpi_np, 8))))
+        self.slurm_part = tk.StringVar(value=master.slurm_part.get())
+        self.slurm_time = tk.StringVar(value=master.slurm_time.get())
+        self.slurm_nodes = tk.StringVar(value=str(master.slurm_nodes.get()))
+        self.slurm_ntasks = tk.StringVar(value=str(master.slurm_ntasks.get()))
+        self.slurm_account = tk.StringVar(value=master.slurm_account.get())
+        self.style_var = tk.StringVar(value=master.figure_style_var.get())
+        self.emit_report = tk.BooleanVar(value=bool(master.emit_report_var.get()))
+
+        container = ttk.Frame(self, padding=12)
+        container.pack(fill=tk.BOTH, expand=True)
+        self.step_var = tk.StringVar(value="步骤 1/5")
+        ttk.Label(container, textvariable=self.step_var, font=("", 12, "bold")).pack(anchor=tk.W, pady=(0, 8))
+
+        self.stack = ttk.Frame(container)
+        self.stack.pack(fill=tk.BOTH, expand=True)
+        self.pages: list[ttk.Frame] = []
+        self.slurm_widgets: list[ttk.Widget] = []
+        self.pages.append(self._build_system_page())
+        self.pages.append(self._build_workflow_page())
+        self.pages.append(self._build_precision_page())
+        self.pages.append(self._build_resource_page())
+        self.pages.append(self._build_output_page())
+
+        nav = ttk.Frame(container)
+        nav.pack(fill=tk.X, pady=(12, 0))
+        self.btn_prev = ttk.Button(nav, text="上一步", command=self.on_prev)
+        self.btn_prev.pack(side=tk.LEFT)
+        self.btn_cancel = ttk.Button(nav, text="取消", command=self.on_cancel)
+        self.btn_cancel.pack(side=tk.RIGHT)
+        self.btn_finish = ttk.Button(nav, text="完成", command=self.on_finish)
+        self.btn_finish.pack(side=tk.RIGHT, padx=6)
+        self.btn_next = ttk.Button(nav, text="下一步", command=self.on_next)
+        self.btn_next.pack(side=tk.RIGHT)
+
+        self.current_index = 0
+        self._update_page()
+        self._center_on_parent(master)
+
+    def _center_on_parent(self, master):
+        try:
+            self.update_idletasks()
+            w = self.winfo_width()
+            h = self.winfo_height()
+            x = master.winfo_rootx() + (master.winfo_width() - w) // 2
+            y = master.winfo_rooty() + (master.winfo_height() - h) // 2
+            self.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
+    def _build_system_page(self) -> ttk.Frame:
+        frame = ttk.Frame(self.stack)
+        ttk.Label(frame, text="选择体系类型：").pack(anchor=tk.W)
+        options = [
+            ("metal", "金属（ISMEAR=1, SIGMA≈0.2）"),
+            ("semiconductor", "半导体（ISMEAR=0, SIGMA≈0.05）"),
+            ("insulator", "绝缘体（ISMEAR=0, SIGMA≈0.05）"),
+        ]
+        for value, text in options:
+            ttk.Radiobutton(frame, text=text, value=value, variable=self.system_type).pack(anchor=tk.W, pady=2)
+        ttk.Label(frame, text="该设置用于推荐展宽参数。", foreground="#555555").pack(anchor=tk.W, pady=(6, 0))
+        return frame
+
+    def _build_workflow_page(self) -> ttk.Frame:
+        frame = ttk.Frame(self.stack)
+        ttk.Label(frame, text="选择计算流程：").pack(anchor=tk.W)
+        for value, text in [
+            ("relax_scf_dos", "Relax → SCF → DOS"),
+            ("relax_scf_bands", "Relax → SCF → Bands"),
+            ("scf_dos", "SCF → DOS"),
+        ]:
+            ttk.Radiobutton(frame, text=text, value=value, variable=self.workflow).pack(anchor=tk.W, pady=2)
+        ttk.Label(frame, text="流程将决定生成的脚本与建议。", foreground="#555555").pack(anchor=tk.W, pady=(6, 0))
+        return frame
+
+    def _build_precision_page(self) -> ttk.Frame:
+        frame = ttk.Frame(self.stack)
+        ttk.Label(frame, text="设置精度与 K 网格：").pack(anchor=tk.W)
+        encut_box = ttk.LabelFrame(frame, text="ENCUT")
+        encut_box.pack(fill=tk.X, pady=4)
+        ttk.Radiobutton(encut_box, text="自动（1.3×ENMAX_max）", value="auto", variable=self.encut_mode, command=self._update_state).pack(anchor=tk.W)
+        ttk.Radiobutton(encut_box, text="手动指定", value="manual", variable=self.encut_mode, command=self._update_state).pack(anchor=tk.W)
+        row = ttk.Frame(encut_box)
+        row.pack(anchor=tk.W, pady=4)
+        ttk.Label(row, text="ENCUT (eV):").pack(side=tk.LEFT)
+        self.encut_entry = ttk.Entry(row, textvariable=self.encut_value, width=8)
+        self.encut_entry.pack(side=tk.LEFT, padx=4)
+
+        k_box = ttk.LabelFrame(frame, text="K 网格")
+        k_box.pack(fill=tk.X, pady=4)
+        ttk.Radiobutton(k_box, text="使用 KSPACING", value="kspacing", variable=self.k_mode, command=self._update_state).pack(anchor=tk.W)
+        ks_row = ttk.Frame(k_box)
+        ks_row.pack(anchor=tk.W, pady=4)
+        ttk.Label(ks_row, text="KSPACING:").pack(side=tk.LEFT)
+        self.kspacing_entry = ttk.Entry(ks_row, textvariable=self.kspacing, width=8)
+        self.kspacing_entry.pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(k_box, text="使用 Monkhorst-Pack 网格", value="kpoints", variable=self.k_mode, command=self._update_state).pack(anchor=tk.W, pady=(6, 0))
+        grid_row = ttk.Frame(k_box)
+        grid_row.pack(anchor=tk.W, pady=4)
+        for label, var in zip(["Nx", "Ny", "Nz"], self.kgrid):
+            ttk.Label(grid_row, text=label).pack(side=tk.LEFT, padx=(0, 2))
+            ttk.Spinbox(grid_row, from_=1, to=24, textvariable=var, width=4).pack(side=tk.LEFT, padx=(0, 6))
+        if not HAS_SEEKPATH:
+            ttk.Label(k_box, text="未检测到 seekpath，建议优先使用 KSPACING。", foreground="#aa5500").pack(anchor=tk.W, pady=(4, 0))
+        return frame
+
+    def _build_resource_page(self) -> ttk.Frame:
+        frame = ttk.Frame(self.stack)
+        ttk.Label(frame, text="配置资源：").pack(anchor=tk.W)
+        row = ttk.Frame(frame)
+        row.pack(anchor=tk.W, pady=4)
+        ttk.Label(row, text="本地核数 (-np):").pack(side=tk.LEFT)
+        self.np_entry = ttk.Entry(row, textvariable=self.np_var, width=6)
+        self.np_entry.pack(side=tk.LEFT, padx=4)
+        ttk.Checkbutton(frame, text="使用 SLURM 集群", variable=self.use_slurm, command=self._update_state).pack(anchor=tk.W, pady=(6, 4))
+        slurm_box = ttk.LabelFrame(frame, text="SLURM")
+        slurm_box.pack(fill=tk.X, pady=4)
+        for label, var in [
+            ("分区", self.slurm_part),
+            ("时长", self.slurm_time),
+            ("节点", self.slurm_nodes),
+            ("ntasks", self.slurm_ntasks),
+            ("账号", self.slurm_account),
+        ]:
+            r = ttk.Frame(slurm_box)
+            r.pack(anchor=tk.W, pady=2)
+            ttk.Label(r, text=label + "：").pack(side=tk.LEFT)
+            entry = ttk.Entry(r, textvariable=var, width=12)
+            entry.pack(side=tk.LEFT, padx=4)
+            self.slurm_widgets.append(entry)
+        if not shutil.which("squeue"):
+            ttk.Label(slurm_box, text="未检测到 SLURM 命令，提交功能可能不可用。", foreground="#aa5500").pack(anchor=tk.W, pady=(4, 0))
+        return frame
+
+    def _build_output_page(self) -> ttk.Frame:
+        frame = ttk.Frame(self.stack)
+        ttk.Label(frame, text="输出选项：").pack(anchor=tk.W)
+        ttk.Label(frame, text="期刊风格：").pack(anchor=tk.W)
+        ttk.Combobox(frame, values=list(FIG_STYLES.keys()), textvariable=self.style_var, state="readonly").pack(anchor=tk.W, pady=2)
+        ttk.Checkbutton(frame, text="生成复现报告", variable=self.emit_report).pack(anchor=tk.W, pady=(6, 2))
+        if not HAS_PYMATGEN:
+            ttk.Label(frame, text="未检测到 pymatgen，高级结构功能将关闭。", foreground="#aa5500").pack(anchor=tk.W, pady=(6, 0))
+        return frame
+
+    def _update_state(self):
+        self.encut_entry.configure(state=tk.NORMAL if self.encut_mode.get() == "manual" else tk.DISABLED)
+        self.kspacing_entry.configure(state=tk.NORMAL if self.k_mode.get() == "kspacing" else tk.DISABLED)
+        for widget in self.slurm_widgets:
+            try:
+                widget.configure(state=tk.NORMAL if self.use_slurm.get() else tk.DISABLED)
+            except Exception:
+                pass
+
+    def _update_page(self):
+        for page in self.pages:
+            page.pack_forget()
+        page = self.pages[self.current_index]
+        page.pack(fill=tk.BOTH, expand=True)
+        self.step_var.set(f"步骤 {self.current_index + 1}/5")
+        self.btn_prev.configure(state=tk.NORMAL if self.current_index > 0 else tk.DISABLED)
+        if self.current_index >= len(self.pages) - 1:
+            self.btn_next.configure(state=tk.DISABLED)
+            self.btn_finish.configure(state=tk.NORMAL)
+        else:
+            self.btn_next.configure(state=tk.NORMAL)
+            self.btn_finish.configure(state=tk.DISABLED)
+        self._update_state()
+
+    def _validate_page(self) -> bool:
+        if self.current_index == 2 and self.k_mode.get() == "kspacing":
+            try:
+                float(self.kspacing.get())
+            except Exception:
+                messagebox.showerror(APP_NAME, "KSPACING 需为数字")
+                return False
+        if self.current_index == 3:
+            try:
+                int(self.np_var.get())
+            except Exception:
+                messagebox.showerror(APP_NAME, "-np 需为正整数")
+                return False
+        return True
+
+    def on_next(self):
+        if not self._validate_page():
+            return
+        if self.current_index < len(self.pages) - 1:
+            self.current_index += 1
+            self._update_page()
+
+    def on_prev(self):
+        if self.current_index > 0:
+            self.current_index -= 1
+            self._update_page()
+
+    def on_cancel(self):
+        self.result = None
+        self.destroy()
+
+    def on_finish(self):
+        if not self._validate_page():
+            return
+        try:
+            np_total = int(self.np_var.get())
+            if np_total <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror(APP_NAME, "-np 需为正整数")
+            return
+        encut_val = None
+        if self.encut_mode.get() == "manual":
+            try:
+                encut_val = int(self.encut_value.get())
+            except Exception:
+                messagebox.showerror(APP_NAME, "请输入合法的 ENCUT 数值")
+                return
+        kspacing_val = None
+        kgrid_val = None
+        if self.k_mode.get() == "kspacing":
+            try:
+                kspacing_val = float(self.kspacing.get())
+            except Exception:
+                messagebox.showerror(APP_NAME, "KSPACING 需为数字")
+                return
+        else:
+            kgrid_val = tuple(int(var.get()) for var in self.kgrid)
+        slurm_cfg: Dict[str, Any] = {
+            "partition": self.slurm_part.get(),
+            "time": self.slurm_time.get(),
+            "nodes": self._safe_int(self.slurm_nodes.get(), 1),
+            "ntasks": self._safe_int(self.slurm_ntasks.get(), np_total),
+            "account": self.slurm_account.get(),
+        }
+        profile = WizardProfile(
+            system_type=self.system_type.get(),
+            workflow=self.workflow.get(),
+            encut_strategy=self.encut_mode.get(),
+            encut_value=encut_val,
+            k_mode=self.k_mode.get(),
+            kspacing=kspacing_val,
+            kgrid=kgrid_val,
+            use_slurm=bool(self.use_slurm.get()),
+            np=np_total,
+            slurm=slurm_cfg,
+            figure_style=self.style_var.get() or "AFM",
+            emit_report=bool(self.emit_report.get()),
+        )
+        self.result = profile
+        self.destroy()
+
+    def _safe_int(self, value: str, default: int) -> int:
+        try:
+            num = int(value)
+            return num if num > 0 else default
+        except Exception:
+            return default
+
+
 
 
 if __name__ == "__main__":
