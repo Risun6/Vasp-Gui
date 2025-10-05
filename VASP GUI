@@ -2133,7 +2133,7 @@ class SystemStatsMonitor(threading.Thread):
         loadavg = self._loadavg()
         files = self._file_stats()
         procs = self._process_stats()
-        run_state, run_pids, suggestions = self._run_status(procs, files)
+        run_state, run_pids, suggestions, run_elapsed = self._run_status(procs, files)
         return {
             "timestamp": timestamp,
             "cpu_usage": cpu_usage,
@@ -2143,6 +2143,7 @@ class SystemStatsMonitor(threading.Thread):
             "run_state": run_state,
             "run_pids": run_pids,
             "suggestions": suggestions,
+            "run_elapsed": run_elapsed,
         }
 
     def _cpu_usage_percent(self) -> float | None:
@@ -2216,13 +2217,13 @@ class SystemStatsMonitor(threading.Thread):
         # 限制输出 + 超时，避免在某些系统里 ps 卡住
         try:
             out = subprocess.check_output(
-                ["bash", "-lc", "ps -eo pid,%cpu,%mem,cmd --sort=-%cpu | head -n 6"],
+                ["bash", "-lc", "ps -eo pid,etimes,%cpu,%mem,cmd --sort=-%cpu | head -n 6"],
                 text=True, stderr=subprocess.DEVNULL, timeout=2.0
             )
         except Exception:
             try:
                 out = subprocess.check_output(
-                    ["ps", "-eo", "pid,%cpu,%mem,cmd"],
+                    ["ps", "-eo", "pid,etimes,%cpu,%mem,cmd"],
                     text=True, stderr=subprocess.DEVNULL, timeout=2.0
                 )
                 out = "\n".join(out.splitlines()[:6])
@@ -2232,11 +2233,18 @@ class SystemStatsMonitor(threading.Thread):
         lines = out.strip().splitlines()
         procs = []
         for line in lines[1:6]:
-            parts = line.split(None, 3)
-            if len(parts) < 3:
+            parts = line.split(None, 4)
+            if len(parts) < 4:
                 continue
-            pid, cpu, mem = parts[0], parts[1], parts[2]
-            cmd_full = parts[3] if len(parts) >= 4 else ""
+            pid = parts[0]
+            elapsed_str = parts[1] if len(parts) >= 2 else ""
+            cpu = parts[2] if len(parts) >= 3 else ""
+            mem = parts[3] if len(parts) >= 4 else ""
+            cmd_full = parts[4] if len(parts) >= 5 else ""
+            try:
+                elapsed = int(elapsed_str)
+            except Exception:
+                elapsed = None
             cwd = self._proc_cwd(pid)
 
             in_project = False
@@ -2259,6 +2267,7 @@ class SystemStatsMonitor(threading.Thread):
                 "pid": pid, "cmd": cmd_full.strip(),
                 "cpu": cpu, "mem": mem,
                 "is_vasp": is_vasp, "cwd": cwd, "in_project": in_project,
+                "elapsed": elapsed,
             })
         return procs
 
@@ -2269,12 +2278,19 @@ class SystemStatsMonitor(threading.Thread):
         except Exception:
             return None
 
-    def _run_status(self, procs: list[dict], files: list[dict]) -> tuple[str, list[str], list[str]]:
+    def _run_status(self, procs: list[dict], files: list[dict]) -> tuple[str, list[str], list[str], int | None]:
         run_pids: list[str] = []
         suggestions: list[str] = []
+        run_elapsed: int | None = None
         for proc in procs:
             if proc.get("is_vasp") and proc.get("in_project"):
                 run_pids.append(proc.get("pid", ""))
+                elapsed_val = proc.get("elapsed")
+                if isinstance(elapsed_val, (int, float)):
+                    elapsed_int = int(elapsed_val)
+                    if elapsed_int >= 0:
+                        if run_elapsed is None or elapsed_int > run_elapsed:
+                            run_elapsed = elapsed_int
         run_state = "running" if run_pids else "idle"
         if run_pids:
             suggestions.append(
@@ -2293,7 +2309,7 @@ class SystemStatsMonitor(threading.Thread):
                     suggestions.append(f"{short} 暂未增长，可稍后再次检查。")
         if len(suggestions) > 5:
             suggestions = suggestions[:5]
-        return run_state, run_pids, suggestions
+        return run_state, run_pids, suggestions, run_elapsed
 
     @classmethod
     def snapshot(cls, workdir: Path, watch_files: list[str] | None) -> dict:
@@ -6024,6 +6040,17 @@ nice -n 5 ionice -c2 -n4 \
         self.project_dir = proj
         return proj
 
+    @staticmethod
+    def _format_elapsed(seconds: Any) -> str:
+        if not isinstance(seconds, (int, float)):
+            return ""
+        total = int(seconds)
+        if total < 0:
+            return ""
+        hours, rem = divmod(total, 3600)
+        minutes, secs = divmod(rem, 60)
+        return f"已运行 {hours:02d}:{minutes:02d}:{secs:02d}"
+
     def apply_run_status(self, status_text: str, suggestions: list[str] | None = None):
         self.run_status_var.set(status_text)
         text = "暂无建议。"
@@ -6072,8 +6099,13 @@ nice -n 5 ionice -c2 -n4 \
     def _handle_stats(self, stats: dict):
         run_state = stats.get("run_state")
         run_pids = stats.get("run_pids", [])
+        run_elapsed = stats.get("run_elapsed")
+        elapsed_text = self._format_elapsed(run_elapsed)
         if run_state == "running" and run_pids:
-            status = f"   运行中 (PID {', '.join(run_pids)})"
+            if elapsed_text:
+                status = f"   运行中（{elapsed_text}，PID {', '.join(run_pids)}）"
+            else:
+                status = f"   运行中 (PID {', '.join(run_pids)})"
         elif run_state == "idle":
             status = "⚪ 未检测到 VASP 进程"
         else:
