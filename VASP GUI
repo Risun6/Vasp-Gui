@@ -3430,12 +3430,12 @@ class VaspGUI(tk.Tk):
         row = ttk.Frame(left); row.pack(fill=tk.X, pady=2)
         ttk.Label(row, text="上层 POSCAR:").pack(side=tk.LEFT)
         ttk.Entry(row, textvariable=self.tw_top_path, width=44).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row, text="选择…", command=lambda: self._tw_pick_poscar(self.tw_top_path)).pack(side=tk.LEFT)
+        ttk.Button(row, text="选择...", command=lambda: self._tw_pick_poscar(self.tw_top_path)).pack(side=tk.LEFT)
 
         row = ttk.Frame(left); row.pack(fill=tk.X, pady=2)
         ttk.Label(row, text="下层 POSCAR:").pack(side=tk.LEFT)
         ttk.Entry(row, textvariable=self.tw_bot_path, width=44).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row, text="选择…", command=lambda: self._tw_pick_poscar(self.tw_bot_path)).pack(side=tk.LEFT)
+        ttk.Button(row, text="选择...", command=lambda: self._tw_pick_poscar(self.tw_bot_path)).pack(side=tk.LEFT)
 
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
@@ -4454,11 +4454,11 @@ class VaspGUI(tk.Tk):
         top.pack(fill=tk.X)
         ttk.Label(top, text="上层 POSCAR:").pack(side=tk.LEFT)
         ttk.Entry(top, textvariable=self.tw_top_path, width=48).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="选择…", command=self._tw_choose_top).pack(side=tk.LEFT)
+        ttk.Button(top, text="选择...", command=self._tw_choose_top).pack(side=tk.LEFT)
 
         ttk.Label(top, text="  下层 POSCAR:").pack(side=tk.LEFT, padx=(8, 0))
         ttk.Entry(top, textvariable=self.tw_bot_path, width=48).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="选择…", command=self._tw_choose_bot).pack(side=tk.LEFT)
+        ttk.Button(top, text="选择...", command=self._tw_choose_bot).pack(side=tk.LEFT)
 
         # 第二行：扫参目录 + 快捷按钮
         row2 = ttk.Frame(frame)
