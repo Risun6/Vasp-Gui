@@ -43,6 +43,7 @@ import hashlib
 import datetime as _dt
 import pickle
 import tempfile
+from functools import partial
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Literal, Callable
@@ -201,6 +202,108 @@ FIG_STYLES: Dict[str, Dict[str, Any]] = {
 }
 
 POST_FIG_DPI = 240
+
+
+@dataclass
+class PreflightItem:
+    level: Literal["ok", "warn", "error", "info"]
+    title: str
+    detail: str
+    fix: Optional[Callable[[], None]] = None
+    fix_label: Optional[str] = None
+    auto: bool = True
+
+
+KEY_CORRECTIONS = {
+    "ISPINN": "ISPIN",
+    "ENCUTT": "ENCUT",
+    "SIGMMA": "SIGMA",
+    "MAGMOMM": "MAGMOM",
+    "IDIPLOL": "IDIPOL",
+}
+
+
+TW_TEMPLATE_LIBRARY: dict[str, dict[str, Any]] = {
+    "graphene_bn": {
+        "label": "石墨烯 / h-BN（六角）",
+        "summary": "典型蜂窝晶格，真空 18–20 Å，默认 Γ 中心网格。",
+        "incar": {
+            "ISMEAR": "0",
+            "SIGMA": "0.05",
+            "ISYM": "0",
+            "LDIPOL": ".TRUE.",
+            "IDIPOL": "3",
+            "LCHARG": ".TRUE.",
+            "LWAVE": ".FALSE.",
+        },
+        "kspacing": 0.22,
+        "vacuum": 20.0,
+        "interlayer": 3.35,
+        "allow_strain": 0.8,
+        "gamma_center": True,
+        "notes": "蜂窝晶格默认 0–60°，展宽采用高斯 0.05 eV。",
+    },
+    "mos2_tmd": {
+        "label": "MoS₂ / WS₂（TMD）",
+        "summary": "过渡金属二硫化物常用设定，真空 18–20 Å。",
+        "incar": {
+            "ISMEAR": "0",
+            "SIGMA": "0.05",
+            "ISYM": "0",
+            "EDIFF": "1e-6",
+            "EDIFFG": "-0.02",
+            "LDIPOL": ".TRUE.",
+            "IDIPOL": "3",
+            "LCHARG": ".TRUE.",
+            "LWAVE": ".FALSE.",
+            "IVDW": "12",
+        },
+        "kspacing": 0.24,
+        "vacuum": 20.0,
+        "interlayer": 3.2,
+        "allow_strain": 0.8,
+        "gamma_center": True,
+        "notes": "半导体体系默认高斯展宽 0.05 eV，推荐配合 rVV10 / D3。",
+    },
+    "hetero_moire": {
+        "label": "异质双层 / 莫尔预筛",
+        "summary": "大莫尔超胞初筛，默认 Γ-only 预估，放宽 KSPACING。",
+        "incar": {
+            "ISMEAR": "0",
+            "SIGMA": "0.05",
+            "ISYM": "0",
+            "LDIPOL": ".TRUE.",
+            "IDIPOL": "3",
+            "LREAL": "Auto",
+            "NELM": "120",
+            "ALGO": "Normal",
+            "LCHARG": ".TRUE.",
+            "LWAVE": ".FALSE.",
+        },
+        "kspacing": 0.35,
+        "vacuum": 20.0,
+        "interlayer": 3.3,
+        "allow_strain": 1.0,
+        "gamma_center": True,
+        "force_gamma_only": True,
+        "notes": "原子数巨大的莫尔超胞优先仅 Γ 点，再细化网格。",
+    },
+}
+
+TW_FALLBACK_DEFAULTS = {
+    "vacuum": 20.0,
+    "interlayer": 3.35,
+    "allow_strain": 0.8,
+    "kspacing": 0.22,
+    "ISMEAR": "0",
+    "SIGMA": "0.05",
+    "LDIPOL": ".TRUE.",
+    "IDIPOL": "3",
+    "ENCUT": None,
+    "gamma_center": True,
+    "force_gamma_only": False,
+}
+
 
 
 def _normalize_style(style: str | None) -> str:
@@ -719,8 +822,26 @@ def read_text(p: Path) -> str:
         except Exception:
             return ""
 
+def atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding=encoding) as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
 def write_text(p: Path, s: str) -> None:
-    p.write_text(s, encoding="utf-8")
+    atomic_write_text(p, s, encoding="utf-8")
 
 def format_bytes(num: int | float | None) -> str:
     """将字节数转为易读字符串。"""
@@ -921,7 +1042,7 @@ def _load_cached(workdir: Path, cache_key: str, files: list[Path], builder: Call
         return None
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
-        meta_path.write_text(json.dumps({"fingerprint": fingerprint}, ensure_ascii=False), encoding="utf-8")
+        atomic_write_text(meta_path, json.dumps({"fingerprint": fingerprint}, ensure_ascii=False), encoding="utf-8")
         with data_path.open("wb") as fp:
             pickle.dump(data, fp)
     except Exception:
@@ -2459,6 +2580,7 @@ class VaspGUI(tk.Tk):
         self.run_suggestion_widgets: list[tk.Text] = []
         self.post_results: dict[str, PostResult] = {}
         self.post_latest_reports: dict[str, Path] = {}
+        self.ui_mode = tk.StringVar(value="newbie")
         self.overview_items = [
             ("__project__", "项目目录"),
             ("INCAR", "INCAR"),
@@ -2498,6 +2620,9 @@ class VaspGUI(tk.Tk):
         ttk.Button(toolbar, text="创建示例项目", command=self.on_create_example_project).pack(side=tk.LEFT, padx=4)
         self.demo_mode_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(toolbar, text="演示模式", variable=self.demo_mode_var, command=self.toggle_demo_mode).pack(side=tk.LEFT, padx=6)
+        ttk.Label(toolbar, text="模式:").pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Radiobutton(toolbar, text="新手模式", value="newbie", variable=self.ui_mode).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Radiobutton(toolbar, text="专家模式", value="expert", variable=self.ui_mode).pack(side=tk.LEFT, padx=(4, 8))
 
         # Notebook
         self.nb = ttk.Notebook(self)
@@ -2528,6 +2653,9 @@ class VaspGUI(tk.Tk):
         # === CODEX END: add twist/shift tab ===
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.ui_mode.trace_add("write", lambda *_: self._update_mode_ui())
+        self.after(50, self._update_mode_ui)
 
     def toggle_demo_mode(self):
         if self.demo_mode_var.get():
@@ -2652,6 +2780,27 @@ class VaspGUI(tk.Tk):
 
         _bind_mousewheel(inner)
 
+        style = ttk.Style()
+        style.configure("TwBanner.TFrame", background="#e7f1ff")
+        style.configure("TwBanner.TLabel", background="#e7f1ff", foreground="#0a5cad")
+
+        self.tw_banner_frame = ttk.Frame(inner, padding=8, style="TwBanner.TFrame")
+        self.tw_banner_var = tk.StringVar(value="")
+        banner_label = ttk.Label(
+            self.tw_banner_frame,
+            textvariable=self.tw_banner_var,
+            wraplength=900,
+            justify=tk.LEFT,
+            style="TwBanner.TLabel",
+        )
+        banner_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            self.tw_banner_frame,
+            text="开始二维材料扫描",
+            command=self._tw_launch_wizard,
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+        self._tw_banner_visible = False
+
         paned = ttk.PanedWindow(inner, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
@@ -2659,55 +2808,78 @@ class VaspGUI(tk.Tk):
         left = ttk.Frame(paned, padding=8)
         paned.add(left, weight=1)
 
-        ttk.Label(left, text="INCAR 模板与编辑").pack(anchor=tk.W)
-        temp_bar = ttk.Frame(left)
-        temp_bar.pack(fill=tk.X, pady=4)
+        self.incar_section_label = ttk.Label(left, text="INCAR 模板与编辑")
+        self.incar_section_label.pack(anchor=tk.W)
         self.incar_template = tk.StringVar(value="relax")
+        self.incar_template_bar = ttk.Frame(left)
+        self.incar_template_bar.pack(fill=tk.X, pady=4)
         for key, txt in [
             ("relax", "几何优化"),
             ("static", "静态自洽"),
             ("dos", "态密度"),
             ("bands", "能带预设"),
         ]:
-            ttk.Radiobutton(temp_bar, text=txt, value=key, variable=self.incar_template, command=self.load_incar_template).pack(side=tk.LEFT)
-        ttk.Button(temp_bar, text="加载模板到编辑器", command=self.load_incar_template).pack(side=tk.RIGHT)
+            ttk.Radiobutton(
+                self.incar_template_bar,
+                text=txt,
+                value=key,
+                variable=self.incar_template,
+                command=self.load_incar_template,
+            ).pack(side=tk.LEFT)
+        ttk.Button(self.incar_template_bar, text="加载模板到编辑器", command=self.load_incar_template).pack(side=tk.RIGHT)
 
         # INCAR 简单面板
-        simple_box = ttk.LabelFrame(left, text="INCAR 简单面板")
-        simple_box.pack(fill=tk.X, pady=4)
+        self.incar_simple_box = ttk.LabelFrame(left, text="INCAR 关键旋钮（新手模式）")
+        self.incar_simple_box.pack(fill=tk.X, pady=4)
         self.incar_simple_vars: dict[str, tk.StringVar] = {}
         simple_items = [
             ("ENCUT", "ENCUT (eV)"),
-            ("EDIFF", "EDIFF"),
-            ("EDIFFG", "EDIFFG"),
+            ("KSPACING", "KSPACING (Å⁻¹)"),
             ("ISMEAR", "ISMEAR"),
             ("SIGMA", "SIGMA"),
-            ("KSPACING", "KSPACING"),
-            ("NSW", "NSW"),
+            ("EDIFF", "EDIFF"),
+            ("EDIFFG", "EDIFFG"),
+            ("ISPIN", "ISPIN"),
+            ("MAGMOM", "MAGMOM"),
+            ("LREAL", "LREAL"),
         ]
         for idx, (key, label) in enumerate(simple_items):
             row = idx // 2
             col = idx % 2
-            frame_cell = ttk.Frame(simple_box)
+            frame_cell = ttk.Frame(self.incar_simple_box)
             frame_cell.grid(row=row, column=col, sticky="ew", padx=4, pady=2)
             ttk.Label(frame_cell, text=label + ":").pack(side=tk.LEFT)
             var = tk.StringVar()
             self.incar_simple_vars[key] = var
-            entry = ttk.Entry(frame_cell, textvariable=var, width=12)
+            entry = ttk.Entry(frame_cell, textvariable=var, width=14)
             entry.pack(side=tk.LEFT, padx=4)
         for i in range(2):
-            simple_box.grid_columnconfigure(i, weight=1)
-        btn_row = ttk.Frame(simple_box)
+            self.incar_simple_box.grid_columnconfigure(i, weight=1)
+        btn_row = ttk.Frame(self.incar_simple_box)
         btn_row.grid(row=(len(simple_items)+1)//2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         ttk.Button(btn_row, text="从编辑器读取", command=self.refresh_incar_simple_panel).pack(side=tk.LEFT)
         ttk.Button(btn_row, text="写入到编辑器", command=self.apply_incar_simple_panel).pack(side=tk.LEFT, padx=6)
 
-        self.incar_text = ScrolledText(left, height=20, undo=True, wrap="none")
+        self.incar_advanced_frame = ttk.Frame(left)
+        self.incar_advanced_frame.pack(fill=tk.BOTH, expand=True)
+        self.incar_text = ScrolledText(self.incar_advanced_frame, height=20, undo=True, wrap="none")
         self.incar_text.pack(fill=tk.BOTH, expand=True)
-        btns = ttk.Frame(left)
+        btns = ttk.Frame(self.incar_advanced_frame)
         btns.pack(fill=tk.X, pady=4)
         ttk.Button(btns, text="打开现有 INCAR", command=lambda: self.open_into_editor("INCAR", self.incar_text)).pack(side=tk.LEFT)
         ttk.Button(btns, text="保存到项目", command=lambda: self.save_from_editor("INCAR", self.incar_text)).pack(side=tk.LEFT, padx=6)
+
+        # 记录 pack 参数以便模式切换时恢复
+        try:
+            self._incar_template_pack_opts = self.incar_template_bar.pack_info()
+            self._incar_template_pack_opts.pop("in", None)
+        except Exception:
+            self._incar_template_pack_opts = {"fill": tk.X, "pady": 4}
+        try:
+            self._incar_advanced_pack_opts = self.incar_advanced_frame.pack_info()
+            self._incar_advanced_pack_opts.pop("in", None)
+        except Exception:
+            self._incar_advanced_pack_opts = {"fill": tk.BOTH, "expand": True}
 
         # 右边：POSCAR & KPOINTS 编辑
         right = ttk.Frame(paned, padding=8)
@@ -2724,7 +2896,7 @@ class VaspGUI(tk.Tk):
 
         ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
-        ttk.Label(right, text="KPOINTS 编辑（可在K 点生成页自动生成）").pack(anchor=tk.W)
+        ttk.Label(right, text="K 点设置（可改为 KSPACING 自动生成）").pack(anchor=tk.W)
         self.kpoints_text = ScrolledText(right, height=10, undo=True, wrap="none")
         self.kpoints_text.pack(fill=tk.BOTH, expand=True)
         row2 = ttk.Frame(right)
@@ -2747,6 +2919,7 @@ class VaspGUI(tk.Tk):
         # 默认加载模板并同步简单面板
         self.load_incar_template()
         self.refresh_incar_simple_panel()
+        self._update_tw_entry_banner()
         return frame
 
     def load_incar_template(self):
@@ -2776,12 +2949,19 @@ class VaspGUI(tk.Tk):
         values: dict[str, str] = {}
         for line in text.splitlines():
             stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
+            if not stripped or stripped.startswith("#") or stripped.startswith("!"):
                 continue
             m = re.match(r"([A-Za-z0-9_+-]+)\s*=\s*(.+)", stripped)
             if m:
-                key = m.group(1).upper()
-                values[key] = m.group(2).strip()
+                key_raw = m.group(1).upper()
+                key = KEY_CORRECTIONS.get(key_raw, key_raw)
+                val = m.group(2)
+                for sep in ("!", "#"):
+                    idx = val.find(sep)
+                    if idx != -1:
+                        val = val[:idx]
+                        break
+                values[key] = val.strip()
         for key, var in self.incar_simple_vars.items():
             var.set(values.get(key, ""))
 
@@ -2798,31 +2978,111 @@ class VaspGUI(tk.Tk):
         self.incar_text.insert("1.0", new_text)
         self.refresh_incar_simple_panel()
 
+    def _update_mode_ui(self):
+        mode = getattr(self, "ui_mode", None)
+        mode_val = "newbie"
+        if mode is not None:
+            mode_val = mode.get()
+        simple_box = getattr(self, "incar_simple_box", None)
+        template_bar = getattr(self, "incar_template_bar", None)
+        section_label = getattr(self, "incar_section_label", None)
+        advanced_frame = getattr(self, "incar_advanced_frame", None)
+        template_pack = getattr(self, "_incar_template_pack_opts", {})
+        advanced_pack = getattr(self, "_incar_advanced_pack_opts", {})
+
+        if simple_box:
+            title = "INCAR 关键旋钮（新手模式）" if mode_val == "newbie" else "INCAR 简单面板（与编辑器同步）"
+            try:
+                simple_box.configure(text=title)
+            except Exception:
+                pass
+        if section_label:
+            try:
+                section_label.configure(
+                    text="INCAR 新手面板" if mode_val == "newbie" else "INCAR 模板与编辑"
+                )
+            except Exception:
+                pass
+
+        if mode_val == "newbie":
+            if template_bar and template_bar.winfo_manager():
+                template_bar.pack_forget()
+            if advanced_frame and advanced_frame.winfo_manager():
+                advanced_frame.pack_forget()
+        else:
+            if template_bar and not template_bar.winfo_manager():
+                template_bar.pack(**template_pack)
+            if advanced_frame and not advanced_frame.winfo_manager():
+                advanced_frame.pack(**advanced_pack)
+
     @staticmethod
-    def _update_incar_text(text: str, updates: dict[str, str]) -> str:
-        keys = {k.upper(): v for k, v in updates.items()}
+    def _update_incar_text(text: str, updates: dict[str, Optional[str]]) -> str:
+        normalized_updates: dict[str, str] = {}
+        removals_exact: set[str] = set()
+        for key, value in updates.items():
+            if key is None:
+                continue
+            key_clean = key.upper().strip()
+            key_norm = KEY_CORRECTIONS.get(key_clean, key_clean)
+            if value is None or (isinstance(value, str) and value.strip() == ""):
+                removals_exact.add(key_clean)
+                continue
+            normalized_updates[key_norm] = value
+            if key_clean != key_norm:
+                removals_exact.add(key_clean)
+
         lines = text.splitlines()
         new_lines: list[str] = []
-        handled: set[str] = set()
+        handled_keys: set[str] = set()
+
         for line in lines:
             stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
+            if not stripped or stripped.startswith("#") or stripped.startswith("!"):
                 new_lines.append(line)
                 continue
-            m = re.match(r"([A-Za-z0-9_+-]+)\s*=", stripped)
-            if m:
-                key = m.group(1).upper()
-                if key in keys:
-                    val = keys[key]
-                    if val:
-                        new_lines.append(f"{key} = {val}")
-                    handled.add(key)
+            m = re.match(r"^(\s*)([A-Za-z0-9_+-]+)\s*=\s*(.*)$", line)
+            if not m:
+                new_lines.append(line)
+                continue
+            lead, key_token, value_part = m.groups()
+            key_clean = key_token.upper()
+            key_norm = KEY_CORRECTIONS.get(key_clean, key_clean)
+            comment = ""
+            value_body = value_part
+            for sep in ("!", "#"):
+                idx = value_body.find(sep)
+                if idx != -1:
+                    comment = value_body[idx:].strip()
+                    value_body = value_body[:idx]
+                    break
+
+            if key_clean in removals_exact:
+                handled_keys.add(key_norm)
+                continue
+
+            if key_norm in normalized_updates:
+                if key_norm in handled_keys:
                     continue
-            new_lines.append(line)
-        for key, val in keys.items():
-            if not val or key in handled:
+                new_val = normalized_updates[key_norm]
+                line_out = f"{lead}{key_norm} = {new_val.strip()}"
+                if comment:
+                    if not line_out.endswith(" "):
+                        line_out += " "
+                    line_out += comment
+                new_lines.append(line_out)
+                handled_keys.add(key_norm)
+            else:
+                if key_norm in handled_keys:
+                    continue
+                new_lines.append(line)
+                handled_keys.add(key_norm)
+
+        for key, val in normalized_updates.items():
+            if not val or key in handled_keys:
                 continue
             new_lines.append(f"{key} = {val}")
+            handled_keys.add(key)
+
         result = "\n".join(new_lines)
         if result and not result.endswith("\n"):
             result += "\n"
@@ -3031,7 +3291,7 @@ class VaspGUI(tk.Tk):
             {"name": "dos_demo", "files": {"png": dos_png.name, "svg": dos_svg.name, "csv": "dos_demo.csv"}},
             {"name": "bands_demo", "files": {"png": band_png.name, "svg": band_svg.name, "csv": "bands_demo.csv"}},
         ]}
-        (fig_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_text(fig_dir / "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _ensure_project_scaffold(self, proj: Path) -> None:
         for name in ("plots", "snapshots", "figures", "reports"):
@@ -3275,7 +3535,7 @@ class VaspGUI(tk.Tk):
         ttk.Spinbox(row, from_=1, to=50, textvariable=self.k_ny, width=5).pack(side=tk.LEFT, padx=6)
         ttk.Label(row, text="Nz").pack(side=tk.LEFT)
         ttk.Spinbox(row, from_=1, to=50, textvariable=self.k_nz, width=5).pack(side=tk.LEFT, padx=6)
-        ttk.Checkbutton(box, text="Gamma 中心", variable=self.k_gamma).pack(anchor=tk.W, padx=8)
+        ttk.Checkbutton(box, text="Gamma 中心网格 (Gamma-centered)", variable=self.k_gamma).pack(anchor=tk.W, padx=8)
 
         btns = ttk.Frame(container)
         btns.pack(fill=tk.X, padx=8, pady=4)
@@ -3338,6 +3598,1111 @@ class VaspGUI(tk.Tk):
         ttk.Label(row, text=caption, font=("TkDefaultFont", 10, "bold")).pack(side=tk.LEFT)
         self._add_help_button(row, title or caption, help_text)
         return row
+
+    def _tw_detect_structure_context(self) -> dict[str, Any]:
+        context: dict[str, Any] = {
+            "is_slab": False,
+            "vacuum": None,
+            "c_length": None,
+            "elements": [],
+            "source": None,
+        }
+        candidates: list[tuple[str, Path]] = []
+        for attr in ("tw_top_path", "tw_bot_path"):
+            var = getattr(self, attr, None)
+            if isinstance(var, tk.StringVar):
+                try:
+                    p = Path(var.get())
+                except Exception:
+                    continue
+                if p.exists():
+                    candidates.append((attr, p))
+        proj_poscar = self.current_project_path() / "POSCAR"
+        if not candidates and proj_poscar.exists():
+            candidates.append(("project", proj_poscar))
+
+        poscar_text = ""
+        source_label: Optional[str] = None
+        for tag, path in candidates:
+            try:
+                poscar_text = read_text(path)
+                source_label = str(path)
+                break
+            except Exception:
+                continue
+        if not poscar_text and getattr(self, "poscar_text", None) is not None:
+            try:
+                poscar_text = self.poscar_text.get("1.0", tk.END)
+                source_label = "编辑器中的 POSCAR"
+            except Exception:
+                poscar_text = ""
+
+        if poscar_text.strip():
+            elems, _ = parse_poscar(poscar_text)
+            if elems:
+                context["elements"] = elems
+        if source_label:
+            context["source"] = source_label
+
+        if HAS_PYMATGEN and poscar_text.strip():
+            try:
+                from pymatgen.core import Structure  # type: ignore
+
+                if source_label and isinstance(source_label, str) and Path(source_label).exists():
+                    structure = Structure.from_file(source_label)
+                else:
+                    structure = Structure.from_str(poscar_text, fmt="poscar")
+                c_len = float(structure.lattice.c)
+                context["c_length"] = c_len
+                cart_z = [structure.lattice.get_cartesian_coords(site.frac_coords)[2] for site in structure]
+                if cart_z:
+                    z_span = max(cart_z) - min(cart_z)
+                    vacuum = max(c_len - z_span, 0.0)
+                    context["vacuum"] = vacuum
+                is_low_dim = False
+                try:
+                    if hasattr(structure, "is_low_dimensional") and structure.is_low_dimensional(2):
+                        is_low_dim = True
+                except Exception:
+                    is_low_dim = False
+                if not is_low_dim:
+                    vac = context.get("vacuum")
+                    if vac is not None and c_len:
+                        is_low_dim = vac > 6.0 and c_len > 15.0
+                context["is_slab"] = bool(is_low_dim)
+            except Exception:
+                pass
+
+        if context.get("is_slab") and context.get("vacuum") is not None:
+            vac = float(context["vacuum"])
+            c_len = float(context.get("c_length") or 0.0)
+            context["reason"] = (
+                f"检测到 c≈{c_len:.1f} Å，真空≈{vac:.1f} Å → 判定为 2D/薄膜体系。"
+            )
+        elif context.get("c_length"):
+            c_len = float(context["c_length"])
+            context["reason"] = (
+                f"晶胞 c 轴≈{c_len:.1f} Å，未检测到明显真空层，将采用通用默认。"
+            )
+        else:
+            context["reason"] = "未检测到 POSCAR，沿用通用默认。"
+        return context
+
+    def _tw_collect_history_defaults(self) -> dict[str, tuple[Any, str]]:
+        history: dict[str, tuple[Any, str]] = {}
+
+        def _set_once(key: str, value: Any, origin: str) -> None:
+            if value is None:
+                return
+            if key not in history:
+                history[key] = (value, origin)
+
+        proj = self.current_project_path()
+        incar_path = proj / "INCAR"
+        incar_text = ""
+        if incar_path.exists():
+            try:
+                incar_text = read_text(incar_path)
+            except Exception:
+                incar_text = ""
+        elif getattr(self, "incar_text", None) is not None:
+            try:
+                incar_text = self.incar_text.get("1.0", tk.END)
+            except Exception:
+                incar_text = ""
+        if incar_text.strip():
+            incar_map, _typos = self._parse_incar_map(incar_text)
+            for key in ("KSPACING", "ISMEAR", "SIGMA", "LDIPOL", "IDIPOL", "ENCUT", "KGAMMA"):
+                if key in incar_map:
+                    val = incar_map[key]
+                    if key == "KGAMMA":
+                        val = str(val).strip().upper() in {"T", ".TRUE.", "TRUE", "1"}
+                        key_norm = "gamma_center"
+                    else:
+                        key_norm = key if key not in {"KSPACING"} else "kspacing"
+                    _set_once(key_norm, val, "项目 INCAR")
+
+        meta_candidates: list[Path] = []
+        root_meta = proj / "meta.json"
+        if root_meta.exists():
+            meta_candidates.append(root_meta)
+        sweep_root = proj / "twist_sweep"
+        if sweep_root.exists():
+            try:
+                meta_candidates.extend(
+                    sorted(
+                        (p for p in sweep_root.glob("*/meta.json") if p.is_file()),
+                        key=lambda x: x.stat().st_mtime,
+                        reverse=True,
+                    )
+                )
+            except Exception:
+                pass
+        for meta_path in meta_candidates:
+            try:
+                data = json.loads(read_text(meta_path))
+            except Exception:
+                continue
+            label = "项目 meta.json" if meta_path == root_meta else f"{meta_path.parent.name}/meta.json"
+            for key, alias in (
+                ("vacuum", "vacuum"),
+                ("interlayer", "interlayer"),
+                ("allow_strain", "allow_strain"),
+                ("kspacing", "kspacing"),
+                ("ismear", "ISMEAR"),
+                ("sigma", "SIGMA"),
+                ("ldipol", "LDIPOL"),
+                ("idipol", "IDIPOL"),
+                ("gamma_center", "gamma_center"),
+                ("gamma_only", "force_gamma_only"),
+            ):
+                val = data.get(key)
+                if val is None:
+                    continue
+                if key in {"ldipol", "gamma_center", "gamma_only"}:
+                    if isinstance(val, str):
+                        val = val.strip().upper() in {"T", ".TRUE.", "TRUE", "1"}
+                    else:
+                        val = bool(val)
+                _set_once(alias, val, label)
+
+        kpoints_path = proj / "KPOINTS"
+        if kpoints_path.exists():
+            _set_once("kpoints_file", str(kpoints_path), "项目 KPOINTS")
+
+        return history
+
+    def _tw_guess_template_key(self, context: dict[str, Any]) -> str:
+        elems = {str(e).capitalize() for e in context.get("elements", [])}
+        if elems and elems.issubset({"C", "B", "N"}):
+            return "graphene_bn"
+        tmd_metals = {"Mo", "W"}
+        chalcogens = {"S", "Se", "Te"}
+        if elems and elems & tmd_metals and elems & chalcogens:
+            return "mos2_tmd"
+        return "hetero_moire"
+
+    def _tw_resolve_recommended_config(self) -> dict[str, Any]:
+        context = self._tw_detect_structure_context()
+        history = self._tw_collect_history_defaults()
+
+        template_choice_label = "auto"
+        if hasattr(self, "tw_template_var") and isinstance(self.tw_template_var, tk.StringVar):
+            template_choice_label = self.tw_template_var.get() or "auto"
+        choice_map = getattr(self, "_tw_template_choice_map", {})
+        template_key = choice_map.get(template_choice_label, template_choice_label)
+        if hasattr(self, "_tw_selected_template"):
+            template_key = getattr(self, "_tw_selected_template") or template_key
+        if template_key in {"auto", ""}:
+            template_key = self._tw_guess_template_key(context)
+        template = TW_TEMPLATE_LIBRARY.get(template_key)
+
+        sources_chain: list[str] = []
+        values: dict[str, Any] = {}
+        origins: dict[str, str] = {}
+
+        def _set_value(key: str, value: Any, origin: str) -> None:
+            if value is None or key in values:
+                return
+            values[key] = value
+            origins[key] = origin
+
+        if history:
+            sources_chain.append("项目历史")
+            for key in (
+                "vacuum",
+                "interlayer",
+                "allow_strain",
+                "kspacing",
+                "ISMEAR",
+                "SIGMA",
+                "LDIPOL",
+                "IDIPOL",
+                "ENCUT",
+                "gamma_center",
+                "force_gamma_only",
+            ):
+                if key in history:
+                    val, origin = history[key]
+                    if key == "kspacing":
+                        try:
+                            val = float(val)
+                        except Exception:
+                            pass
+                    if key in {"vacuum", "interlayer", "allow_strain"}:
+                        try:
+                            val = float(val)
+                        except Exception:
+                            pass
+                    _set_value(key, val, origin)
+
+        if template:
+            sources_chain.append(f"材料模板：{template['label']}")
+            _set_value("vacuum", template.get("vacuum"), template["label"])
+            _set_value("interlayer", template.get("interlayer"), template["label"])
+            _set_value("allow_strain", template.get("allow_strain"), template["label"])
+            _set_value("kspacing", template.get("kspacing"), template["label"])
+            _set_value("gamma_center", template.get("gamma_center"), template["label"])
+            _set_value("force_gamma_only", template.get("force_gamma_only"), template["label"])
+            for key, val in template.get("incar", {}).items():
+                _set_value(key.upper(), val, template["label"])
+
+        sources_chain.append("通用默认")
+        for key, val in TW_FALLBACK_DEFAULTS.items():
+            _set_value(key, val, "通用默认")
+
+        incar_patch: dict[str, str] = {}
+        if "kspacing" in values and not values.get("force_gamma_only"):
+            try:
+                incar_patch["KSPACING"] = f"{float(values['kspacing']):.3f}"
+            except Exception:
+                incar_patch["KSPACING"] = str(values["kspacing"])
+        for key in ("ISMEAR", "SIGMA", "LDIPOL", "IDIPOL", "ENCUT"):
+            if key in values:
+                incar_patch[key] = str(values[key])
+        if values.get("gamma_center") is not None:
+            incar_patch["KGAMMA"] = ".TRUE." if bool(values["gamma_center"]) else ".FALSE."
+
+        summary = "来源：" + " → ".join(sources_chain)
+        reason = context.get("reason", "")
+        if template_choice_label in {"auto", "自动推荐（根据结构推断）"} and template:
+            reason = f"自动推荐模板：{template['label']}。" + reason
+
+        return {
+            "context": context,
+            "history": history,
+            "template_key": template_key,
+            "template_choice": template_choice_label,
+            "template": template,
+            "values": values,
+            "origins": origins,
+            "sources_chain": sources_chain,
+            "summary": summary,
+            "reason": reason,
+            "incar_patch": incar_patch,
+        }
+
+    def _tw_update_config_summary(self, *, apply_initial: bool = False) -> None:
+        info = self._tw_resolve_recommended_config()
+        self._tw_config_cache = info
+
+        summary = info.get("summary", "来源：通用默认")
+        reason = info.get("reason", "")
+        if hasattr(self, "tw_config_summary_var"):
+            self.tw_config_summary_var.set(summary)
+        if hasattr(self, "tw_config_reason_var"):
+            self.tw_config_reason_var.set(reason)
+
+        template = info.get("template")
+        if hasattr(self, "tw_template_desc_var"):
+            if info.get("template_choice") in {"auto", "自动推荐（根据结构推断）"} and template:
+                self.tw_template_desc_var.set(
+                    f"自动推荐：{template['label']} — {template.get('summary', '')}"
+                )
+            elif template:
+                self.tw_template_desc_var.set(template.get("summary", ""))
+            else:
+                self.tw_template_desc_var.set("使用通用默认参数，可根据体系自行调整。")
+
+        if hasattr(self, "tw_apply_source_var"):
+            chain = info.get("sources_chain", [])
+            self.tw_apply_source_var.set("来源：" + " / ".join(chain))
+
+        tree = getattr(self, "tw_config_tree", None)
+        if tree is not None:
+            try:
+                tree.delete(*tree.get_children())
+            except Exception:
+                pass
+            display_order = [
+                ("vacuum", "真空 (Å)", lambda v: f"{float(v):.1f}"),
+                ("interlayer", "层间距 (Å)", lambda v: f"{float(v):.2f}"),
+                ("allow_strain", "容许面内等比例应变(%)", lambda v: f"{float(v):.2f}"),
+                ("kspacing", "KSPACING (Å⁻¹)", lambda v: f"{float(v):.3f}"),
+                ("ISMEAR", "ISMEAR", str),
+                ("SIGMA", "SIGMA", str),
+                ("LDIPOL", "LDIPOL", str),
+                ("IDIPOL", "IDIPOL", str),
+                ("ENCUT", "ENCUT", str),
+                ("gamma_center", "Gamma 中心网格", lambda v: "是" if bool(v) else "否"),
+                ("force_gamma_only", "仅 Γ 点 (Γ-only)", lambda v: "是" if bool(v) else "否"),
+            ]
+            for key, label, fmt in display_order:
+                if key not in info["values"]:
+                    continue
+                val = info["values"][key]
+                try:
+                    disp = fmt(val)
+                except Exception:
+                    disp = str(val)
+                origin = info["origins"].get(key, "通用默认")
+                tree.insert("", tk.END, values=(label, disp, origin))
+
+        if apply_initial and not getattr(self, "_tw_defaults_applied", False):
+            mapping = [
+                ("vacuum", "tw_vacuum", float),
+                ("interlayer", "tw_interlayer", float),
+                ("allow_strain", "tw_allow_strain", float),
+                ("kspacing", "tw_kspacing", float),
+                ("gamma_center", "tw_gamma_center", bool),
+                ("force_gamma_only", "tw_force_gamma_only", bool),
+            ]
+            self._tw_setting_defaults = True
+            try:
+                for key, attr, caster in mapping:
+                    if key not in info["values"] or not hasattr(self, attr):
+                        continue
+                    var = getattr(self, attr)
+                    try:
+                        val = caster(info["values"][key])
+                    except Exception:
+                        val = info["values"][key]
+                    try:
+                        var.set(val)
+                    except Exception:
+                        pass
+            finally:
+                self._tw_setting_defaults = False
+                self._tw_defaults_applied = True
+
+        self._tw_update_task_summary()
+
+    def _tw_apply_recommended_config(self) -> None:
+        info = getattr(self, "_tw_config_cache", None) or self._tw_resolve_recommended_config()
+        values: dict[str, Any] = info.get("values", {})
+        incar_patch: dict[str, str] = info.get("incar_patch", {})
+
+        current_text = ""
+        incar_path = self.current_project_path() / "INCAR"
+        if incar_path.exists():
+            try:
+                current_text = read_text(incar_path)
+            except Exception:
+                current_text = ""
+        elif getattr(self, "incar_text", None) is not None:
+            try:
+                current_text = self.incar_text.get("1.0", tk.END)
+            except Exception:
+                current_text = ""
+        current_map, _ = self._parse_incar_map(current_text)
+
+        incar_changes: list[str] = []
+        patch_final: dict[str, Optional[str]] = {}
+        for key, new_val in incar_patch.items():
+            old_val = current_map.get(key)
+            if str(old_val).strip() == str(new_val).strip():
+                continue
+            incar_changes.append(f"{key}: {old_val or '未设置'} → {new_val}")
+            patch_final[key] = new_val
+
+        local_changes: list[str] = []
+        local_mapping = [
+            ("vacuum", "tw_vacuum"),
+            ("interlayer", "tw_interlayer"),
+            ("allow_strain", "tw_allow_strain"),
+            ("kspacing", "tw_kspacing"),
+            ("gamma_center", "tw_gamma_center"),
+            ("force_gamma_only", "tw_force_gamma_only"),
+        ]
+        for key, attr in local_mapping:
+            if key not in values or not hasattr(self, attr):
+                continue
+            var = getattr(self, attr)
+            try:
+                current = var.get()
+            except Exception:
+                current = None
+            target = values[key]
+            if isinstance(var, tk.BooleanVar):
+                current = bool(current)
+                target_bool = bool(target)
+                if current != target_bool:
+                    local_changes.append(f"{attr[3:]}: {current} → {target_bool}")
+            else:
+                try:
+                    current_val = float(current)
+                    target_val = float(target)
+                except Exception:
+                    current_val = current
+                    target_val = target
+                if current_val != target_val:
+                    local_changes.append(f"{attr[3:]}: {current_val} → {target_val}")
+
+        if not incar_changes and not local_changes:
+            messagebox.showinfo(APP_NAME, "当前参数已与推荐值一致，无需改动。")
+            return
+
+        lines = []
+        if incar_changes:
+            lines.append("INCAR 将更新：\n - " + "\n - ".join(incar_changes))
+        if local_changes:
+            lines.append("界面参数将更新：\n - " + "\n - ".join(local_changes))
+        msg = "\n\n".join(lines)
+        if not messagebox.askyesno(APP_NAME, f"确认应用推荐参数？\n\n{msg}"):
+            return
+
+        if patch_final:
+            self._apply_incar_patch(patch_final, message="[twist] 已应用推荐 INCAR 参数")
+
+        self._tw_setting_defaults = True
+        try:
+            for key, attr in local_mapping:
+                if key not in values or not hasattr(self, attr):
+                    continue
+                var = getattr(self, attr)
+                try:
+                    var.set(values[key])
+                except Exception:
+                    pass
+        finally:
+            self._tw_setting_defaults = False
+
+        self._tw_update_config_summary()
+        self._tw_append_log("已应用二维材料推荐参数。")
+
+    def _tw_update_task_summary(self, *_args) -> None:
+        if getattr(self, "_tw_setting_defaults", False):
+            return
+        summary_var = getattr(self, "tw_task_summary_var", None)
+        rule_var = getattr(self, "tw_task_rule_var", None)
+        if summary_var is None:
+            return
+        try:
+            theta_a = float(self.tw_theta_a.get())
+            theta_b = float(self.tw_theta_b.get())
+            theta_step = float(self.tw_theta_step.get())
+        except Exception:
+            summary_var.set("角度范围无效")
+            return
+        twist_enabled = bool(getattr(self, "tw_enable_twist", tk.BooleanVar(value=True)).get())
+        slide_enabled = bool(getattr(self, "tw_enable_slide", tk.BooleanVar(value=True)).get())
+        try:
+            ux_steps = int(self.tw_ux_steps.get())
+            uy_steps = int(self.tw_uy_steps.get())
+        except Exception:
+            summary_var.set("滑移网格无效")
+            return
+        try:
+            max_tasks = int(self.tw_max_tasks.get())
+        except Exception:
+            max_tasks = 0
+        if twist_enabled:
+            thetas = self._tw_linspace(theta_a, theta_b, theta_step if theta_step else 1.0)
+        else:
+            thetas = [theta_a]
+        n_theta = len(thetas)
+        n_ux = ux_steps if slide_enabled else 1
+        n_uy = uy_steps if slide_enabled else 1
+        total = n_theta * n_ux * n_uy
+        text = f"Nθ={n_theta} × Nₓ={n_ux} × Nᵧ={n_uy} = {total} 个任务"
+        try:
+            gamma_forced = bool(self.tw_force_gamma_only.get())
+        except Exception:
+            gamma_forced = False
+        if gamma_forced:
+            text += "（已手动仅 Γ 点）"
+        if max_tasks > 0 and total > max_tasks:
+            text += f"  ⚠️ 超出上限 {max_tasks}"
+            if hasattr(self, "tw_task_summary_label"):
+                self.tw_task_summary_label.configure(foreground="#b35c00")
+        else:
+            if max_tasks > 0:
+                text += f"（上限 {max_tasks}）"
+            if hasattr(self, "tw_task_summary_label"):
+                self.tw_task_summary_label.configure(foreground="#1a1a1a")
+        summary_var.set(text)
+
+        if rule_var is not None and hasattr(self, "tw_gamma_atom_threshold"):
+            try:
+                threshold = int(self.tw_gamma_atom_threshold.get())
+            except Exception:
+                threshold = 500
+            if gamma_forced:
+                rule_var.set(
+                    f"规则：已强制仅 Γ 点；预计原子数超过 ~{threshold} × 2 层时也会记录自动触发条件。"
+                )
+            else:
+                rule_var.set(
+                    f"规则：预计原子数超过 ~{threshold} × 2 层时自动切换仅 Γ 点。"
+                )
+
+    def _tw_on_template_change(self, *_args) -> None:
+        choice_label = "auto"
+        if hasattr(self, "tw_template_var") and isinstance(self.tw_template_var, tk.StringVar):
+            try:
+                choice_label = self.tw_template_var.get() or "auto"
+            except Exception:
+                choice_label = "auto"
+        choice_map = getattr(self, "_tw_template_choice_map", {})
+        self._tw_selected_template = choice_map.get(choice_label, choice_label)
+        self._tw_update_config_summary()
+
+    def _tw_on_structure_change(self, *_args) -> None:
+        self._tw_update_config_summary()
+        self._update_tw_entry_banner()
+
+    def _update_tw_entry_banner(self) -> None:
+        frame = getattr(self, "tw_banner_frame", None)
+        if frame is None:
+            return
+        info = self._tw_detect_structure_context()
+        is_slab = bool(info.get("is_slab"))
+        if is_slab:
+            c_len = info.get("c_length")
+            vacuum = info.get("vacuum")
+            parts = ["检测到 2D/薄膜结构"]
+            if c_len:
+                parts.append(f"c≈{float(c_len):.1f} Å")
+            if vacuum:
+                parts.append(f"真空≈{float(vacuum):.1f} Å")
+            message = "，".join(parts) + "，是否进入『二维材料扫描』？"
+            self.tw_banner_var.set(message)
+            if not getattr(self, "_tw_banner_visible", False):
+                try:
+                    frame.pack(fill=tk.X, padx=8, pady=(4, 0))
+                except Exception:
+                    pass
+                self._tw_banner_visible = True
+        else:
+            if getattr(self, "_tw_banner_visible", False):
+                try:
+                    frame.pack_forget()
+                except Exception:
+                    pass
+                self._tw_banner_visible = False
+
+    def _tw_launch_wizard(self) -> None:
+        """四步式向导：统一引导二维材料扫描默认。"""
+        existing = getattr(self, "_tw_wizard", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.lift()
+                    existing.focus_set()
+                    return
+            except Exception:
+                self._tw_wizard = None
+
+        context = self._tw_detect_structure_context()
+
+        def _get_float(name: str, default: float) -> float:
+            var = getattr(self, name, None)
+            if var is None:
+                return default
+            try:
+                return float(var.get())
+            except Exception:
+                return default
+
+        def _get_int(name: str, default: int) -> int:
+            var = getattr(self, name, None)
+            if var is None:
+                return default
+            try:
+                return int(var.get())
+            except Exception:
+                return default
+
+        try:
+            top_default = self.tw_top_path.get()
+        except Exception:
+            top_default = ""
+        try:
+            bot_default = self.tw_bot_path.get()
+        except Exception:
+            bot_default = ""
+        proj_poscar = self.current_project_path() / "POSCAR"
+        if not top_default and proj_poscar.exists():
+            top_default = str(proj_poscar)
+        if not bot_default and proj_poscar.exists():
+            bot_default = str(proj_poscar)
+        if not bot_default:
+            bot_default = top_default
+
+        template_labels = list(getattr(self, "_tw_template_choice_map", {}).keys())
+        if not template_labels:
+            template_labels = ["自动推荐（根据结构推断）"]
+        try:
+            template_default = self.tw_template_var.get()
+            if template_default not in template_labels:
+                raise ValueError
+        except Exception:
+            template_default = template_labels[0]
+
+        theta_a_default = _get_float("tw_theta_a", 0.0)
+        theta_b_default = _get_float("tw_theta_b", 5.0)
+        theta_step_default = max(_get_float("tw_theta_step", 1.0), 1e-3)
+        ux_steps_default = max(_get_int("tw_ux_steps", 5), 1)
+        uy_steps_default = max(_get_int("tw_uy_steps", 5), 1)
+        max_tasks_default = max(_get_int("tw_max_tasks", 0), 0)
+
+        top = tk.Toplevel(self)
+        top.title("二维材料扫描快速向导")
+        top.transient(self)
+        top.grab_set()
+        self._tw_wizard = top
+
+        body = ttk.Frame(top, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        wizard_top_var = tk.StringVar(value=top_default)
+        wizard_bot_var = tk.StringVar(value=bot_default)
+        wizard_template_var = tk.StringVar(value=template_default)
+        wizard_theta_a = tk.DoubleVar(value=theta_a_default)
+        wizard_theta_b = tk.DoubleVar(value=theta_b_default)
+        wizard_theta_step = tk.DoubleVar(value=theta_step_default)
+        wizard_ux_steps = tk.IntVar(value=ux_steps_default)
+        wizard_uy_steps = tk.IntVar(value=uy_steps_default)
+
+        step_frames: list[ttk.Frame] = []
+        context_reason = context.get("reason", "") or "未检测到 POSCAR，沿用通用默认。"
+        context_source = context.get("source")
+
+        step1 = ttk.Frame(body)
+        step_frames.append(step1)
+        ttk.Label(step1, text="步骤 1/4：选择上下层结构 (POSCAR)", font=("TkDefaultFont", 10, "bold")).pack(anchor=tk.W)
+        if context_source:
+            ttk.Label(
+                step1,
+                text=f"识别到结构来源：{context_source}",
+                foreground="#555",
+                wraplength=420,
+                justify=tk.LEFT,
+            ).pack(anchor=tk.W, pady=(2, 6))
+
+        def _browse(var: tk.StringVar) -> None:
+            p = filedialog.askopenfilename(
+                title="选择 POSCAR",
+                filetypes=[("POSCAR", "POSCAR"), ("All", "*")],
+                initialdir=self.project_dir,
+            )
+            if p:
+                var.set(p)
+
+        row_top = ttk.Frame(step1)
+        row_top.pack(fill=tk.X, pady=4)
+        ttk.Label(row_top, text="上层 (T)").pack(side=tk.LEFT)
+        ttk.Entry(row_top, textvariable=wizard_top_var, width=50).pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
+        ttk.Button(row_top, text="浏览…", command=lambda: _browse(wizard_top_var)).pack(side=tk.LEFT)
+
+        row_bot = ttk.Frame(step1)
+        row_bot.pack(fill=tk.X, pady=4)
+        ttk.Label(row_bot, text="下层 (B)").pack(side=tk.LEFT)
+        ttk.Entry(row_bot, textvariable=wizard_bot_var, width=50).pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
+        ttk.Button(row_bot, text="浏览…", command=lambda: _browse(wizard_bot_var)).pack(side=tk.LEFT)
+
+        def _use_project_poscar() -> None:
+            if proj_poscar.exists():
+                wizard_top_var.set(str(proj_poscar))
+                wizard_bot_var.set(str(proj_poscar))
+            else:
+                messagebox.showinfo(APP_NAME, f"项目目录中未找到 {proj_poscar.name}")
+
+        ttk.Button(step1, text="使用当前项目 POSCAR", command=_use_project_poscar).pack(anchor=tk.W, pady=(4, 0))
+        ttk.Button(step1, text="复制上层路径到下层", command=lambda: wizard_bot_var.set(wizard_top_var.get())).pack(anchor=tk.W, pady=(2, 0))
+
+        step2 = ttk.Frame(body)
+        step_frames.append(step2)
+        ttk.Label(step2, text="步骤 2/4：选择推荐模板", font=("TkDefaultFont", 10, "bold")).pack(anchor=tk.W)
+        ttk.Label(
+            step2,
+            text=context_reason,
+            foreground="#555",
+            wraplength=420,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(2, 6))
+
+        ttk.Label(step2, text="材料模板：").pack(anchor=tk.W)
+        template_combo = ttk.Combobox(
+            step2,
+            state="readonly",
+            values=template_labels,
+            textvariable=wizard_template_var,
+        )
+        template_combo.pack(fill=tk.X, pady=(2, 6))
+        template_info_var = tk.StringVar(value="")
+        ttk.Label(
+            step2,
+            textvariable=template_info_var,
+            wraplength=420,
+            foreground="#555",
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+
+        def _update_template_info(*_args) -> None:
+            label = wizard_template_var.get()
+            key = getattr(self, "_tw_template_choice_map", {}).get(label, label)
+            tpl = TW_TEMPLATE_LIBRARY.get(key)
+            if tpl:
+                template_info_var.set(f"推荐：{tpl['label']} — {tpl.get('summary', '')}")
+            else:
+                template_info_var.set("将使用通用默认参数，可在完成后自行微调。")
+            refresh_summary()
+
+        template_combo.bind("<<ComboboxSelected>>", _update_template_info)
+
+        step3 = ttk.Frame(body)
+        step_frames.append(step3)
+        ttk.Label(step3, text="步骤 3/4：设置角度与滑移网格", font=("TkDefaultFont", 10, "bold")).pack(anchor=tk.W)
+
+        row_angle = ttk.Frame(step3)
+        row_angle.pack(fill=tk.X, pady=4)
+        ttk.Label(row_angle, text="起始 θ (°)").pack(side=tk.LEFT)
+        ttk.Entry(row_angle, textvariable=wizard_theta_a, width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Label(row_angle, text="结束 θ (°)").pack(side=tk.LEFT)
+        ttk.Entry(row_angle, textvariable=wizard_theta_b, width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Label(row_angle, text="步长 (°)").pack(side=tk.LEFT)
+        ttk.Entry(row_angle, textvariable=wizard_theta_step, width=8).pack(side=tk.LEFT, padx=4)
+
+        row_slide = ttk.Frame(step3)
+        row_slide.pack(fill=tk.X, pady=4)
+        ttk.Label(row_slide, text="uₓ 步数").pack(side=tk.LEFT)
+        ttk.Spinbox(row_slide, from_=1, to=32, textvariable=wizard_ux_steps, width=6).pack(side=tk.LEFT, padx=4)
+        ttk.Label(row_slide, text="uᵧ 步数").pack(side=tk.LEFT)
+        ttk.Spinbox(row_slide, from_=1, to=32, textvariable=wizard_uy_steps, width=6).pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(
+            step3,
+            text="六角或三角晶格 0–60° 已覆盖独立堆垛；滑移覆盖 [0,1)×[0,1)。",
+            foreground="#555",
+            wraplength=420,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(2, 6))
+
+        task_preview_var = tk.StringVar(value="预估任务数：—")
+        ttk.Label(step3, textvariable=task_preview_var, foreground="#0a5cad").pack(anchor=tk.W)
+        task_hint_var = tk.StringVar(value="")
+        ttk.Label(step3, textvariable=task_hint_var, foreground="#b35c00", wraplength=420, justify=tk.LEFT).pack(anchor=tk.W)
+
+        step4 = ttk.Frame(body)
+        step_frames.append(step4)
+        ttk.Label(step4, text="步骤 4/4：确认并进入二维面板", font=("TkDefaultFont", 10, "bold")).pack(anchor=tk.W)
+        summary_var = tk.StringVar(value="")
+        ttk.Label(step4, textvariable=summary_var, wraplength=420, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 6))
+        ttk.Button(step4, text="一键快速体检并修复", command=self.quick_preflight).pack(anchor=tk.W)
+        ttk.Label(
+            step4,
+            text="完成后将跳转至二维页，可立即运行“开始批量扫描”或“只生成当前构型”。",
+            foreground="#555",
+            wraplength=420,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(6, 0))
+
+        def _compute_counts():
+            try:
+                a = float(wizard_theta_a.get())
+                b = float(wizard_theta_b.get())
+                step = float(wizard_theta_step.get())
+            except Exception:
+                return None
+            if step <= 0:
+                step = 1.0
+            if abs(b - a) < 1e-9:
+                thetas = [a]
+            else:
+                thetas = self._tw_linspace(a, b, step)
+            ux = max(int(wizard_ux_steps.get()), 1)
+            uy = max(int(wizard_uy_steps.get()), 1)
+            total = len(thetas) * ux * uy
+            return len(thetas), ux, uy, total
+
+        def refresh_summary(*_args) -> None:
+            counts = _compute_counts()
+            lines: list[str] = []
+            top_path = wizard_top_var.get().strip()
+            bot_path = wizard_bot_var.get().strip()
+            lines.append(f"结构：上层 {Path(top_path).name or '未选'} / 下层 {Path(bot_path).name or '未选'}")
+            lines.append(f"模板：{wizard_template_var.get()}")
+            if counts:
+                n_theta, n_ux, n_uy, total = counts
+                lines.append(f"角度 Nθ={n_theta}, 滑移 Nₓ={n_ux} × Nᵧ={n_uy}, 任务数≈{total}")
+            if context_reason:
+                lines.append(context_reason)
+            summary_var.set("\n".join(lines))
+
+        def update_task_preview(*_args) -> None:
+            counts = _compute_counts()
+            if not counts:
+                task_preview_var.set("预估任务数：参数未设置完整")
+                task_hint_var.set("")
+            else:
+                n_theta, n_ux, n_uy, total = counts
+                msg = f"预估任务数：Nθ={n_theta} × Nₓ={n_ux} × Nᵧ={n_uy} = {total}"
+                if max_tasks_default and total > max_tasks_default:
+                    msg += f"  ⚠️ 超过上限 {max_tasks_default}"
+                    task_hint_var.set("超过上限时会自动启用仅 Γ 点策略。")
+                elif max_tasks_default:
+                    msg += f"（上限 {max_tasks_default}）"
+                    task_hint_var.set("")
+                else:
+                    task_hint_var.set("")
+                task_preview_var.set(msg)
+            refresh_summary()
+
+        for var in (
+            wizard_theta_a,
+            wizard_theta_b,
+            wizard_theta_step,
+            wizard_ux_steps,
+            wizard_uy_steps,
+        ):
+            try:
+                var.trace_add("write", update_task_preview)
+            except Exception:
+                pass
+
+        for var in (wizard_top_var, wizard_bot_var, wizard_template_var):
+            try:
+                var.trace_add("write", refresh_summary)
+            except Exception:
+                pass
+
+        _update_template_info()
+        update_task_preview()
+
+        nav = ttk.Frame(top, padding=(12, 0, 12, 12))
+        nav.pack(fill=tk.X)
+
+        current = {"index": 0}
+
+        def show_step(idx: int) -> None:
+            idx = max(0, min(idx, len(step_frames) - 1))
+            for frame in step_frames:
+                frame.pack_forget()
+            step_frames[idx].pack(fill=tk.BOTH, expand=True)
+            current["index"] = idx
+            prev_btn.configure(state=tk.NORMAL if idx > 0 else tk.DISABLED)
+            next_btn.configure(state=tk.NORMAL if idx < len(step_frames) - 1 else tk.DISABLED)
+            finish_btn.configure(state=tk.NORMAL if idx == len(step_frames) - 1 else tk.DISABLED)
+
+        def _validate(idx: int) -> bool:
+            if idx == 0:
+                top_path = wizard_top_var.get().strip()
+                bot_path = wizard_bot_var.get().strip()
+                if not top_path or not bot_path:
+                    messagebox.showwarning(APP_NAME, "请为上下层选择 POSCAR。")
+                    return False
+                missing = []
+                if top_path and not Path(top_path).exists():
+                    missing.append(top_path)
+                if bot_path and not Path(bot_path).exists():
+                    missing.append(bot_path)
+                if missing:
+                    messagebox.showwarning(APP_NAME, "以下路径不存在：\n" + "\n".join(missing))
+                    return False
+            if idx >= 2:
+                if not _compute_counts():
+                    messagebox.showwarning(APP_NAME, "请填写有效的角度与滑移参数。")
+                    return False
+            return True
+
+        def go_next() -> None:
+            idx = current["index"]
+            if not _validate(idx):
+                return
+            show_step(idx + 1)
+
+        def go_prev() -> None:
+            show_step(current["index"] - 1)
+
+        def _apply_to_main() -> None:
+            top_path = wizard_top_var.get().strip()
+            bot_path = wizard_bot_var.get().strip()
+            template_label = wizard_template_var.get()
+            if top_path and hasattr(self, "tw_top_path"):
+                self.tw_top_path.set(top_path)
+            if bot_path and hasattr(self, "tw_bot_path"):
+                self.tw_bot_path.set(bot_path)
+            if template_label and hasattr(self, "tw_template_var"):
+                try:
+                    self.tw_template_var.set(template_label)
+                except Exception:
+                    pass
+                self._tw_on_template_change()
+            try:
+                self.tw_theta_a.set(float(wizard_theta_a.get()))
+                self.tw_theta_b.set(float(wizard_theta_b.get()))
+                self.tw_theta_step.set(max(float(wizard_theta_step.get()), 1e-3))
+            except Exception:
+                pass
+            try:
+                self.tw_ux_steps.set(max(int(wizard_ux_steps.get()), 1))
+                self.tw_uy_steps.set(max(int(wizard_uy_steps.get()), 1))
+            except Exception:
+                pass
+            for attr in ("tw_enable_twist", "tw_enable_slide"):
+                var = getattr(self, attr, None)
+                if isinstance(var, tk.BooleanVar):
+                    try:
+                        var.set(True)
+                    except Exception:
+                        pass
+            self._tw_update_config_summary()
+            self._tw_update_task_summary()
+            self._update_tw_entry_banner()
+            self.goto_tab(getattr(self, "page_twist", None) or self.page_inputs)
+            self._tw_append_log("二维扫描向导已应用所选设置。")
+
+        def _finish() -> None:
+            if not _validate(current["index"]):
+                return
+            _apply_to_main()
+            _close()
+
+        def _close() -> None:
+            try:
+                top.grab_release()
+            except Exception:
+                pass
+            try:
+                top.destroy()
+            finally:
+                self._tw_wizard = None
+
+        nav.pack_propagate(False)
+        ttk.Separator(nav, orient=tk.HORIZONTAL).pack(fill=tk.X, side=tk.TOP, pady=(0, 8))
+        btn_row = ttk.Frame(nav)
+        btn_row.pack(fill=tk.X)
+        cancel_btn = ttk.Button(btn_row, text="取消", command=_close)
+        cancel_btn.pack(side=tk.RIGHT)
+        finish_btn = ttk.Button(btn_row, text="完成", command=_finish)
+        finish_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        next_btn = ttk.Button(btn_row, text="下一步", command=go_next)
+        next_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        prev_btn = ttk.Button(btn_row, text="上一步", command=go_prev)
+        prev_btn.pack(side=tk.RIGHT)
+
+        show_step(0)
+        try:
+            top.update_idletasks()
+            w = top.winfo_width()
+            h = top.winfo_height()
+            x = self.winfo_rootx() + (self.winfo_width() - w) // 2
+            y = self.winfo_rooty() + (self.winfo_height() - h) // 2
+            top.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        except Exception:
+            pass
+        top.protocol("WM_DELETE_WINDOW", _close)
+
+    def _tw_update_tw_post_hint(self) -> None:
+        frame = getattr(self, "tw_post_hint_frame", None)
+        if frame is None:
+            return
+        var = getattr(self, "tw_post_hint_var", None)
+        root = self.current_project_path() / "twist_sweep"
+        exists = root.exists()
+        best_hint = ""
+        csv_path = root / "results.csv"
+        if csv_path.exists():
+            try:
+                import csv
+                best_energy = None
+                with csv_path.open("r", encoding="utf-8", errors="ignore") as f:
+                    reader = csv.DictReader(f)
+                    for rec in reader:
+                        try:
+                            energy = float(rec.get("E") or rec.get("totalE_eV") or "nan")
+                            theta = float(rec.get("theta") or "nan")
+                            ux = float(rec.get("ux") or "nan")
+                            uy = float(rec.get("uy") or "nan")
+                        except Exception:
+                            continue
+                        if math.isnan(energy) or math.isnan(theta) or math.isnan(ux) or math.isnan(uy):
+                            continue
+                        if best_energy is None or energy < best_energy:
+                            best_energy = energy
+                            best_hint = f"最优候选 θ≈{theta:.3f}°, u≈({ux:.3f},{uy:.3f})"
+            except Exception:
+                best_hint = ""
+        if exists:
+            message = "检测到 twist_sweep 批量目录，可快速复算最优 θ,u 组合。"
+            if best_hint:
+                message += " " + best_hint
+            if var is not None:
+                var.set(message)
+            if not getattr(self, "_tw_post_hint_visible", False):
+                frame.pack(fill=tk.X, pady=(0, 6))
+                self._tw_post_hint_visible = True
+        else:
+            if var is not None:
+                var.set("")
+            if getattr(self, "_tw_post_hint_visible", False):
+                try:
+                    frame.pack_forget()
+                except Exception:
+                    pass
+                self._tw_post_hint_visible = False
+
+    def _tw_jump_to_best_for_refine(self) -> None:
+        root = self.current_project_path() / "twist_sweep"
+        rows = self._tw_load_results_table(root)
+        if not rows:
+            messagebox.showwarning(APP_NAME, "未在项目中找到 twist_sweep 结果。")
+            return
+        best = None
+        best_key = None
+        for row in rows:
+            energy = row.get("E")
+            try:
+                energy_val = float(energy)
+            except Exception:
+                energy_val = float("nan")
+            if math.isnan(energy_val):
+                continue
+            gap = row.get("gap")
+            try:
+                gap_val = float(gap)
+            except Exception:
+                gap_val = float("nan")
+            gap_metric = abs(gap_val) if not math.isnan(gap_val) else float("inf")
+            key = (energy_val, gap_metric)
+            if best_key is None or key < best_key:
+                best_key = key
+                best = row
+        if best is None:
+            best = rows[0]
+
+        def _safe_float(val: object, default: float = 0.0) -> float:
+            try:
+                num = float(val)
+            except Exception:
+                return default
+            return default if math.isnan(num) else num
+
+        theta = _safe_float(best.get("theta"), 0.0)
+        ux = _safe_float(best.get("ux"), 0.0)
+        uy = _safe_float(best.get("uy"), 0.0)
+        note = best.get("note") or ""
+        rel_path = best.get("path") or ""
+        self._tw_single_override = (ux, uy)
+        try:
+            self.tw_theta_a.set(theta)
+            self.tw_theta_b.set(theta)
+        except Exception:
+            pass
+        try:
+            self.tw_enable_twist.set(False)
+        except Exception:
+            pass
+        try:
+            self.tw_enable_slide.set(False)
+        except Exception:
+            pass
+        self._tw_update_task_summary()
+        self.goto_tab(getattr(self, "page_twist", None) or self.page_inputs)
+        self._tw_append_log(
+            f"已定位最优候选：θ={theta:.3f}°, u=({ux:.3f},{uy:.3f})。建议使用“只生成当前构型”并在 INCAR 中切换 HSE06。"
+        )
+        lines = [
+            f"θ ≈ {theta:.3f}°", f"uₓ ≈ {ux:.3f}", f"uᵧ ≈ {uy:.3f}",
+        ]
+        if rel_path:
+            lines.append(f"目录：{rel_path}")
+        if note:
+            lines.append(f"备注：{note}")
+        lines.append("下一步：点击“只生成当前构型”生成精修目录，并运行快速体检。")
+        messagebox.showinfo(APP_NAME, "已定位最优 θ,u", "\n".join(lines))
+
     # === CODEX END: twist/shift helpers ===
 
     # === CODEX BEGIN: twist/shift page UI ===
@@ -3355,6 +4720,27 @@ class VaspGUI(tk.Tk):
 
         left = ttk.Frame(left_canvas, padding=8)
         left_window = left_canvas.create_window((0, 0), window=left, anchor="nw")
+
+
+        style = ttk.Style()
+        style.configure("TwBanner.TFrame", background="#e7f1ff")
+        style.configure("TwBanner.TLabel", background="#e7f1ff", foreground="#0a5cad")
+
+        self.tw_post_hint_frame = ttk.Frame(left, padding=6, style="TwBanner.TFrame")
+        self.tw_post_hint_var = tk.StringVar(value="")
+        ttk.Label(
+            self.tw_post_hint_frame,
+            textvariable=self.tw_post_hint_var,
+            wraplength=320,
+            justify=tk.LEFT,
+            style="TwBanner.TLabel",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            self.tw_post_hint_frame,
+            text="快速复算最优 θ,u",
+            command=self._tw_jump_to_best_for_refine,
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+        self._tw_post_hint_visible = False
 
         def _sync_scrollregion(event):
             left_canvas.configure(scrollregion=left_canvas.bbox("all"))
@@ -3379,63 +4765,125 @@ class VaspGUI(tk.Tk):
             widget.bind("<MouseWheel>", _on_mousewheel)
             widget.bind("<Button-4>", _on_mousewheel)
             widget.bind("<Button-5>", _on_mousewheel)
-        ttk.Label(left, text="二维材料扭转/滑移 | 生成批量 POSCAR 与扫参任务").pack(anchor=tk.W, pady=(0,6))
+        ttk.Label(left, text="二维材料扭转/滑移 | 生成批量 POSCAR 与扫参任务").pack(anchor=tk.W, pady=(0, 6))
+
+        template_choices = {
+            "自动推荐（根据结构推断）": "auto",
+            "石墨烯 / h-BN（六角）": "graphene_bn",
+            "MoS₂ / WS₂（TMD）": "mos2_tmd",
+            "异质双层 / 莫尔预筛": "hetero_moire",
+        }
+        self._tw_template_choice_map = template_choices
+
+        provenance_box = ttk.LabelFrame(left, text="配置来源与推荐")
+        provenance_box.pack(fill=tk.X, pady=(0, 8))
+
+        combo_row = ttk.Frame(provenance_box)
+        combo_row.pack(fill=tk.X, pady=(4, 2))
+        ttk.Label(combo_row, text="材料模板：").pack(side=tk.LEFT)
+        self.tw_template_var = tk.StringVar(value=list(template_choices.keys())[0])
+        template_combo = ttk.Combobox(
+            combo_row,
+            state="readonly",
+            values=list(template_choices.keys()),
+            textvariable=self.tw_template_var,
+            width=28,
+        )
+        template_combo.pack(side=tk.LEFT, padx=(4, 0))
+        template_combo.bind("<<ComboboxSelected>>", lambda _e: self._tw_on_template_change())
+        self.tw_apply_source_var = tk.StringVar(value="来源：通用默认")
+        ttk.Label(combo_row, textvariable=self.tw_apply_source_var, foreground="#555").pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Button(combo_row, text="应用推荐参数", command=self._tw_apply_recommended_config).pack(side=tk.RIGHT, padx=(6, 0))
+
+        self.tw_config_summary_var = tk.StringVar(value="来源：通用默认")
+        ttk.Label(
+            provenance_box,
+            textvariable=self.tw_config_summary_var,
+            wraplength=360,
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, pady=(2, 2))
+
+        self.tw_config_reason_var = tk.StringVar(value="为何是这个默认：—")
+        ttk.Label(
+            provenance_box,
+            textvariable=self.tw_config_reason_var,
+            wraplength=360,
+            justify=tk.LEFT,
+            foreground="#555",
+        ).pack(fill=tk.X, pady=(0, 4))
+
+        self.tw_template_desc_var = tk.StringVar(value="")
+        ttk.Label(
+            provenance_box,
+            textvariable=self.tw_template_desc_var,
+            wraplength=360,
+            justify=tk.LEFT,
+            foreground="#555",
+        ).pack(fill=tk.X, pady=(0, 4))
+
+        self.tw_config_tree = ttk.Treeview(
+            provenance_box,
+            columns=("param", "value", "source"),
+            show="headings",
+            height=5,
+        )
+        self.tw_config_tree.heading("param", text="参数")
+        self.tw_config_tree.heading("value", text="推荐值")
+        self.tw_config_tree.heading("source", text="来源")
+        self.tw_config_tree.column("param", width=140, anchor=tk.W)
+        self.tw_config_tree.column("value", width=90, anchor=tk.W)
+        self.tw_config_tree.column("source", anchor=tk.W)
+        self.tw_config_tree.pack(fill=tk.X, pady=(0, 4))
 
         help_poscar = textwrap.dedent("""
             【基础输入】
-            • 先后选择底层 (B) 与上层 (T) 的 POSCAR。
-            • 默认假设 POSCAR 的 c 轴接近层法向；若不符合，请先在外部对齐晶格。
-            • 上层以刚体方式旋转/滑移，并按“真空(Å)”设定层间距。
+            • 先后选择底层 (B) 与上层 (T) 的 POSCAR；优先使用已经几何优化的结构。
+            • 默认假设 POSCAR 的 c 轴沿层法向；如不满足，请先在外部完成对齐。
+            • 真空厚度与偶极修正建议在上方“配置来源”中查看推荐值与来源解释。
         """).strip()
         help_vacuum = textwrap.dedent("""
             【真空与容许应变】
-            • “真空(Å)” 决定最终 c 轴长度 = 层间距 + 真空层，常用 15–20 Å。
-            • 建议配合 INCAR 中 LDIPOL=.TRUE. 与 IDIPOL=3 以消除偶极。
-            • “容许应变(%)” 控制搜索近共格超胞时允许的面内等效拉伸/压缩，常用 0.5–1.0%。
-            • 程序会在限制内搜索对角超胞，若仍匹配失败可放宽容许应变或提高搜索阶数。
+            • 真空(Å) = 层间距 + 空腔厚度，二维体系常用 15–20 Å，并配合 LDIPOL=.TRUE., IDIPOL=3。
+            • 容许面内等比例应变(%) 控制近共格匹配的松紧，通常 0.5–1.0%；值越大超胞越小，但物理偏差增大。
+            • 推荐流程：先在较松参数下收敛，再逐步放宽偶极修正或收紧应变阈值。
         """).strip()
         help_twist = textwrap.dedent("""
             【扭转角扫描】
-            • 起/止/步长按闭区间生成角度序列；步长不能整除区间时，会截断在终点前的最后一个值。
-            • 六角或三角晶格在 0–60° 内即可覆盖独立堆垛；异质双层通常也采用该范围。
-            • 角度数量 Nθ = floor((止 − 起)/步长) + 1。
+            • 起/止/步长按闭区间生成角度序列；若步长无法整除区间，末端会自动截断。
+            • 六角/三角晶格 0–60° 已覆盖独立堆垛；其它体系请根据对称性调整范围。
+            • 角度数量 Nθ = floor((止 − 起)/步长) + 1，会在任务统计中实时显示。
         """).strip()
         help_slide = textwrap.dedent("""
             【滑移网格】
-            • 滑移向量定义为 t = uₓ·a₁ + uᵧ·a₂，其中 a₁、a₂ 为底层面内基矢。
-            • 网格在 [0,1)×[0,1) 内均匀采样，u=1 与 u=0 等价。
-            • 设 uₓ 步数 = nₓ、uᵧ 步数 = nᵧ，共生成 nₓ×nᵧ 个组合；六角晶格会按对称性自动去重。
+            • 滑移以分数坐标 uₓ,uᵧ 表示：t = uₓ·a₁ + uᵧ·a₂，取值范围 [0,1)。
+            • 设 uₓ 步数 = nₓ、uᵧ 步数 = nᵧ，共生成 nₓ×nᵧ 组合；六角晶格会自动消除对称重复。
+            • 可先用稀疏网格预筛，再在感兴趣区间细化滑移步数。
         """).strip()
         help_compute = textwrap.dedent("""
-            【KSPACING 与任务上限】
-            • KSPACING 优先写入 INCAR：金属或小原胞常用 0.18–0.22；半导体 0.22–0.30；莫尔超胞可先用 Γ-only 或 0.35 预筛。
-            • 若项目目录存在 KPOINTS 文件，则沿用原网格；否则采用 KSPACING 自动生成。
-            • 任务上限用于约束 sweep 规模，总任务数近似为 Nθ × nₓ × nᵧ。
+            【K 点策略与任务规模】
+            • KSPACING (Å⁻¹) 控制自动网格密度；若项目已有 KPOINTS，则 KPOINTS 优先生效。
+            • Gamma 中心网格 (Gamma-centered) 通过 KGAMMA 控制；“仅 Γ 点 (Γ-only)” 将写入 1×1×1 KPOINTS。
+            • 总任务数 ≈ Nθ × Nₓ × Nᵧ；超过阈值会自动记录并触发仅 Γ 点策略。
         """).strip()
         help_actions = textwrap.dedent("""
             【操作按钮】
-            • “预览当前(θ,u)几何”：即时构造当前组合以核对结构。
-            • “生成单例 POSCAR”：仅输出当前参数对应的单个目录。
-            • “批量遍历并生成”：按角度与滑移网格生成全部任务、脚本与 meta.json。
+            • “预览当前构型（θ,u）”：即时生成当前组合并绘制俯视结构，不写入磁盘。
+            • “只生成当前构型”：创建单独子目录，便于针对性调参。
+            • “开始批量扫描”：依据当前网格构建 twist_sweep/* 子目录并写入 INCAR/KPOINTS/meta.json。
             • “生成后自动运行”：复制项目脚本并尝试调用 run_local.sh（实验性功能）。
-            • “解析 sweep 结果 → CSV”：统计能量、带隙与备注生成汇总表。
+            • “解析 sweep 结果 → CSV”：统计能量/带隙/备注，便于后续筛选与复算。
         """).strip()
         help_defaults = textwrap.dedent("""
-            【推荐默认值】
-            • 真空 20 Å，INCAR 建议 LDIPOL=.TRUE. 与 IDIPOL=3。
-            • 容许应变 0.5–0.8%，极小角度可放宽至 1.0%。
-            • 角度初扫 0–10°、步长 2°，重点角度再加密。
-            • 滑移网格常用 5×5 或 7×7；势垒/摩擦研究可加密到 15×15。
-            • KSPACING ≈0.22，超大胞可先用 Γ-only 预筛后再细化。
-            • SCF/DOS：ISMEAR=0, SIGMA=0.05；结构优化或金属可改 ISMEAR=1, SIGMA=0.2。
-            • 层间范德华建议统一采用 IVDW=12 或 rVV10。
+            【科研说明】
+            • PBE 带隙偏低，关键构型可在“配置来源”内一键切换 HSE06 核心标签。
+            • 真空 15–20 Å、LDIPOL/IDIPOL=3 是薄膜/2D 体系的常规做法；记录来源便于审稿复现。
+            • 扫描参数、K 点密度、偶极修正均会写入 meta.json，方便导出 run_meta.json。
         """).strip()
         help_notes = textwrap.dedent("""
             【常见注意事项】
-            • 小角度会显著增加原子数，可结合任务上限、Γ-only 预筛或提高容许应变控制规模。
-            • 滑移始终以底层基矢的分数坐标描述，可借助预览面板显示的 t = uₓ·a₁ + uᵧ·a₂ 校验。
-            • 网格采用 [0,1) 范围避免端点重复；设定角度步长时请确认覆盖目标终点。
-            • PBE 带隙偏低，关键构型建议追加 HSE 或 scGW 以形成多保真修正。
+            • 角度越小原子数越大，可结合任务上限与“仅 Γ 点”策略控制规模。
+            • 滑移采用 [0,1) 分数坐标，可借助预览面板核对 t = uₓ·a₁ + uᵧ·a₂。
+            • 扫描前建议运行“快速体检 (Preflight)”并应用推荐修复，避免粗糙默认网格。
         """).strip()
 
         # 路径选择
@@ -3453,12 +4901,20 @@ class VaspGUI(tk.Tk):
         ttk.Entry(row, textvariable=self.tw_bot_path, width=30).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text="选择…", command=lambda: self._tw_pick_poscar(self.tw_bot_path)).pack(side=tk.LEFT)
 
+        try:
+            self.tw_top_path.trace_add("write", self._tw_on_structure_change)
+            self.tw_bot_path.trace_add("write", self._tw_on_structure_change)
+        except Exception:
+            pass
+
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
         # 基本几何参数
         self.tw_vacuum = tk.DoubleVar(value=20.0)     # 真空厚度 (Å)
         self.tw_interlayer = tk.DoubleVar(value=3.35)  # 层间距 (Å)
         self.tw_allow_strain = tk.DoubleVar(value=0.8)  # 允许等效小应变（%）
+        self.tw_gamma_center = tk.BooleanVar(value=True)
+        self.tw_force_gamma_only = tk.BooleanVar(value=False)
         self.tw_gamma_atom_threshold = tk.IntVar(value=500)  # 超大超胞→Gamma-only
         self.tw_enable_twist = tk.BooleanVar(value=True)
         self.tw_enable_slide = tk.BooleanVar(value=True)
@@ -3469,7 +4925,7 @@ class VaspGUI(tk.Tk):
         ttk.Entry(row, textvariable=self.tw_vacuum, width=7).pack(side=tk.LEFT, padx=4)
         ttk.Label(row, text="层间距(Å)").pack(side=tk.LEFT, padx=(8, 0))
         ttk.Entry(row, textvariable=self.tw_interlayer, width=7).pack(side=tk.LEFT, padx=4)
-        ttk.Label(row, text="容许应变(%)").pack(side=tk.LEFT, padx=(8,0))
+        ttk.Label(row, text="容许面内等比例应变(%)").pack(side=tk.LEFT, padx=(8,0))
         ttk.Entry(row, textvariable=self.tw_allow_strain, width=7).pack(side=tk.LEFT, padx=4)
 
         dim_frame = ttk.LabelFrame(left, text="扫描维度")
@@ -3494,7 +4950,7 @@ class VaspGUI(tk.Tk):
 
         # 滑移扫描（分数坐标）
         self._add_section_heading(left, "滑移网格", help_slide, title="滑移 (分数坐标)")
-        ttk.Label(left, text="滑移 (分数坐标 u_x,u_y)：").pack(anchor=tk.W)
+        ttk.Label(left, text="滑移 (分数坐标 uₓ,uᵧ，取值 [0,1) )：").pack(anchor=tk.W)
         self.tw_ux_steps = tk.IntVar(value=5)
         self.tw_uy_steps = tk.IntVar(value=5)
         r=ttk.Frame(left); r.pack(fill=tk.X, pady=2)
@@ -3511,22 +4967,61 @@ class VaspGUI(tk.Tk):
 
         self._add_section_heading(left, "计算与并行策略", help_compute, title="KSPACING 与任务上限")
         r=ttk.Frame(left); r.pack(fill=tk.X, pady=2)
-        ttk.Label(r, text="KSPACING").pack(side=tk.LEFT); ttk.Entry(r, textvariable=self.tw_kspacing, width=7).pack(side=tk.LEFT, padx=4)
-        ttk.Label(r, text="任务上限").pack(side=tk.LEFT, padx=(8,0)); ttk.Entry(r, textvariable=self.tw_max_tasks, width=7).pack(side=tk.LEFT, padx=4)
+        ttk.Label(r, text="KSPACING (Å⁻¹)").pack(side=tk.LEFT)
+        ttk.Entry(r, textvariable=self.tw_kspacing, width=7).pack(side=tk.LEFT, padx=4)
+        ttk.Label(r, text="最大任务数 N（硬阈值）").pack(side=tk.LEFT, padx=(8,0)); ttk.Entry(r, textvariable=self.tw_max_tasks, width=7).pack(side=tk.LEFT, padx=4)
+        ttk.Label(left, text="若存在 KPOINTS 文件则优先生效；缺省两者时 VASP 会回退粗糙网格。", foreground="#666", wraplength=360, justify=tk.LEFT).pack(fill=tk.X, pady=(0,4))
+        ttk.Checkbutton(left, text="Gamma 中心网格 (Gamma-centered)", variable=self.tw_gamma_center).pack(anchor=tk.W, pady=(0,2))
+        ttk.Checkbutton(left, text="仅 Γ 点 (Γ-only)", variable=self.tw_force_gamma_only).pack(anchor=tk.W, pady=(0,4))
         ttk.Checkbutton(left, text="生成后自动运行（试验性）", variable=self.tw_autorun).pack(anchor=tk.W, pady=(2,4))
+
+        self.tw_task_summary_var = tk.StringVar(value="Nθ × Nₓ × Nᵧ = —")
+        self.tw_task_summary_label = ttk.Label(left, textvariable=self.tw_task_summary_var)
+        self.tw_task_summary_label.pack(anchor=tk.W, pady=(0,2))
+        self.tw_task_rule_var = tk.StringVar(value="规则：预计原子数超过 ~500 × 2 层时自动切换仅 Γ 点。")
+        ttk.Label(left, textvariable=self.tw_task_rule_var, foreground="#555", wraplength=360, justify=tk.LEFT).pack(anchor=tk.W, pady=(0,6))
 
         # 操作按钮
         self._add_section_heading(left, "任务操作", help_actions, title="选项与按钮")
         btns = ttk.Frame(left); btns.pack(fill=tk.X, pady=8)
-        ttk.Button(btns, text="预览当前(θ,u)几何", command=self._tw_preview_once).pack(side=tk.LEFT)
-        ttk.Button(btns, text="生成单例 POSCAR", command=lambda: self._tw_generate(single=True)).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btns, text="批量遍历并生成", command=lambda: self._tw_generate(single=False)).pack(side=tk.LEFT)
+        ttk.Button(btns, text="预览当前构型（θ,u）", command=self._tw_preview_once).pack(side=tk.LEFT)
+        ttk.Button(btns, text="只生成当前构型", command=lambda: self._tw_generate(single=True)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="开始批量扫描", command=lambda: self._tw_generate(single=False)).pack(side=tk.LEFT)
 
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
         ttk.Button(left, text="解析 sweep 结果 → CSV", command=self._tw_collect_results_btn).pack(anchor=tk.W)
         ttk.Button(left, text="绘制 gap 热图（用当前 θ）", command=self._tw_plot_gap_heatmap_btn).pack(anchor=tk.W, pady=(4, 0))
         ttk.Button(left, text="绘制 gap–θ 曲线（min/mean/max）", command=self._tw_plot_gap_vs_theta_btn).pack(anchor=tk.W, pady=(4, 8))
 
+        for var in (
+            self.tw_theta_a,
+            self.tw_theta_b,
+            self.tw_theta_step,
+            self.tw_ux_steps,
+            self.tw_uy_steps,
+            self.tw_enable_twist,
+            self.tw_enable_slide,
+            self.tw_max_tasks,
+        ):
+            try:
+                var.trace_add("write", self._tw_update_task_summary)
+            except Exception:
+                pass
+        try:
+            def _on_gamma_center_change(*_args):
+                self._tw_update_config_summary()
+
+            def _on_gamma_only_change(*_args):
+                self._tw_update_config_summary()
+                self._tw_update_task_summary()
+
+            self.tw_gamma_center.trace_add("write", _on_gamma_center_change)
+            self.tw_force_gamma_only.trace_add("write", _on_gamma_only_change)
+        except Exception:
+            pass
+
+        self._tw_on_template_change()
+        self._tw_update_config_summary(apply_initial=True)
 
         self._add_section_heading(left, "推荐默认值", help_defaults, title="计算与物理的默认值", pady=(8, 4))
         self._add_section_heading(left, "常见注意事项", help_notes, title="常见注意事项", pady=(0, 8))
@@ -3564,6 +5059,76 @@ class VaspGUI(tk.Tk):
                 self.tw_log.configure(state=tk.DISABLED)
             except Exception:
                 pass
+
+    def _tw_apply_incar_template(self, key: str) -> None:
+        templates = {
+            "metal_film": {
+                "patch": {
+                    "ISMEAR": "1",
+                    "SIGMA": "0.2",
+                    "ISYM": "0",
+                    "KSPACING": "0.22",
+                    "LDIPOL": ".TRUE.",
+                    "IDIPOL": "3",
+                    "LCHARG": ".TRUE.",
+                    "LWAVE": ".FALSE.",
+                },
+                "kspacing": 0.22,
+                "summary": "已应用金属薄膜模板：ISMEAR=1, SIGMA=0.2, ISYM=0, LDIPOL/IDIPOL=3, KSPACING=0.22。",
+            },
+            "hetero_semi": {
+                "patch": {
+                    "ISMEAR": "0",
+                    "SIGMA": "0.05",
+                    "ISYM": "0",
+                    "KSPACING": "0.24",
+                    "LDIPOL": ".TRUE.",
+                    "IDIPOL": "3",
+                    "EDIFF": "1e-6",
+                    "EDIFFG": "-0.02",
+                    "LCHARG": ".TRUE.",
+                    "LWAVE": ".FALSE.",
+                },
+                "kspacing": 0.24,
+                "summary": "已应用半导体异质结模板：ISMEAR=0, SIGMA=0.05, ISYM=0, LDIPOL/IDIPOL=3, KSPACING≈0.24。",
+            },
+            "moire_screen": {
+                "patch": {
+                    "ISMEAR": "0",
+                    "SIGMA": "0.05",
+                    "ISYM": "0",
+                    "KSPACING": "0.35",
+                    "LREAL": "Auto",
+                    "NELM": "120",
+                    "ALGO": "Normal",
+                    "PREC": "Normal",
+                    "LDIPOL": ".TRUE.",
+                    "IDIPOL": "3",
+                    "LCHARG": ".TRUE.",
+                    "LWAVE": ".FALSE.",
+                },
+                "kspacing": 0.35,
+                "summary": "已应用超大莫尔预筛模板：Γ-only 友好参数，KSPACING≈0.35，并保留 LDIPOL/IDIPOL 设置。",
+            },
+        }
+
+        tpl = templates.get(key)
+        if not tpl:
+            return
+        patch = tpl.get("patch", {})
+        summary = tpl.get("summary", "已应用模板。")
+        self._apply_incar_patch(patch, message=f"[twist-template] {summary}")
+        kspacing_val = tpl.get("kspacing")
+        if kspacing_val is not None and hasattr(self, "tw_kspacing"):
+            try:
+                self.tw_kspacing.set(float(kspacing_val))
+            except Exception:
+                pass
+        self._tw_append_log(summary)
+        try:
+            messagebox.showinfo(APP_NAME, summary + "\n如需进一步调整，可在输入页继续修改 INCAR。")
+        except Exception:
+            pass
 
     def _set_busy(self, busy: bool, message: str | None = None) -> None:
         """轻量设置 Busy 光标，并可选记录日志。"""
@@ -3996,6 +5561,9 @@ class VaspGUI(tk.Tk):
             ux_steps = int(self.tw_ux_steps.get())
             uy_steps = int(self.tw_uy_steps.get())
             max_tasks = int(self.tw_max_tasks.get())
+            gamma_center = bool(self.tw_gamma_center.get())
+            force_gamma_only = bool(self.tw_force_gamma_only.get())
+            gamma_threshold = int(self.tw_gamma_atom_threshold.get())
         except Exception as e:
             messagebox.showerror(APP_NAME, f"参数错误：{e}")
             return
@@ -4043,6 +5611,16 @@ class VaspGUI(tk.Tk):
             except Exception:
                 incar_text = ""
 
+        single_override = getattr(self, "_tw_single_override", None)
+        single_ux = None
+        single_uy = None
+        if single and isinstance(single_override, tuple) and len(single_override) == 2:
+            try:
+                single_ux = float(single_override[0])
+                single_uy = float(single_override[1])
+            except Exception:
+                single_ux = single_override[0]
+                single_uy = single_override[1]
         params = dict(
             single=single,
             theta_a=theta_a,
@@ -4062,6 +5640,11 @@ class VaspGUI(tk.Tk):
             project_path=project_path,
             incar_text=incar_text,
             autorun=autorun,
+            gamma_center=gamma_center,
+            force_gamma_only=force_gamma_only,
+            gamma_threshold=gamma_threshold,
+            single_ux=single_ux,
+            single_uy=single_uy,
         )
 
         busy_msg = "正在生成单例任务…" if single else "正在批量生成 twist_sweep 任务…"
@@ -4087,12 +5670,15 @@ class VaspGUI(tk.Tk):
             if warn_msg:
                 messagebox.showwarning(APP_NAME, warn_msg)
             self.refresh_project_overview()
+            self._tw_update_tw_post_hint()
 
         def _on_error(exc: Exception):
             self._set_busy(False)
             self._tw_append_log(f"生成失败：{exc}")
             messagebox.showerror(APP_NAME, f"生成失败：{exc}")
 
+        if single:
+            self._tw_single_override = None
         self._run_bg(self._tw_generate_core, params, on_done=_on_done, on_error=_on_error)
 
     def _tw_generate_core(self, params: dict) -> dict:
@@ -4116,6 +5702,16 @@ class VaspGUI(tk.Tk):
         project_path: Path = Path(params["project_path"])
         incar_text: str = params.get("incar_text", "")
         autorun = bool(params.get("autorun", False))
+        gamma_center = bool(params.get("gamma_center", True))
+        force_gamma_only = bool(params.get("force_gamma_only", False))
+        try:
+            gamma_threshold = int(params.get("gamma_threshold", 500))
+        except Exception:
+            gamma_threshold = 500
+        single_ux = params.get("single_ux")
+        single_uy = params.get("single_uy")
+        if gamma_threshold <= 0:
+            gamma_threshold = 500
 
         import importlib
 
@@ -4131,7 +5727,18 @@ class VaspGUI(tk.Tk):
         else:
             thetas = self._tw_linspace(theta_a, theta_b, step=theta_step)
 
-        if single or not slide_enabled:
+        if single:
+            try:
+                ux_val = float(single_ux) if single_ux is not None else 0.0
+            except Exception:
+                ux_val = single_ux or 0.0
+            try:
+                uy_val = float(single_uy) if single_uy is not None else 0.0
+            except Exception:
+                uy_val = single_uy or 0.0
+            uxs = [ux_val]
+            uys = [uy_val]
+        elif not slide_enabled:
             uxs = [0.0]
             uys = [0.0]
         else:
@@ -4165,6 +5772,11 @@ class VaspGUI(tk.Tk):
                     seen.add(key)
                     combos.append((th, float(cu[0]), float(cu[1])))
 
+        if single and (single_ux is not None or single_uy is not None):
+            try:
+                logs.append(f"单构型模式：使用滑移 u=({uxs[0]:.3f},{uys[0]:.3f})")
+            except Exception:
+                logs.append("单构型模式：使用指定滑移 u 值。")
         logs.append(
             f"开始生成：θ 数量={len(thetas)}, u_x 数量={len(uxs)}, u_y 数量={len(uys)}，总计 {len(combos)} 个组合"
         )
@@ -4178,6 +5790,7 @@ class VaspGUI(tk.Tk):
         skipped = 0
         last_preview: tuple | None = None
         warn_msg = None
+        auto_gamma_dirs: list[str] = []
 
         for th, ux, uy in combos:
             name = f"theta_{th:+06.2f}_ux_{ux:0.3f}_uy_{uy:0.3f}".replace("+", "")
@@ -4212,16 +5825,43 @@ class VaspGUI(tk.Tk):
                 logs.append(f"写入 POSCAR 失败：{exc}")
                 continue
 
+            gamma_only = bool(force_gamma_only)
+            if not gamma_only and gamma_threshold > 0:
+                gamma_only = len(st) >= gamma_threshold
+            if gamma_only:
+                auto_gamma_dirs.append(workdir.name)
+
             patch = {
                 "ISYM": "0",
-                "KSPACING": f"{kspacing}",
                 "LWAVE": ".FALSE.",
                 "LCHARG": ".TRUE.",
                 "LDIPOL": ".TRUE.",
                 "IDIPOL": "3",
             }
+            if not gamma_only:
+                patch["KSPACING"] = f"{kspacing}"
+            patch["KGAMMA"] = ".TRUE." if gamma_center else ".FALSE."
+
             incar_new = self._update_incar_text(incar_text, patch)
             write_text(workdir / "INCAR", incar_new)
+
+            kpoints_path = workdir / "KPOINTS"
+            if gamma_only:
+                kpt_txt = "\n".join([
+                    "Gamma-only mesh",
+                    "0",
+                    "Gamma",
+                    "1 1 1",
+                    "0 0 0",
+                    "",
+                ])
+                atomic_write_text(kpoints_path, kpt_txt, encoding="utf-8")
+            else:
+                if kpoints_path.exists():
+                    try:
+                        kpoints_path.unlink()
+                    except Exception:
+                        pass
 
             pot = project_path / "POTCAR"
             if pot.exists():
@@ -4232,8 +5872,16 @@ class VaspGUI(tk.Tk):
 
             meta_path = workdir / "meta.json"
             meta2 = dict(meta)
-            meta2.update(dict(path=str(workdir)))
-            meta_path.write_text(json.dumps(meta2, ensure_ascii=False, indent=2), encoding="utf-8")
+            meta2.update(
+                dict(
+                    path=str(workdir),
+                    gamma_only=bool(gamma_only),
+                    gamma_center=bool(gamma_center),
+                )
+            )
+            if not gamma_only:
+                meta2["kspacing"] = float(kspacing)
+            atomic_write_text(meta_path, json.dumps(meta2, ensure_ascii=False, indent=2), encoding="utf-8")
 
             made += 1
             last_preview = (st, meta2)
@@ -4261,6 +5909,13 @@ class VaspGUI(tk.Tk):
 
         info_msg = f"生成完成：成功 {made}，跳过 {skipped}（详见各子目录）。输出根目录：{root}"
         logs.append(f"生成完成：成功 {made}，跳过 {skipped}，输出目录 {root}")
+
+        if auto_gamma_dirs:
+            sample = ", ".join(auto_gamma_dirs[:4])
+            msg = f"{len(auto_gamma_dirs)} 个任务因原子数较大已设置为仅 Γ 点：{sample}" + (" …" if len(auto_gamma_dirs) > 4 else "")
+            logs.append(msg)
+            if warn_msg is None:
+                warn_msg = msg
 
         return {
             "logs": logs,
@@ -5045,7 +6700,7 @@ class VaspGUI(tk.Tk):
                 [
                     ("选择项目", self.choose_project),
                     ("新建项目", self.create_project),
-                    ("快速体检", self.quick_check),
+                    ("快速体检 (Preflight)", self.quick_check),
                 ],
                 self.page_inputs,
             ),
@@ -5066,6 +6721,15 @@ class VaspGUI(tk.Tk):
                     ("解析元素", self.show_poscar_elements),
                 ],
                 self.page_inputs,
+            ),
+            (
+                "③½ 二维材料批量（扭转/滑移）",
+                "针对二维材料的扭转/滑移扫描，提供推荐模板、任务估算与批量生成。",
+                [
+                    ("开始二维材料扫描", self._tw_launch_wizard),
+                    ("打开二维面板", lambda: self.goto_tab(self.page_twist)),
+                ],
+                self.page_twist,
             ),
             (
                 "④ 配置运行方式",
@@ -5681,6 +7345,27 @@ nice -n 5 ionice -c2 -n4 \
         left = ttk.Frame(left_canvas, padding=8)
         left_window = left_canvas.create_window((0, 0), window=left, anchor="nw")
 
+        style = ttk.Style()
+        style.configure("TwBanner.TFrame", background="#e7f1ff")
+        style.configure("TwBanner.TLabel", background="#e7f1ff", foreground="#0a5cad")
+
+        self.tw_post_hint_frame = ttk.Frame(left, padding=6, style="TwBanner.TFrame")
+        self.tw_post_hint_var = tk.StringVar(value="")
+        ttk.Label(
+            self.tw_post_hint_frame,
+            textvariable=self.tw_post_hint_var,
+            wraplength=320,
+            justify=tk.LEFT,
+            style="TwBanner.TLabel",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            self.tw_post_hint_frame,
+            text="快速复算最优 θ,u",
+            command=self._tw_jump_to_best_for_refine,
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+        self._tw_post_hint_visible = False
+
+
         def _sync_scrollregion(event):
             left_canvas.configure(scrollregion=left_canvas.bbox("all"))
 
@@ -5798,6 +7483,7 @@ nice -n 5 ionice -c2 -n4 \
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
         self.post_fig_area = ttk.Notebook(right)
         self.post_fig_area.pack(fill=tk.BOTH, expand=True)
+        self._tw_update_tw_post_hint()
 
         return frame
 
@@ -6061,7 +7747,7 @@ nice -n 5 ionice -c2 -n4 \
         }
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            atomic_write_text(CONFIG_PATH, json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
 
@@ -6226,6 +7912,8 @@ nice -n 5 ionice -c2 -n4 \
                 widget.insert("1.0", read_text(path))
             except Exception:
                 pass
+        self._update_tw_entry_banner()
+        self._tw_update_tw_post_hint()
 
     def set_project(self, path: Path):
         try:
@@ -6237,6 +7925,8 @@ nice -n 5 ionice -c2 -n4 \
         self.load_project_inputs()
         self.refresh_project_overview()
         self.refresh_run_status()
+        self._update_tw_entry_banner()
+        self._tw_update_tw_post_hint()
 
     # ------------------------- 项目与体检 ----------------------------------
     def choose_project(self):
@@ -6257,70 +7947,524 @@ nice -n 5 ionice -c2 -n4 \
         messagebox.showinfo(APP_NAME, f"已创建项目目录：{p}")
 
     def quick_check(self):
-        proj = self.current_project_path()
-        summary: list[str] = []
-        issues: list[str] = []
+        self.quick_preflight()
 
-        required = ["INCAR", "POSCAR", "POTCAR", "KPOINTS"]
-        for name in required:
-            path = proj / name
-            exists = path.exists()
-            mark = "✔" if exists else "✗"
-            summary.append(f"{name:7s} : {mark} {path if exists else ''}".rstrip())
-            if not exists:
-                issues.append(f"未检测到 {name}，请确认是否已保存到项目目录。")
-
-        poscar_text = ""
-        poscar_path = proj / "POSCAR"
-        if poscar_path.exists():
-            poscar_text = read_text(poscar_path)
-        else:
-            poscar_text = self.poscar_text.get("1.0", tk.END).strip()
-
-        elems = unique_elements_from_poscar(poscar_text) if poscar_text else []
-        if elems:
-            summary.append("POSCAR 元素: " + ", ".join(elems))
-        elif poscar_text:
-            issues.append("POSCAR 内容存在但未能解析元素，请检查第6/7行。")
-        else:
-            issues.append("POSCAR 内容为空。")
-
-        potcar_path = proj / "POTCAR"
-        if potcar_path.exists() and elems:
-            pot_text = read_text(potcar_path)
-            titels = [ln for ln in pot_text.splitlines() if ln.strip().startswith("TITEL")]
-            if len(titels) < len(elems):
-                issues.append("POTCAR 中的赝势数量少于 POSCAR 元素数量。")
-
-        incar_path = proj / "INCAR"
-        incar_text = read_text(incar_path) if incar_path.exists() else self.incar_text.get("1.0", tk.END)
-        for key in ("ENCUT", "EDIFF"):
-            if not re.search(rf"(?mi)^\s*{re.escape(key)}\s*=", incar_text):
-                issues.append(f"INCAR 未设置 {key}，请确认输入参数。")
-
-        for cmd in ["mpirun", self.vasp_cmd.get().strip(), "sbatch", "wsl" if os.name == "nt" else None]:
-            if not cmd:
-                continue
-            resolved = which(cmd)
-            summary.append(f"which {cmd:8s} -> {resolved or '未找到'}")
-            if resolved is None and cmd not in ("sbatch", "wsl"):
-                issues.append(f"未在 PATH 中找到 {cmd}，可能无法直接运行 VASP。")
-
-        potroot = Path(self.pot_dir_var.get())
-        summary.append(f"POT 库: {potroot} {'(存在)' if potroot.exists() else '(不存在)'}")
-        if not potroot.exists():
-            issues.append("赝势库根目录不存在，请重新设置 POTCAR 路径。")
-
-        log_msg = "\n".join(summary)
-        self.append_run_log(log_msg + "\n")
+    def quick_preflight(self):
+        report = self._collect_preflight_checks()
+        if not report:
+            return
+        log_lines = report.get("log_lines", [])
+        if log_lines:
+            self.append_run_log("\n".join(log_lines) + "\n")
         self.refresh_project_overview()
         self.refresh_run_status()
+        self._show_preflight_dialog(report)
 
-        if issues:
-            detail = "\n- " + "\n- ".join(issues)
-            messagebox.showwarning(APP_NAME, f"项目体检结果：\n{log_msg}\n\n需关注：{detail}")
+    def _parse_incar_map(self, text: str) -> tuple[dict[str, str], list[tuple[str, str, str]]]:
+        mapping: dict[str, str] = {}
+        typos: list[tuple[str, str, str]] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith("!"):
+                continue
+            if "=" not in stripped:
+                continue
+            key_part, value_part = stripped.split("=", 1)
+            key_clean = key_part.strip().upper()
+            if not key_clean:
+                continue
+            value = value_part.strip()
+            for sep in ("!", "#"):
+                idx = value.find(sep)
+                if idx != -1:
+                    value = value[:idx].strip()
+                    break
+            key_norm = KEY_CORRECTIONS.get(key_clean, key_clean)
+            mapping[key_norm] = value
+            if key_norm != key_clean:
+                typos.append((key_clean, key_norm, value))
+        return mapping, typos
+
+    def _apply_incar_patch(self, patch: dict[str, Optional[str]], message: str | None = None) -> str:
+        proj = self.current_project_path()
+        proj.mkdir(parents=True, exist_ok=True)
+        incar_path = proj / "INCAR"
+        if incar_path.exists():
+            base_text = read_text(incar_path)
         else:
-            messagebox.showinfo(APP_NAME, f"项目体检完成：\n{log_msg}\n\n未发现明显问题，可继续下一步。")
+            base_text = self.incar_text.get("1.0", tk.END)
+        new_text = self._update_incar_text(base_text, patch)
+        write_text(incar_path, new_text)
+        try:
+            self.incar_text.delete("1.0", tk.END)
+            self.incar_text.insert("1.0", new_text)
+        except Exception:
+            pass
+        try:
+            self.refresh_incar_simple_panel()
+        except Exception:
+            pass
+        self.refresh_project_overview()
+        if message:
+            self.append_run_log(message + "\n")
+        return new_text
+
+    def _collect_preflight_checks(self) -> dict[str, Any]:
+        proj = self.current_project_path()
+        items: list[PreflightItem] = []
+        log_lines: list[str] = []
+        icon_map = {"error": "❌", "warn": "⚠️", "ok": "✅", "info": "ℹ️"}
+
+        def _add(level: str, title: str, detail: str, fix: Callable[[], None] | None = None,
+                 fix_label: str | None = None, auto: bool = True) -> None:
+            item = PreflightItem(level=level, title=title, detail=detail, fix=fix, fix_label=fix_label, auto=auto)
+            items.append(item)
+            icon = icon_map.get(level, "•")
+            log_lines.append(f"[Preflight]{icon} {title} - {detail}")
+
+        proj_exists = proj.exists()
+        if proj_exists:
+            _add("ok", "项目目录", f"{proj}")
+        else:
+            _add("error", "项目目录", f"{proj} 不存在，部分检查可能无法完成。", auto=False)
+
+        incar_path = proj / "INCAR"
+        poscar_path = proj / "POSCAR"
+        kpoints_path = proj / "KPOINTS"
+        potcar_path = proj / "POTCAR"
+
+        incar_text = read_text(incar_path) if incar_path.exists() else self.incar_text.get("1.0", tk.END)
+        poscar_text = read_text(poscar_path) if poscar_path.exists() else self.poscar_text.get("1.0", tk.END)
+        kpoints_text = read_text(kpoints_path) if kpoints_path.exists() else self.kpoints_text.get("1.0", tk.END)
+
+        incar_map, incar_typos = self._parse_incar_map(incar_text)
+
+        def _check_file(name: str, path: Path, editor: tk.Text | None, *, critical: bool) -> None:
+            if path.exists():
+                _add("ok", f"{name} 文件", f"{path.name} 已存在")
+                return
+            editor_content = ""
+            if editor is not None:
+                try:
+                    editor_content = editor.get("1.0", tk.END).strip()
+                except Exception:
+                    editor_content = ""
+            if editor_content:
+                _add(
+                    "warn",
+                    f"{name} 文件",
+                    f"{path.name} 尚未保存到 {proj}",
+                    fix=partial(self.save_from_editor, name, editor),
+                    fix_label=f"保存 {name}",
+                    auto=False,
+                )
+            else:
+                level = "error" if critical else "warn"
+                _add(level, f"{name} 文件", f"未在项目目录中检测到 {path.name}", auto=False)
+
+        _check_file("INCAR", incar_path, getattr(self, "incar_text", None), critical=True)
+        _check_file("POSCAR", poscar_path, getattr(self, "poscar_text", None), critical=True)
+        _check_file("KPOINTS", kpoints_path, getattr(self, "kpoints_text", None), critical=False)
+
+        if potcar_path.exists():
+            pot_text = read_text(potcar_path)
+            titel_lines = [ln for ln in pot_text.splitlines() if ln.strip().startswith("TITEL")]
+            _add("ok", "POTCAR 赝势", f"检测到 {len(titel_lines)} 条 TITEL 记录")
+        else:
+            _add("error", "POTCAR 赝势", "项目目录缺少 POTCAR，请先拼接赝势。", auto=False)
+
+        potroot = Path(self.pot_dir_var.get())
+        if potroot.exists():
+            _add("info", "赝势库路径", f"{potroot}")
+        else:
+            _add("warn", "赝势库路径", f"{potroot} 不存在，请确认设置。", auto=False)
+
+        if poscar_text.strip():
+            poscar_elements, poscar_counts = parse_poscar(poscar_text)
+            if poscar_elements:
+                _add("info", "POSCAR 元素", ", ".join(poscar_elements))
+            else:
+                _add("warn", "POSCAR 解析", "未能解析元素，请检查第6/7行。", auto=False)
+        else:
+            poscar_elements, poscar_counts = [], []
+            _add("error", "POSCAR 内容", "POSCAR 内容为空。", auto=False)
+
+        if potcar_path.exists() and poscar_elements:
+            pot_text = read_text(potcar_path)
+            titel_lines = [ln for ln in pot_text.splitlines() if ln.strip().startswith("TITEL")]
+            if len(titel_lines) < len(poscar_elements):
+                _add("warn", "POTCAR 匹配", "POTCAR 中的赝势数量少于 POSCAR 元素数量。", auto=False)
+
+        for key in ("ENCUT", "EDIFF"):
+            if key not in incar_map:
+                _add("warn", "INCAR 关键参数", f"未设置 {key}，请确认是否符合计算需求。", auto=False)
+
+        if incar_typos:
+            typo_desc = ", ".join(f"{orig} → {norm}" for orig, norm, _ in incar_typos)
+
+            def _fix_typos() -> None:
+                patch: dict[str, Optional[str]] = {}
+                for orig, norm, value in incar_typos:
+                    if norm not in incar_map:
+                        patch[norm] = value
+                    patch[orig] = None
+                self._apply_incar_patch(patch, message=f"已自动更正 INCAR 键名：{typo_desc}")
+
+            _add("warn", "INCAR 键名", f"检测到可能的拼写：{typo_desc}", fix=_fix_typos, fix_label="自动更正键名")
+
+        structure = None
+        vacuum_ang = None
+        is_slab = False
+        if HAS_PYMATGEN:
+            try:
+                from pymatgen.core import Structure  # type: ignore
+
+                if poscar_path.exists():
+                    structure = Structure.from_file(str(poscar_path))
+                elif poscar_text.strip():
+                    structure = Structure.from_str(poscar_text, fmt="poscar")
+            except Exception:
+                structure = None
+
+        if structure is not None:
+            try:
+                cart_z = [structure.lattice.get_cartesian_coords(site.frac_coords)[2] for site in structure]
+                if cart_z:
+                    z_min = min(cart_z)
+                    z_max = max(cart_z)
+                    z_span = z_max - z_min
+                    c_len = structure.lattice.c
+                    vacuum_ang = max(c_len - z_span, 0.0)
+                    try:
+                        if hasattr(structure, "is_low_dimensional") and structure.is_low_dimensional(2):
+                            is_slab = True
+                    except Exception:
+                        pass
+                    if not is_slab and vacuum_ang is not None:
+                        is_slab = vacuum_ang > 6.0 and c_len > 15.0
+            except Exception:
+                structure = None
+
+        has_kpoints = kpoints_path.exists()
+        kspacing_value: float | None = None
+        if "KSPACING" in incar_map:
+            try:
+                kspacing_value = float(str(incar_map["KSPACING"]).split()[0])
+            except Exception:
+                kspacing_value = None
+
+        if not has_kpoints and kspacing_value is None:
+
+            def _fix_kspacing() -> None:
+                self._apply_incar_patch({"KSPACING": "0.22"}, message="已补充 KSPACING = 0.22")
+
+            _add(
+                "error",
+                "K 网格",
+                "未检测到 KPOINTS 或 KSPACING，VASP 将退回粗糙默认网格。",
+                fix=_fix_kspacing,
+                fix_label="设置 KSPACING=0.22",
+            )
+        elif has_kpoints and kspacing_value is not None:
+            _add("info", "K 网格", "检测到 KPOINTS 与 KSPACING 同时存在，VASP 将优先使用 KPOINTS 文件。", auto=False)
+        elif kspacing_value is not None and structure is not None:
+            try:
+                lengths = structure.lattice.reciprocal_lattice.lengths
+                approx = [max(1, int(round(l / kspacing_value))) for l in lengths]
+                _add(
+                    "info",
+                    "KSPACING 估算",
+                    f"KSPACING ≈ {kspacing_value:.3f} Å⁻¹ → 约 {approx[0]}×{approx[1]}×{approx[2]} 网格",
+                    auto=False,
+                )
+            except Exception:
+                pass
+
+        if is_slab:
+            ldipol_raw = incar_map.get("LDIPOL")
+            ldipol_true = str(ldipol_raw).strip().upper() in {".TRUE.", "TRUE", "T"}
+            idipol_val = str(incar_map.get("IDIPOL", "")).strip()
+
+            def _apply_dipole() -> None:
+                self._apply_incar_patch({"LDIPOL": ".TRUE.", "IDIPOL": "3"}, message="已启用 LDIPOL/IDIPOL=3")
+
+            vac_text = f"，真空约 {vacuum_ang:.1f} Å" if vacuum_ang is not None else ""
+            if not ldipol_true:
+                _add(
+                    "warn",
+                    "薄膜偶极修正",
+                    f"检测到 2D/薄膜结构{vac_text}，建议启用 LDIPOL=.TRUE., IDIPOL=3。",
+                    fix=_apply_dipole,
+                    fix_label="写入 LDIPOL/IDIPOL",
+                )
+            elif idipol_val not in {"3", "2", "1"} or idipol_val != "3":
+                _add(
+                    "warn",
+                    "薄膜偶极修正",
+                    "已启用 LDIPOL，但 IDIPOL≠3，建议沿 c 方向取 3。",
+                    fix=lambda: self._apply_incar_patch({"IDIPOL": "3"}, message="已设置 IDIPOL=3"),
+                    fix_label="设置 IDIPOL=3",
+                )
+            else:
+                _add("info", "薄膜偶极修正", "已启用 LDIPOL/IDIPOL=3，可在必要时补充 DIPOL 中点。", auto=False)
+
+        gap_value: float | None = None
+        band_character = "unknown"
+
+        def _bandgap_from_vasprun(vpath: Path) -> float | None:
+            try:
+                import xml.etree.ElementTree as ET
+
+                for _, elem in ET.iterparse(str(vpath), events=("end",)):
+                    if elem.tag == "i" and elem.attrib.get("name", "").lower() == "bandgap":
+                        text = (elem.text or "").strip()
+                        elem.clear()
+                        if text:
+                            return float(text)
+                return None
+            except Exception:
+                return None
+
+        vasprun_path = proj / "vasprun.xml"
+        if vasprun_path.exists():
+            gap_value = _bandgap_from_vasprun(vasprun_path)
+
+        if gap_value is None:
+            dos_data = _parse_dos_doscar(proj)
+            if dos_data:
+                energies = dos_data.get("energies", [])
+                dos_vals = dos_data.get("dos", [])
+                fermi = dos_data.get("fermi") or 0.0
+                rel = [e - fermi for e in energies]
+                gap_est, band_type = _estimate_gap_from_dos(rel, dos_vals, 0.02)
+                if band_type == "metal":
+                    gap_value = 0.0
+                    band_character = "metal"
+                elif gap_est > 0:
+                    gap_value = gap_est
+                    band_character = "semiconductor"
+
+        if gap_value is not None and band_character == "unknown":
+            if gap_value <= 0.05:
+                band_character = "metal"
+                gap_value = 0.0
+            else:
+                band_character = "semiconductor"
+
+        smear_reco = ("0", "0.05")
+        smear_desc = "默认建议 ISMEAR=0, SIGMA=0.05"
+        if band_character == "metal":
+            smear_reco = ("1", "0.2")
+            smear_desc = "检测到金属性（带隙≈0），建议 ISMEAR=1, SIGMA≈0.2"
+        elif band_character in {"semiconductor", "insulator"}:
+            if gap_value is not None:
+                smear_desc = f"检测到带隙 ~ {gap_value:.2f} eV，建议 ISMEAR=0, SIGMA=0.05"
+            else:
+                smear_desc = "检测到带隙型体系，建议 ISMEAR=0, SIGMA=0.05"
+
+        isme_current = incar_map.get("ISMEAR")
+        sigma_current = incar_map.get("SIGMA")
+        smear_fix_needed = False
+
+        def _int_or_none(val: str | None) -> int | None:
+            if val is None:
+                return None
+            try:
+                return int(float(val))
+            except Exception:
+                return None
+
+        if isme_current is None:
+            smear_fix_needed = True
+        else:
+            isme_int = _int_or_none(isme_current)
+            if band_character == "metal" and isme_int not in {1, 2}:
+                smear_fix_needed = True
+            elif band_character in {"semiconductor", "insulator"} and isme_int not in {0, -5}:
+                smear_fix_needed = True
+
+        if sigma_current is None:
+            smear_fix_needed = True
+        else:
+            try:
+                if abs(float(sigma_current) - float(smear_reco[1])) > 0.05:
+                    smear_fix_needed = True
+            except Exception:
+                smear_fix_needed = True
+
+        if smear_fix_needed:
+            _add(
+                "warn",
+                "展宽参数",
+                smear_desc,
+                fix=lambda: self._apply_incar_patch({"ISMEAR": smear_reco[0], "SIGMA": smear_reco[1]}, message="已更新 ISMEAR/SIGMA"),
+                fix_label=f"设置 ISMEAR={smear_reco[0]}",
+            )
+        else:
+            _add("info", "展宽参数", smear_desc, auto=False)
+
+        spin = incar_map.get("ISPIN")
+        spin_int = _int_or_none(spin)
+        if spin_int == 2 and "MAGMOM" not in incar_map:
+            if poscar_counts:
+                template = " ".join(f"{cnt}*1.0" for cnt in poscar_counts)
+            else:
+                template = "1*1.0"
+
+            def _fix_magmom() -> None:
+                self._apply_incar_patch({"MAGMOM": template}, message="已写入示例 MAGMOM")
+
+            _add(
+                "warn",
+                "磁性初始化",
+                f"ISPIN=2 但未设置 MAGMOM，已准备模板：{template}",
+                fix=_fix_magmom,
+                fix_label="写入 MAGMOM 模板",
+            )
+
+        if str(incar_map.get("LHFCALC", "")).strip().upper() not in {".TRUE.", "TRUE", "T"}:
+
+            def _apply_hse() -> None:
+                patch = {
+                    "LHFCALC": ".TRUE.",
+                    "HFSCREEN": "0.2",
+                    "AEXX": "0.25",
+                    "ALGO": "Damped",
+                    "TIME": "0.4",
+                    "PRECFOCK": "Fast",
+                    "ISMEAR": "0",
+                    "SIGMA": "0.05",
+                }
+                self._apply_incar_patch(patch, message="已切换至 HSE06 核心标签")
+
+            detail = "PBE 带隙通常偏低，关键构型可追加 HSE06 复算以获得对照。"
+            _add("info", "混成泛函提醒", detail, fix=_apply_hse, fix_label="切换到 HSE06", auto=False)
+
+        cmds = ["mpirun", self.vasp_cmd.get().strip(), "sbatch"]
+        if os.name == "nt":
+            cmds.append("wsl")
+        seen_cmds = set()
+        for cmd in cmds:
+            if not cmd or cmd in seen_cmds:
+                continue
+            seen_cmds.add(cmd)
+            resolved = which(cmd)
+            if resolved:
+                _add("info", f"命令 {cmd}", resolved, auto=False)
+            elif cmd not in {"sbatch", "wsl"}:
+                _add("warn", f"命令 {cmd}", f"未在 PATH 中找到 {cmd}，可能无法直接调用。", auto=False)
+
+        has_errors = any(item.level == "error" for item in items)
+        return {"items": items, "log_lines": log_lines, "has_errors": has_errors}
+
+    def _show_preflight_dialog(self, report: dict[str, Any]) -> None:
+        existing = getattr(self, "_preflight_window", None)
+        if existing and existing.winfo_exists():
+            try:
+                existing.destroy()
+            except Exception:
+                pass
+
+        top = tk.Toplevel(self)
+        top.title("快速体检 (Preflight)")
+        top.geometry("720x520")
+        top.transient(self)
+        self._preflight_window = top
+
+        frame = ttk.Frame(top, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        summary_var = tk.StringVar()
+        ttk.Label(frame, textvariable=summary_var, font=("Arial", 11, "bold")).pack(anchor=tk.W)
+
+        tree_frame = ttk.Frame(frame)
+        tree_frame.pack(fill=tk.BOTH, expand=True, pady=8)
+        columns = ("status", "title", "detail")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=12)
+        tree.heading("status", text="状态")
+        tree.heading("title", text="检查项")
+        tree.heading("detail", text="详情")
+        tree.column("status", width=70, anchor=tk.CENTER)
+        tree.column("title", width=160, anchor=tk.W)
+        tree.column("detail", anchor=tk.W, stretch=True)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.configure(yscrollcommand=scroll.set)
+
+        fix_frame = ttk.LabelFrame(frame, text="一键修复")
+        fix_frame.pack(fill=tk.X, pady=4)
+
+        btn_bar = ttk.Frame(frame)
+        btn_bar.pack(fill=tk.X, pady=(6, 0))
+
+        status_icon = {"error": "❌", "warn": "⚠️", "ok": "✅", "info": "ℹ️"}
+
+        def _apply_fix(item: PreflightItem) -> None:
+            if not item.fix:
+                return
+            try:
+                item.fix()
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror(APP_NAME, f"修复失败：{exc}")
+            finally:
+                _refresh()
+
+        def _apply_all() -> None:
+            current_items = report_state.get("items", [])
+            for item in current_items:
+                if item.fix and item.auto:
+                    try:
+                        item.fix()
+                    except Exception as exc:  # noqa: BLE001
+                        messagebox.showerror(APP_NAME, f"修复失败：{exc}")
+                        break
+            _refresh()
+
+        report_state = {"items": report.get("items", [])}
+
+        def _render(rep: dict[str, Any]) -> None:
+            items_now: list[PreflightItem] = rep.get("items", [])
+            report_state["items"] = items_now
+            for row in tree.get_children():
+                tree.delete(row)
+            counts = {"error": 0, "warn": 0, "ok": 0, "info": 0}
+            for item in items_now:
+                counts[item.level] = counts.get(item.level, 0) + 1
+                tree.insert("", tk.END, values=(status_icon.get(item.level, "•"), item.title, item.detail))
+            summary_var.set(
+                f"共 {len(items_now)} 项检查：❌ {counts.get('error',0)} | ⚠️ {counts.get('warn',0)} | ✅ {counts.get('ok',0)} | ℹ️ {counts.get('info',0)}"
+            )
+            for child in fix_frame.winfo_children():
+                child.destroy()
+            actions = [item for item in items_now if item.fix]
+            auto_items = [item for item in actions if item.auto]
+            if actions:
+                if auto_items:
+                    ttk.Button(fix_frame, text="一键修复常见项", command=_apply_all).pack(side=tk.LEFT, padx=4, pady=4)
+                for item in actions:
+                    label = item.fix_label or f"修复：{item.title}"
+                    ttk.Button(
+                        fix_frame,
+                        text=label,
+                        command=lambda it=item: _apply_fix(it),
+                    ).pack(side=tk.LEFT, padx=4, pady=4)
+            else:
+                ttk.Label(fix_frame, text="当前无需自动修复，所有检查项均已通过。", foreground="#228833").pack(anchor=tk.W, padx=4, pady=4)
+
+        def _refresh() -> None:
+            new_report = self._collect_preflight_checks()
+            if new_report:
+                _render(new_report)
+
+        ttk.Button(btn_bar, text="重新检查", command=_refresh).pack(side=tk.LEFT)
+        ttk.Button(btn_bar, text="关闭", command=top.destroy).pack(side=tk.RIGHT)
+
+        _render(report)
+        try:
+            top.grab_set()
+        except Exception:
+            pass
 
     # === 并行推断辅助 ===
     def _read_file_text(self, p: Path) -> str:
