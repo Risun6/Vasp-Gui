@@ -2443,7 +2443,6 @@ class VaspGUI(tk.Tk):
         self.run_suggestion_widgets: list[tk.Text] = []
         self.post_results: dict[str, PostResult] = {}
         self.post_latest_reports: dict[str, Path] = {}
-        self.tw_last_poscar_dir: Path | None = None
         self.overview_items = [
             ("__project__", "项目目录"),
             ("INCAR", "INCAR"),
@@ -3430,21 +3429,13 @@ class VaspGUI(tk.Tk):
 
         row = ttk.Frame(left); row.pack(fill=tk.X, pady=2)
         ttk.Label(row, text="上层 POSCAR:").pack(side=tk.LEFT)
-        ttk.Entry(row, textvariable=self.tw_top_path, width=44).pack(side=tk.LEFT, padx=4)
-        ttk.Button(
-            row,
-            text="选择…",
-            command=lambda: self._tw_pick_poscar(self.tw_top_path, title="选择上层 POSCAR"),
-        ).pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.tw_top_path, width=30).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text="选择…", command=lambda: self._tw_pick_poscar(self.tw_top_path)).pack(side=tk.LEFT)
 
         row = ttk.Frame(left); row.pack(fill=tk.X, pady=2)
         ttk.Label(row, text="下层 POSCAR:").pack(side=tk.LEFT)
-        ttk.Entry(row, textvariable=self.tw_bot_path, width=44).pack(side=tk.LEFT, padx=4)
-        ttk.Button(
-            row,
-            text="选择…",
-            command=lambda: self._tw_pick_poscar(self.tw_bot_path, title="选择下层 POSCAR"),
-        ).pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.tw_bot_path, width=30).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text="选择…", command=lambda: self._tw_pick_poscar(self.tw_bot_path)).pack(side=tk.LEFT)
 
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
@@ -3607,34 +3598,9 @@ class VaspGUI(tk.Tk):
     # === CODEX END: twist/shift page UI ===
 
     # === CODEX BEGIN: twist/shift geometry core ===
-    def _tw_pick_poscar(self, var: tk.StringVar, title: str = "选择 POSCAR"):
-        current = Path(var.get().strip()) if var.get().strip() else None
-        initialdir: Path | None = None
-        if current:
-            if current.is_dir():
-                initialdir = current
-            else:
-                initialdir = current.parent
-        elif getattr(self, "tw_last_poscar_dir", None):
-            initialdir = self.tw_last_poscar_dir
-
-        options: dict[str, object] = {
-            "title": title,
-            "filetypes": [
-                ("POSCAR / CONTCAR", ("POSCAR", "CONTCAR", "POSCAR-*", "CONTCAR-*")),
-                ("所有文件", "*"),
-            ],
-        }
-        if initialdir and initialdir.exists():
-            options["initialdir"] = str(initialdir)
-
-        p = filedialog.askopenfilename(**options)
-        if p:
-            var.set(p)
-            try:
-                self.tw_last_poscar_dir = Path(p).parent
-            except Exception:
-                self.tw_last_poscar_dir = None
+    def _tw_pick_poscar(self, var):
+        p = filedialog.askopenfilename(title="选择 POSCAR", filetypes=[("POSCAR","POSCAR*"),("All","*")])
+        if p: var.set(p)
 
     def _tw_preview_once(self):
         """使用当前 θ = theta_a、u=(0,0) 快速构造一次并俯视预览。"""
@@ -4546,10 +4512,14 @@ class VaspGUI(tk.Tk):
 
     # --- 目录/文件选择 ---
     def _tw_choose_top(self):
-        self._tw_pick_poscar(self.tw_top_path, title="选择上层 POSCAR")
+        p = filedialog.askopenfilename(title="选择上层 POSCAR", filetypes=[("POSCAR", "POSCAR"), ("All", "*")])
+        if p:
+            self.tw_top_path.set(p)
 
     def _tw_choose_bot(self):
-        self._tw_pick_poscar(self.tw_bot_path, title="选择下层 POSCAR")
+        p = filedialog.askopenfilename(title="选择下层 POSCAR", filetypes=[("POSCAR", "POSCAR"), ("All", "*")])
+        if p:
+            self.tw_bot_path.set(p)
 
     def _tw_choose_dir(self):
         d = filedialog.askdirectory(title="选择扫参目录")
