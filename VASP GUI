@@ -2635,7 +2635,11 @@ class VaspGUI(tk.Tk):
         self.page_monitor = self._build_monitor_page(self.nb)
         self.page_post = self._build_post_page(self.nb)
 
-        # 最后再建 workflow（里面会引用上面三个）
+        # 二维相关页面会在流程助手中引用，需提前创建以保证属性存在
+        self.page_twist = self._build_twistshift_page(self.nb)
+        self.page_twist_results = self._build_twistshift_results_page(self.nb)
+
+        # 最后再建 workflow（里面会引用上面这些页面）
         self.page_workflow = self._build_workflow_page(self.nb)
 
         self.nb.add(self.page_inputs, text="输入 / POTCAR / K 点")
@@ -2645,10 +2649,8 @@ class VaspGUI(tk.Tk):
         self.nb.add(self.page_post, text="后处理")
 
         # === CODEX BEGIN: add twist/shift tab ===
-        self.page_twist = self._build_twistshift_page(self.nb)
         self.nb.add(self.page_twist, text="二维材料·滑移/扭转")
         # 结果演示页：用于快速加载 CSV/JSON 并绘制热图
-        self.page_twist_results = self._build_twistshift_results_page(self.nb)
         self.nb.add(self.page_twist_results, text="二维材料·结果演示")
         # === CODEX END: add twist/shift tab ===
 
