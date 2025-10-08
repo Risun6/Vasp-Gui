@@ -28,6 +28,19 @@ POTCAR 拼接（本地已有赝势）、K 点生成、作业脚本生成与提�
 作者：ChatGPT（GPT-5 Thinking）
 许可：MIT
 """
+# 目录（逻辑分层总览）
+# 1. 运行依赖与基础常量 ................................................. Section 1
+# 2. 后处理 / 数值基础工具函数 ............................................ Section 2
+# 3. 数据模型与模板配置 ................................................... Section 3
+# 4. 演示数据生成与样例 ................................................... Section 4
+# 5. 通用 I/O 与 VASP 项目工具函数 ........................................ Section 5
+# 6. 后处理流程实现（DOS/带结构等） ....................................... Section 6
+# 7. GUI 后台线程与公共组件 ............................................... Section 7
+# 8. 主窗口界面构建（VaspGUI） ............................................ Section 8
+# 9. 扭转/滑移扩展页面与算法 ............................................. Section 9
+# 10. 新手引导与程序入口 ................................................. Section 10
+
+# === Section 1: 运行依赖与基础常量 ===
 from __future__ import annotations
 import os
 import sys
@@ -44,7 +57,7 @@ import datetime as _dt
 import pickle
 import tempfile
 from functools import partial
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Literal, Callable
 from pathlib import Path
@@ -102,6 +115,7 @@ M_E = 9.10938356e-31     # kg
 ANG_TO_M = 1e-10
 
 
+# === Section 2: 后处理 / 数值基础工具函数 ===
 def _ensure_report_dirs(workdir: Path, opts: Dict[str, Any]) -> tuple[Path, Path, Path]:
     """确保报告输出目录存在，返回 (report_dir, figs_dir, tables_dir)。"""
     report_dir = opts.get("report_dir")
@@ -151,6 +165,7 @@ CONFIG_DIR = Path.home() / ".config" / "vasp_gui"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 
+# === Section 3: 数据模型与模板配置 ===
 @dataclass
 class PostResult:
     metrics: Dict[str, float]
@@ -313,12 +328,24 @@ def _normalize_style(style: str | None) -> str:
 
 
 def _clone_2d_table(table: list[list[float]] | None) -> list[list[float]]:
+    """深拷贝二维表，避免后续流程原地修改输入。
+
+    在 DOS / band 等处理链路中，我们会多次对列表做裁剪、插值
+    或转置。直接沿用原始引用会带来难以察觉的副作用，因此这里
+    统一生成逐行副本作为工作副本。
+    """
     if not table:
         return []
     return [list(row) for row in table]
 
 
 def _extract_kcoords(raw_kpts: list[Any] | None) -> list[list[float]]:
+    """把 vasprun 的 K 点节点规范为 ``[[kx, ky, kz], ...]``。
+
+    vasprun.xml 中既可能出现 ``<v>k1 k2 k3</v>``，也可能带权重或
+    以嵌套 ``<v><r>...</r></v>`` 表示。为了让后续路径长度计算、
+    分段拆分等逻辑稳定，我们把所有合法记录拆解为三元浮点数组。
+    """
     coords: list[list[float]] = []
     if not raw_kpts:
         return coords
@@ -340,6 +367,11 @@ def _extract_kcoords(raw_kpts: list[Any] | None) -> list[list[float]]:
 
 
 def _coords_close(a: list[float], b: list[float], tol: float = 1e-6) -> bool:
+    """判断两个坐标向量在 ``tol`` 内是否可视作同一点。
+
+    高对称路径往往在段落连接处重复首尾点。此函数通过逐分量
+    误差比较来消除浮点噪声，为后续的裁剪与分段打基础。
+    """
     if len(a) != len(b):
         return False
     return all(abs(x - y) <= tol for x, y in zip(a, b))
@@ -350,6 +382,18 @@ def _align_band_lengths(
     occs: list[list[float]] | None,
     coords: list[list[float]] | None,
 ) -> tuple[list[list[float]], list[list[float]] | None, list[list[float]] | None]:
+    """让能带、占据与坐标三者保持相同长度。
+
+    vasprun / EIGENVAL 的行数可能不完全匹配坐标表。这里统一按照
+    最短的那一份裁剪，确保：
+
+    - 每条能带都拥有一致的 K 点采样数；
+    - 若带占据度 ``occs``，则与能带同步裁剪；
+    - 坐标列表也在同一范围内截断，保证索引一一对应。
+
+    该操作主要解决旧版本 VASP 在 ``vasprun.xml`` 末尾多写一行
+    的情况，防止后续 ``zip`` 或转置时触发索引越界。
+    """
     if coords and len(coords) != len(bands):
         limit = min(len(coords), len(bands))
         bands = bands[:limit]
@@ -366,6 +410,13 @@ def _trim_periodic_path(
     bands: list[list[float]],
     occs: list[list[float]] | None,
 ) -> tuple[list[list[float]] | None, list[list[float]], list[list[float]] | None, bool]:
+    """去掉路径首尾重复的“闭合点”，并同步更新矩阵。
+
+    若高对称线首尾相接（Γ→X→Γ），VASP 会写入两个完全相同的
+    节点。保持它们会导致路径长度曲线在末尾产生 0 宽度的段，绘图
+    时出现重叠竖线。此函数检测并移除重复点，同时标记是否发生
+    裁剪，便于后续日志给出提示。
+    """
     trimmed = False
     if coords and bands and len(coords) == len(bands) and len(coords) > 1:
         if _coords_close(coords[0], coords[-1]):
@@ -378,6 +429,7 @@ def _trim_periodic_path(
 
 
 def _transpose_band_table(table: list[list[float]]) -> list[list[float]]:
+    """把 ``[band][kpt]`` 结构转置成 ``[kpt][band]``，便于导出。"""
     if not table:
         return []
     widths = [len(row) for row in table if row]
@@ -393,6 +445,14 @@ def _compute_kpath_positions(
     coords: list[list[float]] | None,
     recip: list[list[float]] | None = None,
 ) -> list[float]:
+    """把分数坐标累积成路径位置（距离起点的弧长）。
+
+    处理步骤：
+    1. 如果提供 reciprocal 矩阵，把分数坐标转换到笛卡尔空间；
+    2. 对每个相邻点计算欧氏距离并累加；
+    3. 输出与 coords 等长的 ``positions`` 列表，为绘图 x 轴和
+       片段拆分提供统一基准。
+    """
     if not coords:
         return []
     positions: list[float] = []
@@ -425,6 +485,7 @@ def _compute_kpath_positions(
 
 
 def _split_segments_from_positions(positions: list[float]) -> list[tuple[int, int]]:
+    """依据位置数组切分出各个高对称线段的索引范围。"""
     if len(positions) < 2:
         return []
     segments: list[tuple[int, int]] = []
@@ -486,6 +547,7 @@ Gamma
 """
 
 
+# === Section 4: 演示数据生成与样例 ===
 # === DEMO DATA (improved realistic set) ======================================
 # 口径：PBE-like Si (diamond)；间接带隙 ~0.62 eV (VBM@Γ, CBM@X)
 
@@ -807,7 +869,7 @@ DEMO_POSTPROCS = {
 }
 DEMO_PROJECT_FILES = _demo["DEMO_PROJECT_FILES"]
 # === END DEMO DATA (improved realistic set) ==================================
-# ----------------------------- 工具函数区 ----------------------------------
+# === Section 5: 通用 I/O 与 VASP 项目工具函数 ================================
 
 def which(cmd: str) -> str | None:
     """返回可执行文件绝对路径，找不到则 None。"""
@@ -1022,6 +1084,16 @@ def _fingerprint_files(files: list[Path]) -> str:
 
 
 def _load_cached(workdir: Path, cache_key: str, files: list[Path], builder: Callable[[], Any]) -> Any:
+    """缓存耗时的解析结果，避免多次重复扫描大文件。
+
+    流程说明：
+    1. 使用 ``files`` 的路径、大小、修改时间生成稳定指纹；
+    2. 命中缓存且指纹一致时，直接加载 pickle；
+    3. 否则调用 ``builder`` 重建数据，并写入 ``.cache`` 目录。
+
+    vasprun、EIGENVAL 等可能达到数百 MB，通过缓存可显著降低 GUI
+    多次刷新时的 IO 延迟。若 builder 返回 ``None``，则不写缓存。
+    """
     cache_dir = workdir / ".cache"
     fingerprint = _fingerprint_files(files)
     meta_path = cache_dir / f"{cache_key}.json"
@@ -1051,6 +1123,7 @@ def _load_cached(workdir: Path, cache_key: str, files: list[Path], builder: Call
 
 
 def _parse_fermi_from_outcar(workdir: Path) -> Optional[float]:
+    """扫描 OUTCAR 尾部并解析最后一次写出的费米能级。"""
     outcar = workdir / "OUTCAR"
     if not outcar.exists():
         return None
@@ -1073,6 +1146,7 @@ def _parse_fermi_from_outcar(workdir: Path) -> Optional[float]:
 
 
 def _parse_dos_vasprun(workdir: Path) -> Optional[dict[str, Any]]:
+    """以迭代解析的方式读取 ``vasprun.xml`` 中的总 DOS 列表。"""
     vasprun = workdir / "vasprun.xml"
     if not vasprun.exists():
         return None
@@ -1120,6 +1194,7 @@ def _parse_dos_vasprun(workdir: Path) -> Optional[dict[str, Any]]:
 
 
 def _parse_dos_doscar(workdir: Path) -> Optional[dict[str, Any]]:
+    """兼容 DOSCAR：把总 DOS 能量、态密度与积分读出为列表。"""
     doscar = workdir / "DOSCAR"
     if not doscar.exists():
         return None
@@ -1161,6 +1236,7 @@ def _parse_dos_doscar(workdir: Path) -> Optional[dict[str, Any]]:
 
 
 def _estimate_gap_from_dos(energies: list[float], dos: list[float], threshold: float) -> tuple[float, str]:
+    """基于 DOS 曲线粗略估算带隙，并区分金属/绝缘体。"""
     if not energies or not dos or len(energies) != len(dos):
         return 0.0, "unknown"
     pairs = sorted(zip(energies, dos), key=lambda x: x[0])
@@ -1181,17 +1257,21 @@ def _estimate_gap_from_dos(energies: list[float], dos: list[float], threshold: f
     return gap, "insulator"
 
 
+# === Section 6: 后处理流程实现（DOS/带结构等） ===
 def proc_dos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
+    """生成总 DOS 报告：解析 → 平移 → 估算指标 → 绘图导出。"""
     style = _normalize_style(opts.get("style"))
     threshold = float(opts.get("metal_threshold", 0.02))
     demo_payload = opts.get("demo_payload")
     if demo_payload:
         data = demo_payload
     else:
+        # 统一缓存键，命中后可复用解析结果
         cache_key = "dos_total"
         files = [workdir / "vasprun.xml", workdir / "DOSCAR", workdir / "OUTCAR"]
 
         def _builder():
+            # 解析优先级：vasprun.xml > DOSCAR，缺失则抛错
             data = _parse_dos_vasprun(workdir)
             if data is None:
                 data = _parse_dos_doscar(workdir)
@@ -1205,6 +1285,7 @@ def proc_dos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
 
     energies = data.get("energies", [])
     dos = data.get("dos", [])
+    # 统一费米能级：优先使用解析结果，其次回退 OUTCAR 或数据范围中心
     efermi = data.get("fermi")
     if efermi is None:
         outcar_fermi = _parse_fermi_from_outcar(workdir)
@@ -1214,12 +1295,14 @@ def proc_dos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
             efermi = (max(energies) + min(energies)) / 2
         else:
             efermi = 0.0
+    # 平移到 E - E_F 坐标，便于比较不同算例
     rel_energies = [e - efermi for e in energies]
     dos_at_ef = 0.0
     if rel_energies and dos:
-        # interpolate around zero
+        # 临近采样点估计 DOS(E_F)
         closest_idx = min(range(len(rel_energies)), key=lambda i: abs(rel_energies[i]))
         dos_at_ef = float(dos[closest_idx])
+    # 基于阈值粗略判断金属/绝缘体，并估算带隙
     gap, band_type = _estimate_gap_from_dos(rel_energies, dos, threshold)
     is_metal = 1.0 if dos_at_ef > threshold else 0.0
 
@@ -1227,6 +1310,7 @@ def proc_dos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
 
     fig = Figure(figsize=(5.0, 3.2))
     ax = fig.add_subplot(111)
+    # 统一配色/风格输出 PNG 图
     ax.plot(rel_energies, dos, color="#1f77b4", lw=1.4)
     ax.axvline(0.0, color="#d62728", ls="--", lw=1.0)
     ax.set_xlabel("E - E$_F$ (eV)")
@@ -1265,6 +1349,7 @@ def proc_dos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
 
 
 def _parse_eigenval(workdir: Path) -> Optional[dict[str, Any]]:
+    """逐行解析 EIGENVAL 文件，提取 (k 点, 能带, 占据度)。"""
     eigenval = workdir / "EIGENVAL"
     if not eigenval.exists():
         return None
@@ -1302,6 +1387,7 @@ def _parse_eigenval(workdir: Path) -> Optional[dict[str, Any]]:
 
 
 def _estimate_gap_from_bands(bands: list[list[float]], occs: list[list[float]], fermi: float) -> tuple[float, str, float, float]:
+    """扫描能带矩阵以求 VBM/CBM，并判定带隙性质。"""
     if not bands:
         return 0.0, "unknown", fermi, fermi
     vbm = -1e9
@@ -1328,6 +1414,7 @@ def _estimate_gap_from_bands(bands: list[list[float]], occs: list[list[float]], 
 
 
 def proc_bands(workdir: Path, opts: Dict[str, Any]) -> PostResult:
+    """输出能带图与指标，详细说明见函数内注释。"""
     style = _normalize_style(opts.get("style"))
     threshold = float(opts.get("metal_threshold", 0.02))
     demo_payload = opts.get("demo_payload") if isinstance(opts.get("demo_payload"), dict) else None
@@ -1347,14 +1434,12 @@ def proc_bands(workdir: Path, opts: Dict[str, Any]) -> PostResult:
             except Exception:
                 distance_hint = []
     if data is None:
+        # 解析优先级：尝试缓存，缺失时解析 EIGENVAL
         cache_key = "bands"
         files = [workdir / "vasprun.xml", workdir / "EIGENVAL", workdir / "OUTCAR"]
 
         def _builder():
-            data = _parse_dos_vasprun(workdir)
-            if data and data.get("energies"):
-                # vasprun already parsed for dos; but band requires dedicated parse
-                pass
+            # vasprun 的 DOS 解析会顺带缓存；真正的能带仍需读 EIGENVAL
             bands_data = _parse_eigenval(workdir)
             if bands_data is None:
                 raise FileNotFoundError("缺少能带数据 (vasprun.xml/EIGENVAL)")
@@ -1364,6 +1449,7 @@ def proc_bands(workdir: Path, opts: Dict[str, Any]) -> PostResult:
         if data is None:
             raise RuntimeError("无法解析能带数据。")
 
+    # 深拷贝数据，防止后续修改影响缓存对象
     raw_bands = _clone_2d_table(data.get("bands"))
     if not raw_bands:
         raise RuntimeError("未能在 vasprun.xml/EIGENVAL 中解析到能带数据，请确认已完成能带计算。")
@@ -1373,6 +1459,7 @@ def proc_bands(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     if not coords and isinstance(demo_payload, dict):
         coords = _extract_kcoords(demo_payload.get("kpoints"))
     if not coords:
+        # 兜底读取 KPOINTS line-mode，恢复路径顺序
         kp_file, _ = _read_kpoints_linemode(workdir / "KPOINTS")
         coords = _extract_kcoords(kp_file)
     bands, occs, coords = _align_band_lengths(raw_bands, occs, coords)
@@ -1386,10 +1473,12 @@ def proc_bands(workdir: Path, opts: Dict[str, Any]) -> PostResult:
         flat = [e for energies in bands for e in energies]
         fermi = sum(flat) / len(flat)
 
+    # 估算带隙并将能量相对 E_F 平移
     gap, nature, vbm, cbm = _estimate_gap_from_bands(bands, occs or [], fermi)
 
     rel_bands = [[e - fermi for e in row] for row in bands]
 
+    # 若 demo 提供路径距离则优先使用，否则根据坐标积累弧长
     positions = distance_hint or _compute_kpath_positions(coords)
     if not positions:
         positions = list(range(len(rel_bands)))
@@ -1415,6 +1504,7 @@ def proc_bands(workdir: Path, opts: Dict[str, Any]) -> PostResult:
             xs = positions[start:end]
             ys = series[start:end]
             if len(xs) >= 2:
+                # 按分段绘制，避免在不连续点之间连线
                 ax.plot(xs, ys, color="#1f77b4", lw=1.0)
                 plotted = True
     if not plotted and positions and band_series:
@@ -1472,7 +1562,15 @@ register_postproc(PostProc(name="bands", needs=["vasprun.xml|EIGENVAL"], runner=
 
 
 def proc_pdos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
-    """投影态密度图与数据导出。"""
+    """生成投影态密度（PDOS）图与数据导出。
+
+    步骤概览：
+    1. 解析分组选项（元素 / 轨道 / 原子位点）与能量窗口；
+    2. 若提供 demo 数据，则直接使用；否则依赖 pymatgen 解析 vasprun；
+    3. 将所有曲线统一平移到 E - E_F 坐标，并按窗口截取；
+    4. 绘制总 DOS 与各投影曲线，输出 PNG 与 CSV；
+    5. 汇总费米能级、带隙等指标，返回 ``PostResult``。
+    """
     style = _normalize_style(opts.get("style"))
     group = (opts.get("group") or "element").lower()
     want_elems = opts.get("elements") or None
@@ -1484,6 +1582,7 @@ def proc_pdos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     demo_payload = opts.get("demo_payload") if isinstance(opts.get("demo_payload"), dict) else None
 
     if demo_payload:
+        # 演示模式：直接读取内置样本，跳过磁盘解析
         energies = [float(e) for e in demo_payload.get("energies", [])]
         total = [float(v) for v in demo_payload.get("total", [])]
         raw_curves = demo_payload.get("curves") or {}
@@ -1504,6 +1603,7 @@ def proc_pdos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
         if not vxml.exists():
             raise FileNotFoundError("未找到 vasprun.xml，无法生成投影态密度。")
 
+        # 解析完整 DOS，并保留投影信息
         vasprun = Vasprun(str(vxml), parse_dos=True, parse_projected_dos=True)
         cdos = vasprun.complete_dos
         efermi = float(cdos.efermi)
@@ -1528,6 +1628,7 @@ def proc_pdos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
         elif group == "site":
             structure = cdos.structure
             for idx, site in enumerate(structure.sites[:8]):
+                # 默认限制到前 8 个原子，避免树状列表过长
                 sd = cdos.get_site_dos(site)
                 curves[f"site{idx+1}-{site.specie}"] = [float(x) for x in sd.densities["total"]]
         else:
@@ -1549,11 +1650,22 @@ def proc_pdos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     if not curves:
         raise RuntimeError("未在 vasprun.xml 中找到投影 DOS，请确认 INCAR 设置 LORBIT=11/12 并保留投影数据。")
 
+    rel_energies = [float(e) for e in energies]
+    if demo_payload:
+        rel_energies = [e - float(efermi) for e in rel_energies]
+
+    if ewin:
+        emin, emax = float(ewin[0]), float(ewin[1])
+        mask = [emin <= e <= emax for e in rel_energies]
+        rel_energies = [e for e, keep in zip(rel_energies, mask) if keep]
+        total = [v for v, keep in zip(total, mask) if keep]
+        curves = {name: [val for val, keep in zip(vals, mask) if keep] for name, vals in curves.items()}
+
     fig = Figure(figsize=(5.4, 3.3))
     ax = fig.add_subplot(111)
-    ax.plot(energies, total, lw=1.6, label="total")
+    ax.plot(rel_energies, total, lw=1.6, label="total")
     for name, values in curves.items():
-        ax.plot(energies, values, lw=1.0, label=name)
+        ax.plot(rel_energies, values, lw=1.0, label=name)
     ax.axvline(0.0, ls="--", lw=1.0)
     ax.set_xlim(ewin[0], ewin[1])
     ax.set_xlabel("E - E$_F$ (eV)")
@@ -1568,7 +1680,7 @@ def proc_pdos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     with csv_path.open("w", encoding="utf-8") as fh:
         headers = ["E-Ef (eV)", "total"] + list(curves.keys())
         fh.write(",".join(headers) + "\n")
-        for idx, energy in enumerate(energies):
+        for idx, energy in enumerate(rel_energies):
             row = [f"{energy:.6f}", f"{total[idx]:.6f}"]
             for name in curves.keys():
                 values = curves[name]
@@ -1576,14 +1688,21 @@ def proc_pdos(workdir: Path, opts: Dict[str, Any]) -> PostResult:
                 row.append(f"{val:.6f}")
             fh.write(",".join(row) + "\n")
 
-    metrics = {"E_F": float(efermi), "gap": float(gap_val)}
-    return PostResult(metrics=metrics, figs={"pdos": fig_path}, tables={"pdos": csv_path}, notes=notes)
+    metrics = {"E_F": float(efermi), "gap": float(gap_val), "num_curves": float(len(curves))}
+    return PostResult(
+        metrics=metrics,
+        figs={"pdos": fig_path},
+        tables={"pdos": csv_path},
+        notes=notes,
+        extra={"plot": {"energies": rel_energies, "total": total, "curves": curves, "style": style}},
+    )
 
 
 register_postproc(PostProc(name="pdos", needs=["vasprun.xml"], runner=proc_pdos))
 
 
 def _fallback_reciprocal_from_poscar(poscar: Path) -> Optional[list[list[float]]]:
+    """从 POSCAR 粗略估算倒格矩阵，用于缺省情况下的路径长度。"""
     try:
         lines = read_text(poscar).splitlines()
     except Exception:
@@ -1609,11 +1728,13 @@ def _fallback_reciprocal_from_poscar(poscar: Path) -> Optional[list[list[float]]
 
 
 def proc_bands_labeled(workdir: Path, opts: Dict[str, Any]) -> PostResult:
+    """生成带有高对称点标签的能带图（仅绘制路径，不含能量）。"""
     style = _normalize_style(opts.get("style"))
     report_dir, figs_dir, tables_dir = _ensure_report_dirs(workdir, opts)
 
     demo_payload = opts.get("demo_payload") if isinstance(opts.get("demo_payload"), dict) else None
     if demo_payload:
+        # 演示模式提供预制路径与标签
         kpts = _extract_kcoords(demo_payload.get("kpoints"))
         raw_labels = demo_payload.get("labels")
         labels = [str(lbl) for lbl in raw_labels] if isinstance(raw_labels, (list, tuple)) else []
@@ -1621,6 +1742,7 @@ def proc_bands_labeled(workdir: Path, opts: Dict[str, Any]) -> PostResult:
         kpts, labels = _read_kpoints_linemode(workdir / "KPOINTS")
 
     if demo_payload is None and HAS_PYMATGEN and (workdir / "vasprun.xml").exists():
+        # 有完整 vasprun 时直接用 pymatgen 取得距离与标签
         from pymatgen.io.vasp.outputs import BSVasprun  # type: ignore
 
         bsrun = BSVasprun(str(workdir / "vasprun.xml"), parse_projected_eigen=False)
@@ -1809,12 +1931,14 @@ register_postproc(PostProc(name="bands_lbl", needs=["vasprun.xml|EIGENVAL"], run
 
 
 def proc_effective_mass(workdir: Path, opts: Dict[str, Any]) -> PostResult:
+    """基于能带曲率估算电子 / 空穴有效质量。"""
     style = _normalize_style(opts.get("style"))
     window = max(int(opts.get("window_k", 4)), 2)
     report_dir, figs_dir, tables_dir = _ensure_report_dirs(workdir, opts)
     demo_payload = opts.get("demo_payload") if isinstance(opts.get("demo_payload"), dict) else None
 
     if demo_payload:
+        # 演示路径：直接读取内置能带，免去文件解析
         bands_raw = demo_payload.get("bands") or []
         occs_raw = demo_payload.get("occupancies") or []
         try:
@@ -1926,6 +2050,7 @@ def proc_effective_mass(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     import numpy as _np
 
     if HAS_PYMATGEN and (workdir / "vasprun.xml").exists():
+        # 优先使用 vasprun，pymatgen 可直接返回带结构对象
         from pymatgen.io.vasp.outputs import BSVasprun  # type: ignore
 
         bsrun = BSVasprun(str(workdir / "vasprun.xml"), parse_projected_eigen=False)
@@ -1935,6 +2060,7 @@ def proc_effective_mass(workdir: Path, opts: Dict[str, Any]) -> PostResult:
         bands = [[float(e) for e in row] for row in bs.bands[bs.spin_keys[0]]]
         occs = [[1.0 if e < efermi else 0.0 for e in row] for row in bs.bands[bs.spin_keys[0]]]
     else:
+        # 无 pymatgen 时退回手动解析 EIGENVAL，并推导路径距离
         data = _parse_eigenval(workdir)
         if data is None or not data.get("bands"):
             raise FileNotFoundError("缺少能带数据 (vasprun.xml 或 EIGENVAL)，请先完成能带计算。")
@@ -2000,6 +2126,7 @@ def proc_effective_mass(workdir: Path, opts: Dict[str, Any]) -> PostResult:
     if not distances or len(distances) != nk:
         distances = [float(i) for i in range(nk)]
 
+    # 将能带统一移动到相对费米能级
     rel = [[val - efermi for val in row] for row in bands_k]
     nb = len(rel[0]) if rel else 0
 
@@ -2024,6 +2151,7 @@ def proc_effective_mass(workdir: Path, opts: Dict[str, Any]) -> PostResult:
         raise RuntimeError("有效质量拟合失败：能带数据为空，请确认能带计算输出完整。")
 
     def _fit_mass(idx: tuple[int, int]) -> tuple[float, list[float], list[float]]:
+        """在给定带和 k 点附近做二次拟合，返回 m*/m_e。"""
         band, k0 = idx
         if band < 0 or band >= len(rel_by_band):
             return float("nan"), [], []
@@ -2087,6 +2215,7 @@ register_postproc(PostProc(name="emass", needs=["vasprun.xml|EIGENVAL"], runner=
 
 
 def _parse_locpot_planar_z(locpot: Path) -> Optional[tuple[list[float], list[float]]]:
+    """读取 LOCPOT 并对 xy 平面求平均，得到 z 方向势垒曲线。"""
     if not HAS_NUMPY:
         return None
     import numpy as _np
@@ -2151,12 +2280,14 @@ def _parse_locpot_planar_z(locpot: Path) -> Optional[tuple[list[float], list[flo
 
 
 def proc_planar_potential(workdir: Path, opts: Dict[str, Any]) -> PostResult:
+    """绘制平面平均势 (LOCPOT) 的 z 向轮廓并导出数据。"""
 
     style = _normalize_style(opts.get("style"))
     report_dir, figs_dir, tables_dir = _ensure_report_dirs(workdir, opts)
     demo_payload = opts.get("demo_payload") if isinstance(opts.get("demo_payload"), dict) else None
 
     if demo_payload:
+        # 演示模式直接加载内置曲线
         z = [float(v) for v in demo_payload.get("z", [])]
         values = [float(v) for v in demo_payload.get("values", [])]
         if not z or not values:
@@ -2170,6 +2301,7 @@ def proc_planar_potential(workdir: Path, opts: Dict[str, Any]) -> PostResult:
         if not locpot.exists():
             raise FileNotFoundError("未找到 LOCPOT，请在计算中输出局域势。")
 
+        # 对 LOCPOT 取 xy 平均，得到势能在 z 方向的取值
         data = _parse_locpot_planar_z(locpot)
         if not data:
             raise RuntimeError("解析 LOCPOT 失败或数据不完整，请确认计算输出了 LOCPOT/CHGCAR 并保持文件完整。")
@@ -2208,7 +2340,7 @@ def proc_planar_potential(workdir: Path, opts: Dict[str, Any]) -> PostResult:
 
 register_postproc(PostProc(name="pot_z", needs=["LOCPOT"], runner=proc_planar_potential))
 
-# ----------------------------- GUI 组件 ------------------------------------
+# === Section 7: GUI 后台线程与公共组件 ======================================
 
 class SystemStatsMonitor(threading.Thread):
     """后台线程：监视 CPU/进程以及关键文件增长情况。"""
@@ -2548,6 +2680,7 @@ class EnergyMonitor(threading.Thread):
             return
 
 
+# === Section 8: 主窗口界面构建（VaspGUI） ===================================
 class VaspGUI(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -3554,6 +3687,7 @@ class VaspGUI(tk.Tk):
         self._populate_kpoints_section(frame)
         return frame
 
+    # === Section 9: 扭转/滑移扩展页面与算法 =================================
     # === CODEX BEGIN: twist/shift helpers ===
     def _show_help_dialog(self, title: str, message: str) -> None:
         """弹出一个带滚动文本的帮助对话框。"""
@@ -4838,8 +4972,9 @@ class VaspGUI(tk.Tk):
         self.tw_config_tree.pack(fill=tk.X, pady=(0, 4))
 
         help_poscar = textwrap.dedent("""
-            【基础输入】
-            • 先后选择底层 (B) 与上层 (T) 的 POSCAR；优先使用已经几何优化的结构。
+            【结构导入】
+            • 推荐：直接加载已构建的二维异质结 POSCAR/目录，程序会自动识别层序并列出界面组合。
+            • 备用：也可手动指定上下层 POSCAR；适合需要自定义或缺少 pymatgen/numpy 时。
             • 默认假设 POSCAR 的 c 轴沿层法向；如不满足，请先在外部完成对齐。
             • 真空厚度与偶极修正建议在上方“配置来源”中查看推荐值与来源解释。
         """).strip()
@@ -4888,26 +5023,120 @@ class VaspGUI(tk.Tk):
             • 扫描前建议运行“快速体检 (Preflight)”并应用推荐修复，避免粗糙默认网格。
         """).strip()
 
-        # 路径选择
-        self._add_section_heading(left, "路径选择", help_poscar, title="上/下层 POSCAR 指南", pady=(0, 4))
+        # 路径选择与导入策略
+        self._add_section_heading(left, "路径选择", help_poscar, title="二维异质结导入", pady=(0, 4))
+        self.tw_import_mode = tk.StringVar(value="combined")
+        import_box = ttk.LabelFrame(left, text="导入方式")
+        import_box.pack(fill=tk.X, pady=(0, 6))
+
+        mode_row = ttk.Frame(import_box)
+        mode_row.pack(fill=tk.X, pady=(2, 2))
+        ttk.Label(mode_row, text="选择：").pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            mode_row,
+            text="导入已构建异质结（推荐）",
+            value="combined",
+            variable=self.tw_import_mode,
+            command=self._tw_on_import_mode_change,
+        ).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Radiobutton(
+            mode_row,
+            text="手动指定上下层 POSCAR",
+            value="separate",
+            variable=self.tw_import_mode,
+            command=self._tw_on_import_mode_change,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+        # 已构建异质结导入
+        self.tw_combined_frame = ttk.Frame(import_box)
+        self.tw_combined_frame.pack(fill=tk.X, pady=(4, 2))
+        self.tw_combined_path = tk.StringVar()
+        combined_row = ttk.Frame(self.tw_combined_frame)
+        combined_row.pack(fill=tk.X, pady=2)
+        ttk.Label(combined_row, text="异质结 POSCAR:").pack(side=tk.LEFT)
+        self.tw_combined_entry = ttk.Entry(
+            combined_row, textvariable=self.tw_combined_path, width=30
+        )
+        self.tw_combined_entry.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
+        self.tw_combined_file_btn = ttk.Button(
+            combined_row, text="选 POSCAR…", command=self._tw_pick_combined_poscar
+        )
+        self.tw_combined_file_btn.pack(side=tk.LEFT)
+        self.tw_combined_dir_btn = ttk.Button(
+            combined_row, text="选目录…", command=self._tw_pick_combined_folder
+        )
+        self.tw_combined_dir_btn.pack(side=tk.LEFT, padx=(4, 0))
+
+        self.tw_combined_layers_var = tk.StringVar(value="尚未解析层信息。")
+        ttk.Label(
+            self.tw_combined_frame,
+            textvariable=self.tw_combined_layers_var,
+            wraplength=360,
+            justify=tk.LEFT,
+            foreground="#555",
+        ).pack(anchor=tk.W, padx=2, pady=(2, 0))
+
+        layers_row = ttk.Frame(self.tw_combined_frame)
+        layers_row.pack(fill=tk.X, pady=(4, 2))
+        ttk.Label(layers_row, text="界面选择:").pack(side=tk.LEFT)
+        self.tw_split_choice_var = tk.StringVar()
+        self.tw_split_combo = ttk.Combobox(
+            layers_row, state="disabled", textvariable=self.tw_split_choice_var, width=28
+        )
+        self.tw_split_combo.pack(side=tk.LEFT, padx=4)
+        self.tw_split_combo.bind("<<ComboboxSelected>>", lambda _e: self._tw_apply_combined_split())
+        self.tw_split_apply_btn = ttk.Button(
+            layers_row, text="应用", command=self._tw_apply_combined_split
+        )
+        self.tw_split_apply_btn.pack(side=tk.LEFT)
+
+        self.tw_combined_inputs_var = tk.StringVar(value="INCAR / POTCAR / KPOINTS：— / — / —")
+        ttk.Label(
+            self.tw_combined_frame,
+            textvariable=self.tw_combined_inputs_var,
+            wraplength=360,
+            justify=tk.LEFT,
+            foreground="#555",
+        ).pack(anchor=tk.W, padx=2, pady=(0, 2))
+
+        # 传统：手动指定上下层 POSCAR
+        self.tw_manual_frame = ttk.Frame(import_box)
+        self.tw_manual_frame.pack(fill=tk.X, pady=(6, 2))
+        ttk.Label(self.tw_manual_frame, text="手动指定上下层 POSCAR：").pack(anchor=tk.W)
         self.tw_top_path = tk.StringVar()
         self.tw_bot_path = tk.StringVar()
 
-        row = ttk.Frame(left); row.pack(fill=tk.X, pady=2)
-        ttk.Label(row, text="上层 POSCAR:").pack(side=tk.LEFT)
-        ttk.Entry(row, textvariable=self.tw_top_path, width=30).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row, text="选择…", command=lambda: self._tw_pick_poscar(self.tw_top_path)).pack(side=tk.LEFT)
+        manual_row_top = ttk.Frame(self.tw_manual_frame)
+        manual_row_top.pack(fill=tk.X, pady=2)
+        ttk.Label(manual_row_top, text="上层 POSCAR:").pack(side=tk.LEFT)
+        self.tw_top_entry = ttk.Entry(manual_row_top, textvariable=self.tw_top_path, width=30)
+        self.tw_top_entry.pack(side=tk.LEFT, padx=4)
+        self.tw_top_btn = ttk.Button(
+            manual_row_top, text="选择…", command=lambda: self._tw_pick_poscar(self.tw_top_path)
+        )
+        self.tw_top_btn.pack(side=tk.LEFT)
 
-        row = ttk.Frame(left); row.pack(fill=tk.X, pady=2)
-        ttk.Label(row, text="下层 POSCAR:").pack(side=tk.LEFT)
-        ttk.Entry(row, textvariable=self.tw_bot_path, width=30).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row, text="选择…", command=lambda: self._tw_pick_poscar(self.tw_bot_path)).pack(side=tk.LEFT)
+        manual_row_bot = ttk.Frame(self.tw_manual_frame)
+        manual_row_bot.pack(fill=tk.X, pady=2)
+        ttk.Label(manual_row_bot, text="下层 POSCAR:").pack(side=tk.LEFT)
+        self.tw_bot_entry = ttk.Entry(manual_row_bot, textvariable=self.tw_bot_path, width=30)
+        self.tw_bot_entry.pack(side=tk.LEFT, padx=4)
+        self.tw_bot_btn = ttk.Button(
+            manual_row_bot, text="选择…", command=lambda: self._tw_pick_poscar(self.tw_bot_path)
+        )
+        self.tw_bot_btn.pack(side=tk.LEFT)
 
         try:
             self.tw_top_path.trace_add("write", self._tw_on_structure_change)
             self.tw_bot_path.trace_add("write", self._tw_on_structure_change)
         except Exception:
             pass
+        try:
+            self.tw_combined_path.trace_add("write", self._tw_on_combined_path_change)
+        except Exception:
+            pass
+
+        self._tw_on_import_mode_change()
 
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
@@ -5181,6 +5410,324 @@ class VaspGUI(tk.Tk):
     # === CODEX END: twist/shift page UI ===
 
     # === CODEX BEGIN: twist/shift geometry core ===
+    def _tw_on_import_mode_change(self, *_args) -> None:
+        """在“已构建异质结 / 手动”模式间切换 UI 与状态。"""
+        mode = getattr(self, "tw_import_mode", None)
+        if mode is None:
+            return
+        mode_val = mode.get()
+
+        # 控制组合导入部件
+        combined_state_entry = "normal" if mode_val == "combined" else "readonly"
+        combined_btn_state = tk.NORMAL if mode_val == "combined" else tk.DISABLED
+        try:
+            self.tw_combined_entry.configure(state=combined_state_entry)
+            self.tw_combined_file_btn.configure(state=combined_btn_state)
+            self.tw_combined_dir_btn.configure(state=combined_btn_state)
+        except Exception:
+            pass
+
+        combo_state = "disabled"
+        if mode_val == "combined":
+            has_options = bool(getattr(self, "_tw_split_options", []))
+            combo_state = "readonly" if has_options else "disabled"
+        try:
+            self.tw_split_combo.configure(state=combo_state)
+            self.tw_split_apply_btn.configure(state=combined_btn_state if combo_state != "disabled" else tk.DISABLED)
+        except Exception:
+            pass
+
+        # 控制手动输入部件
+        manual_entry_state = "normal" if mode_val == "separate" else "readonly"
+        manual_btn_state = tk.NORMAL if mode_val == "separate" else tk.DISABLED
+        for widget in (getattr(self, "tw_top_entry", None), getattr(self, "tw_bot_entry", None)):
+            if widget is None:
+                continue
+            try:
+                widget.configure(state=manual_entry_state)
+            except Exception:
+                pass
+        for widget in (getattr(self, "tw_top_btn", None), getattr(self, "tw_bot_btn", None)):
+            if widget is None:
+                continue
+            try:
+                widget.configure(state=manual_btn_state)
+            except Exception:
+                pass
+
+    def _tw_pick_combined_poscar(self) -> None:
+        """选择单个已构建异质结 POSCAR 文件。"""
+        path = filedialog.askopenfilename(
+            title="选择异质结 POSCAR",
+            filetypes=[("POSCAR", "POSCAR*"), ("All", "*")],
+        )
+        if path:
+            self.tw_combined_path.set(path)
+
+    def _tw_pick_combined_folder(self) -> None:
+        """选择包含 POSCAR/INCAR/KPOINTS 的目录。"""
+        folder = filedialog.askdirectory(title="选择异质结目录")
+        if not folder:
+            return
+        candidate = Path(folder) / "POSCAR"
+        if candidate.exists():
+            self.tw_combined_path.set(str(candidate))
+        else:
+            try:
+                messagebox.showwarning(APP_NAME, f"目录 {folder} 中未找到 POSCAR。")
+            except Exception:
+                pass
+
+    def _tw_on_combined_path_change(self, *_args) -> None:
+        """监听路径输入并尝试解析层信息。"""
+        if getattr(self, "_tw_combined_loading", False):
+            return
+        raw = self.tw_combined_path.get().strip()
+        if not raw:
+            self._tw_reset_combined_state()
+            return
+        path = Path(raw)
+        if not path.exists() or not path.is_file():
+            return
+        self._tw_load_combined_structure(path)
+
+    def _tw_reset_combined_state(self) -> None:
+        """清理已构建异质结的缓存与 UI。"""
+        self._tw_combined_cache = None
+        self._tw_split_options = []
+        self._tw_combined_inputs = {}
+        try:
+            self.tw_split_combo.configure(values=(), state="disabled")
+            self.tw_split_choice_var.set("")
+            self.tw_split_apply_btn.configure(state=tk.DISABLED)
+        except Exception:
+            pass
+        self.tw_combined_layers_var.set("尚未解析层信息。")
+        self.tw_combined_inputs_var.set("INCAR / POTCAR / KPOINTS：— / — / —")
+
+    def _tw_load_combined_structure(self, poscar_path: Path) -> None:
+        """加载已构建异质结 POSCAR → 自动分层并生成界面选项。"""
+        if not HAS_PYMATGEN or not HAS_NUMPY:
+            try:
+                messagebox.showerror(APP_NAME, "导入已构建异质结需要 pymatgen 与 numpy 支持。")
+            except Exception:
+                pass
+            self._tw_append_log("缺少 pymatgen 或 numpy，已回退到手动导入模式。")
+            self.tw_import_mode.set("separate")
+            self._tw_on_import_mode_change()
+            return
+
+        from pymatgen.core import Structure
+
+        try:
+            self._tw_combined_loading = True
+            structure = Structure.from_file(str(poscar_path))
+        except Exception as exc:  # noqa: BLE001
+            self._tw_append_log(f"读取异质结 POSCAR 失败：{exc}")
+            try:
+                messagebox.showerror(APP_NAME, f"读取 POSCAR 失败：{exc}")
+            except Exception:
+                pass
+            self._tw_reset_combined_state()
+            return
+        finally:
+            self._tw_combined_loading = False
+
+        layers = self._tw_detect_layers(structure)
+        if len(layers) < 2:
+            self._tw_append_log("未能识别到足够的层数，请确认 POSCAR 是否包含上下层。")
+            try:
+                messagebox.showwarning(APP_NAME, "未能识别到两个以上的层，无法拆分。")
+            except Exception:
+                pass
+            self._tw_reset_combined_state()
+            return
+
+        self._tw_combined_cache = {
+            "structure": structure,
+            "layers": layers,
+            "poscar": poscar_path,
+        }
+
+        layer_labels = [layer["label"] for layer in layers]
+        self.tw_combined_layers_var.set(
+            "检测到 %d 层：%s" % (len(layers), " | ".join(layer_labels))
+        )
+        options = []
+        for idx in range(len(layers) - 1):
+            above = layers[idx]["label"]
+            below = layers[idx + 1]["label"]
+            options.append((f"{above} - {below}", idx))
+        self._tw_split_options = options
+        values = [label for label, _ in options]
+        try:
+            self.tw_split_combo.configure(values=values)
+            if values:
+                default_idx = max(0, len(values) // 2)
+                self.tw_split_choice_var.set(values[default_idx])
+            state = "readonly" if values else "disabled"
+            self.tw_split_combo.configure(state=state)
+            self.tw_split_apply_btn.configure(state=(tk.NORMAL if values else tk.DISABLED))
+        except Exception:
+            pass
+
+        self._tw_update_combined_inputs_label(poscar_path.parent)
+        self.tw_import_mode.set("combined")
+        self._tw_on_import_mode_change()
+        self._tw_append_log(
+            f"已解析异质结：{len(layers)} 层，候选界面 {len(options)} 个。"
+        )
+        if values:
+            self._tw_apply_combined_split()
+
+    def _tw_update_combined_inputs_label(self, base_dir: Path) -> None:
+        """更新 INCAR/POTCAR/KPOINTS 的检测结果标签。"""
+        parts = []
+        found = {}
+        detected_aliases = []
+        for fname, label in [("INCAR", "输入"), ("POTCAR", "POTCAR"), ("KPOINTS", "K 点")]:
+            path = base_dir / fname
+            exists = path.exists()
+            found[fname] = path if exists else None
+            parts.append(f"{label}:{'✓' if exists else '—'}")
+            if exists:
+                detected_aliases.append(f"{label}→{path}")
+        self.tw_combined_inputs_var.set(" | ".join(parts))
+        self._tw_combined_inputs = found
+        if detected_aliases:
+            self._tw_append_log("已检测输入文件：" + ", ".join(detected_aliases))
+        else:
+            self._tw_append_log("未在同目录检测到 INCAR / POTCAR / KPOINTS。")
+
+    def _tw_detect_layers(self, structure) -> list[dict[str, object]]:
+        """基于 z 坐标聚类，返回自上而下的层信息。"""
+        import numpy as np
+
+        if not len(structure):
+            return []
+        zs = np.array([site.coords[2] for site in structure.sites], dtype=float)
+        order = list(np.argsort(-zs))  # 由上至下
+        sorted_z = zs[order]
+        diffs = np.abs(np.diff(sorted_z))
+        if len(diffs):
+            percentile = float(np.percentile(diffs, 60))
+            tol = max(0.45, min(1.6, percentile))
+        else:
+            tol = 0.45
+
+        groups: list[list[int]] = []
+        current = [order[0]]
+        prev_z = sorted_z[0]
+        for idx in order[1:]:
+            z = zs[idx]
+            if abs(z - prev_z) <= tol:
+                current.append(idx)
+            else:
+                groups.append(current)
+                current = [idx]
+            prev_z = z
+        if current:
+            groups.append(current)
+
+        dominant_counts = Counter()
+        groups_info: list[dict[str, object]] = []
+        dominant_species: list[str] = []
+        for grp in groups:
+            species_counter: Counter[str] = Counter()
+            for atom_idx in grp:
+                specie = str(structure[atom_idx].specie)
+                species_counter[specie] += 1
+            if species_counter:
+                dom = species_counter.most_common(1)[0][0]
+            else:
+                dom = "Layer"
+            dominant_counts[dom] += 1
+            dominant_species.append(dom)
+            groups_info.append({
+                "indices": grp,
+                "species": species_counter,
+                "label": dom,  # 占位，稍后更新
+                "z_mean": float(np.mean(zs[grp])) if grp else 0.0,
+            })
+
+        seq_counter: Counter[str] = Counter()
+        for info, dom in zip(groups_info, dominant_species):
+            seq_counter[dom] += 1
+            if dominant_counts[dom] > 1:
+                info["label"] = f"{dom}({seq_counter[dom]})"
+            else:
+                info["label"] = dom
+        return groups_info
+
+    def _tw_apply_combined_split(self) -> None:
+        """根据所选界面生成上下层 POSCAR 并写入项目缓存。"""
+        cache = getattr(self, "_tw_combined_cache", None)
+        if not cache or "structure" not in cache:
+            self._tw_append_log("请先导入异质结 POSCAR。")
+            try:
+                messagebox.showwarning(APP_NAME, "请先导入异质结 POSCAR。")
+            except Exception:
+                pass
+            return
+
+        options = getattr(self, "_tw_split_options", [])
+        if not options:
+            self._tw_append_log("没有可用的界面选项。")
+            return
+        label = self.tw_split_choice_var.get()
+        option_map = {lbl: idx for lbl, idx in options}
+        if label not in option_map:
+            label = options[0][0]
+            self.tw_split_choice_var.set(label)
+        boundary_idx = option_map[label]
+
+        structure = cache["structure"]
+        layers = cache["layers"]
+        from pymatgen.core import Structure
+
+        top_indices: list[int] = []
+        bot_indices: list[int] = []
+        for idx, layer in enumerate(layers):
+            if idx <= boundary_idx:
+                top_indices.extend(layer["indices"])
+            else:
+                bot_indices.extend(layer["indices"])
+        if not top_indices or not bot_indices:
+            self._tw_append_log("拆分失败：任一侧原子为空，请调整界面选择。")
+            try:
+                messagebox.showwarning(APP_NAME, "拆分失败：任一侧原子为空，请调整界面选择。")
+            except Exception:
+                pass
+            return
+
+        top_struct = Structure.from_sites([structure[i] for i in top_indices])
+        bot_struct = Structure.from_sites([structure[i] for i in bot_indices])
+
+        cache_dir = self.current_project_path() / "twist_import"
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            self._tw_append_log(f"创建缓存目录失败：{exc}")
+            return
+
+        safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label)
+        top_path = cache_dir / f"POSCAR_top_{safe_label}.vasp"
+        bot_path = cache_dir / f"POSCAR_bot_{safe_label}.vasp"
+        try:
+            top_struct.to(fmt="poscar", filename=str(top_path))
+            bot_struct.to(fmt="poscar", filename=str(bot_path))
+        except Exception as exc:  # noqa: BLE001
+            self._tw_append_log(f"写入拆分 POSCAR 失败：{exc}")
+            try:
+                messagebox.showerror(APP_NAME, f"写入拆分 POSCAR 失败：{exc}")
+            except Exception:
+                pass
+            return
+
+        self.tw_top_path.set(str(top_path))
+        self.tw_bot_path.set(str(bot_path))
+        self._tw_append_log(f"界面 {label} → 生成 {top_path.name} / {bot_path.name}")
+
     def _tw_pick_poscar(self, var):
         p = filedialog.askopenfilename(title="选择 POSCAR", filetypes=[("POSCAR","POSCAR*"),("All","*")])
         if p: var.set(p)
@@ -8778,6 +9325,8 @@ nice -n 5 ionice -c2 -n4 \
         self.destroy()
         self._stop_following_log()
 
+
+# === Section 10: 新手引导与程序入口 ========================================
 
 class FirstTimeWizard(tk.Toplevel):
     def __init__(self, master: VaspGUI):
